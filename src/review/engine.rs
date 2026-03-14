@@ -400,7 +400,10 @@ impl ReviewEngine {
             ReviewVerdict::Comment => verdict.as_github_event(),
             ReviewVerdict::Approve | ReviewVerdict::RequestChanges => {
                 let authenticated_user = self.github.get_authenticated_user().await.ok();
-                if authenticated_user.as_deref() == Some(pr_data.user.login.as_str()) {
+                if authenticated_user
+                    .as_deref()
+                    .is_some_and(|u| u.eq_ignore_ascii_case(&pr_data.user.login))
+                {
                     "COMMENT"
                 } else {
                     verdict.as_github_event()
@@ -427,7 +430,7 @@ impl ReviewEngine {
         // Append the inline comments to the body so they're not silently lost.
         let post_result = if let Err(ref first_err) = post_result {
             let err_str = format!("{first_err}");
-            if err_str.contains("422") || err_str.contains("Can not approve") {
+            if err_str.contains("(422") || err_str.contains("Can not approve") {
                 let mut retry_body = body.clone();
                 if !inline_comments.is_empty() {
                     retry_body

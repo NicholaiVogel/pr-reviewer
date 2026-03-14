@@ -1,4 +1,12 @@
-repos = []
+# [[repos]]
+# owner = "your-org"
+# name = "your-repo"
+# local_path = "/path/to/local/clone"
+# harness = "claude-code"
+# model = "claude-sonnet-4-6"
+# fork_policy = "ignore"
+# ignore_paths = ["*.lock", "vendor/**"]
+# gitnexus = true
 
 [harness]
 default = "claude-code"
