@@ -202,6 +202,14 @@ pub struct AppConfig {
     pub defaults: DefaultsConfig,
     #[serde(default)]
     pub repos: Vec<RepoConfig>,
+    #[serde(default)]
+    pub serve: ServeConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServeConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 fn default_harness() -> HarnessKind {
@@ -305,6 +313,7 @@ impl Default for AppConfig {
             daemon: DaemonConfig::default(),
             defaults: DefaultsConfig::default(),
             repos: Vec::new(),
+            serve: ServeConfig::default(),
         }
     }
 }
@@ -326,6 +335,10 @@ impl RepoConfig {
 }
 
 impl AppConfig {
+    pub fn serve_enabled(&self) -> bool {
+        self.serve.enabled
+    }
+
     pub fn config_dir() -> Result<PathBuf> {
         if let Ok(path) = std::env::var("PR_REVIEWER_CONFIG_DIR") {
             return Ok(PathBuf::from(path));
@@ -368,8 +381,11 @@ impl AppConfig {
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let file = Self::config_file()?;
         let toml = toml::to_string_pretty(self).context("failed to serialize config")?;
-        fs::write(&file, toml)
-            .with_context(|| format!("failed to write config to {}", file.display()))?;
+        let tmp = file.with_extension("toml.tmp");
+        fs::write(&tmp, toml)
+            .with_context(|| format!("failed to write config to {}", tmp.display()))?;
+        fs::rename(&tmp, &file)
+            .with_context(|| format!("failed to rename tmp config to {}", file.display()))?;
         Ok(())
     }
 

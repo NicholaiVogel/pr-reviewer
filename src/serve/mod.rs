@@ -12,6 +12,8 @@ use axum::{
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use axum::http::HeaderMap;
+
 use crate::config::{AppConfig, WorkflowStep};
 
 // The dashboard HTML is embedded at compile time.
@@ -36,6 +38,7 @@ type SharedConfig = Arc<Mutex<AppConfig>>;
 enum ApiError {
     NotFound(String),
     BadRequest(String),
+    Forbidden(String),
     Internal(anyhow::Error),
 }
 
@@ -44,6 +47,7 @@ impl IntoResponse for ApiError {
         let (status, msg) = match self {
             ApiError::NotFound(m)  => (StatusCode::NOT_FOUND, m),
             ApiError::BadRequest(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
+            ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             ApiError::Internal(e)  => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
         (status, Json(serde_json::json!({ "error": msg }))).into_response()
@@ -94,12 +98,25 @@ async fn list_repos(State(state): State<SharedConfig>) -> ApiResult<impl IntoRes
     Ok(Json(repos))
 }
 
+// ── Path validation ───────────────────────────────────────────────────────────
+
+fn validate_path_segment(seg: &str) -> Result<(), ApiError> {
+    if seg.contains('/') || seg.contains('\\') || seg.contains("..") {
+        return Err(ApiError::BadRequest(format!(
+            "invalid path segment: {seg}"
+        )));
+    }
+    Ok(())
+}
+
 // ── Handler: get workflow ─────────────────────────────────────────────────────
 
 async fn get_workflow(
     State(state): State<SharedConfig>,
     Path((owner, name)): Path<(String, String)>,
 ) -> ApiResult<impl IntoResponse> {
+    validate_path_segment(&owner)?;
+    validate_path_segment(&name)?;
     let cfg = state.lock().await;
     let repo = cfg
         .repos
@@ -114,18 +131,33 @@ async fn get_workflow(
 async fn put_workflow(
     State(state): State<SharedConfig>,
     Path((owner, name)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(steps): Json<Vec<WorkflowStep>>,
 ) -> ApiResult<impl IntoResponse> {
+    validate_path_segment(&owner)?;
+    validate_path_segment(&name)?;
+
+    // CSRF: require custom header on mutating requests.
+    match headers.get("x-requested-with").and_then(|v| v.to_str().ok()) {
+        Some("pr-reviewer") => {}
+        _ => return Err(ApiError::Forbidden("missing or invalid X-Requested-With header".into())),
+    }
+
     validate_workflow(&steps)?;
 
-    let mut cfg = state.lock().await;
-    let repo = cfg
-        .repos
-        .iter_mut()
-        .find(|r| r.owner.eq_ignore_ascii_case(&owner) && r.name.eq_ignore_ascii_case(&name))
-        .ok_or_else(|| ApiError::NotFound(format!("repo not found: {owner}/{name}")))?;
-    repo.workflow = steps;
-    cfg.save()?;
+    // Clone the config for saving outside the lock to avoid blocking I/O
+    // while holding the async mutex.
+    let config_to_save = {
+        let mut cfg = state.lock().await;
+        let repo = cfg
+            .repos
+            .iter_mut()
+            .find(|r| r.owner.eq_ignore_ascii_case(&owner) && r.name.eq_ignore_ascii_case(&name))
+            .ok_or_else(|| ApiError::NotFound(format!("repo not found: {owner}/{name}")))?;
+        repo.workflow = steps;
+        cfg.clone()
+    };
+    config_to_save.save()?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

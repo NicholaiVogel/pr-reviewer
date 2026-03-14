@@ -334,7 +334,12 @@ async fn main() -> Result<()> {
             println!("{}", format_stats(&stats));
         }
         Commands::Serve { port } => {
+            eprintln!("The `serve` command is experimental and not yet ready for use.");
+            eprintln!("To enable it, run: pr-reviewer config set serve.enabled true");
             let cfg = AppConfig::load_or_default()?;
+            if !cfg.serve_enabled() {
+                return Err(anyhow!("serve is disabled; enable with: pr-reviewer config set serve.enabled true"));
+            }
             serve::start(cfg, port).await?;
         }
         Commands::Config { command } => {

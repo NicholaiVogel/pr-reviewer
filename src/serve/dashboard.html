@@ -470,10 +470,20 @@
 
   // ── Fetch repos ──────────────────────────────────────────
   async function loadRepos() {
-    const res = await fetch('/api/repos');
-    repos = await res.json();
-    renderSidebar();
-    if (repos.length > 0 && !currentRepo) selectRepo(repos[0].owner + '/' + repos[0].name);
+    try {
+      const res = await fetch('/api/repos');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      repos = await res.json();
+      renderSidebar();
+      if (repos.length > 0 && !currentRepo) selectRepo(repos[0].owner + '/' + repos[0].name);
+    } catch (err) {
+      const list = document.getElementById('repo-list');
+      list.textContent = '';
+      const errDiv = document.createElement('div');
+      errDiv.style.cssText = 'padding:16px;color:var(--danger);font-size:13px;';
+      errDiv.textContent = 'Failed to load repos: ' + err.message;
+      list.appendChild(errDiv);
+    }
   }
 
   // ── Sidebar ──────────────────────────────────────────────
@@ -798,7 +808,7 @@
     try {
       const res = await fetch(`/api/repos/${repo.owner}/${repo.name}/workflow`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'pr-reviewer' },
         body: JSON.stringify(repo.workflow || []),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -943,7 +953,7 @@
   }
 
   function generateId() {
-    return 'step-' + Math.random().toString(36).slice(2, 9);
+    return crypto.randomUUID();
   }
 
   function escHtml(s) {
@@ -951,7 +961,8 @@
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   // ── Boot ─────────────────────────────────────────────────
