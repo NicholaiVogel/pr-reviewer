@@ -287,6 +287,33 @@ impl Database {
         Ok(())
     }
 
+    pub async fn update_comment_check(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        last_comment_check: &str,
+    ) -> Result<()> {
+        let path = self.path.clone();
+        let repo = repo.to_string();
+        let last_comment_check = last_comment_check.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(&path)?;
+            conn.execute(
+                r#"
+                INSERT INTO pr_state (repo, pr_number, last_comment_check, review_count)
+                VALUES (?1, ?2, ?3, 0)
+                ON CONFLICT(repo, pr_number) DO UPDATE SET
+                  last_comment_check=excluded.last_comment_check
+                "#,
+                params![repo, pr_number, last_comment_check],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+
     pub async fn set_repo_etag(&self, repo: &str, etag: Option<&str>) -> Result<()> {
         let path = self.path.clone();
         let repo = repo.to_string();

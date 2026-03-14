@@ -163,11 +163,14 @@ pub async fn start(
                             }
                         }
 
-                        db.upsert_pr_state(
+                        // Only update comment check timestamp here. The review worker
+                        // updates last_reviewed_sha when the review completes — doing it
+                        // here would race with in-flight workers and cause spurious
+                        // duplicate claim attempts on every poll cycle.
+                        db.update_comment_check(
                             &repo_name,
                             pr.number as i64,
-                            already.as_deref(),
-                            Some(&chrono::Utc::now().to_rfc3339()),
+                            &chrono::Utc::now().to_rfc3339(),
                         )
                         .await?;
                     }
