@@ -7,7 +7,9 @@ description = "Self-hosted PR review daemon that uses local AI CLI tools"
 repository = "https://github.com/nicholai/pr-reviewer"
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
+argon2 = "0.5"
 axum = { version = "0.7", features = ["macros"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

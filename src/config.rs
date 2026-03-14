@@ -82,8 +82,18 @@ pub struct HarnessConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GitHubConfig {
+    /// Plain-text token (legacy — triggers deprecation warning at runtime).
     #[serde(default)]
     pub token: Option<String>,
+    /// Base64-encoded double-encrypted token blob.
+    #[serde(default)]
+    pub encrypted_token: Option<String>,
+    /// Whether a user passphrase was used for the inner encryption layer.
+    #[serde(default)]
+    pub passphrase_protected: bool,
+    /// Preferred token source hint (e.g. "signet", "encrypted").
+    #[serde(default)]
+    pub token_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,7 +179,9 @@ fn default_enabled() -> bool {
 pub struct RepoConfig {
     pub owner: String,
     pub name: String,
-    pub local_path: PathBuf,
+    /// Local path override. When `None`, uses managed clone at `~/.config/pr-reviewer/repos/{owner}/{name}`.
+    #[serde(default)]
+    pub local_path: Option<PathBuf>,
     #[serde(default)]
     pub harness: Option<HarnessKind>,
     #[serde(default)]
@@ -321,6 +333,17 @@ impl Default for AppConfig {
 impl RepoConfig {
     pub fn full_name(&self) -> String {
         format!("{}/{}", self.owner, self.name)
+    }
+
+    /// Resolve the effective local path for this repo.
+    /// Returns `local_path` if set, otherwise the managed clone path.
+    pub fn effective_local_path(&self) -> Result<PathBuf> {
+        crate::repo_manager::resolve_local_path(self)
+    }
+
+    /// Whether this repo uses a managed (auto-cloned) path vs. a manual override.
+    pub fn is_managed(&self) -> bool {
+        self.local_path.is_none()
     }
 
     pub fn resolved_harness(&self, config: &AppConfig) -> HarnessKind {
@@ -506,6 +529,7 @@ fn get_toml_path<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value
     Some(current)
 }
 
+/// Validate that a manually-specified repo path exists.
 pub fn ensure_repo_path_exists(path: &Path) -> Result<()> {
     if !path.exists() {
         return Err(anyhow!("repo path does not exist: {}", path.display()));

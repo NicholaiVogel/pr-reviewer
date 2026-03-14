@@ -1,7 +1,7 @@
 # [[repos]]
 # owner = "your-org"
 # name = "your-repo"
-# local_path = "/path/to/local/clone"
+# local_path = "/path/to/local/clone"  # optional — omit to auto-clone to ~/.config/pr-reviewer/repos/
 # harness = "claude-code"
 # model = "claude-sonnet-4-6"
 # fork_policy = "ignore"
@@ -14,6 +14,13 @@ model = "claude-sonnet-4-6"
 timeout_secs = 600
 
 [github]
+# Token is stored encrypted. Set it with:
+#   pr-reviewer config set-token --passphrase
+#   pr-reviewer config set-token --signet
+#   pr-reviewer config set-token --stdin < token.txt
+# Or use GITHUB_TOKEN env var.
+# encrypted_token = "..."   # set automatically by set-token
+# passphrase_protected = false
 
 [daemon]
 poll_interval_secs = 30

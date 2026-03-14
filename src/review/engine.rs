@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -270,9 +269,14 @@ impl ReviewEngine {
             .collect();
 
         let gitnexus_context = if repo_cfg.gitnexus {
-            match gitnexus::query_context(Path::new(&repo_cfg.local_path), &changed_files).await {
-                Ok(Some(value)) => Some(value),
-                _ => None,
+            match repo_cfg.effective_local_path() {
+                Ok(local) => {
+                    match gitnexus::query_context(&local, &changed_files).await {
+                        Ok(Some(value)) => Some(value),
+                        _ => None,
+                    }
+                }
+                Err(_) => None,
             }
         } else {
             None
