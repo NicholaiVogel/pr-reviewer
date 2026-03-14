@@ -246,7 +246,8 @@ async fn main() -> Result<()> {
                 .cloned()
                 .ok_or_else(|| anyhow!("repo not configured: {repo_name}"))?;
 
-            let engine = ReviewEngine::new(cfg.clone(), gh, db);
+            let mut engine = ReviewEngine::new(cfg.clone(), gh, db);
+            engine.init().await;
             let result = engine
                 .review_pr(
                     &repo_cfg,

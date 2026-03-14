@@ -13,6 +13,10 @@ pub trait Harness: Send + Sync {
     fn kind(&self) -> HarnessKind;
     fn name(&self) -> &'static str;
     fn build_command(&self, prompt: &str, model: &str, working_dir: &Path) -> Command;
+    /// Whether this harness accepts the prompt via stdin instead of CLI arg.
+    fn uses_stdin(&self) -> bool {
+        false
+    }
 }
 
 pub fn for_kind(kind: HarnessKind) -> Box<dyn Harness> {

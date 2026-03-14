@@ -16,13 +16,17 @@ impl Harness for ClaudeCodeHarness {
         "claude-code"
     }
 
-    fn build_command(&self, prompt: &str, model: &str, _working_dir: &Path) -> Command {
+    fn build_command(&self, _prompt: &str, model: &str, _working_dir: &Path) -> Command {
         let mut cmd = Command::new("claude");
         cmd.arg("--model")
             .arg(model)
             .arg("--dangerously-skip-permissions")
             .arg("-p")
-            .arg(prompt);
+            .arg("-");
         cmd
+    }
+
+    fn uses_stdin(&self) -> bool {
+        true
     }
 }

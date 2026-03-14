@@ -1,10 +1,19 @@
+# [[repos]]
+# owner = "your-org"
+# name = "your-repo"
+# local_path = "/path/to/local/clone"
+# harness = "claude-code"
+# model = "claude-sonnet-4-6"
+# fork_policy = "ignore"
+# ignore_paths = ["*.lock", "vendor/**"]
+# gitnexus = true
+
 [harness]
 default = "claude-code"
 model = "claude-sonnet-4-6"
 timeout_secs = 600
 
 [github]
-token = "ghp_replace_me"
 
 [daemon]
 poll_interval_secs = 30
@@ -22,26 +31,3 @@ max_file_size_bytes = 100000
 bot_name = "pr-reviewer"
 dry_run = false
 max_prompt_bytes = 204800
-
-[[repos]]
-owner = "nicholai"
-name = "signetai"
-local_path = "/home/nicholai/signet/signetai"
-harness = "claude-code"
-model = "claude-sonnet-4-6"
-fork_policy = "ignore"
-trusted_authors = ["dependabot[bot]", "renovate[bot]"]
-ignore_paths = ["*.lock", "vendor/**", "dist/**"]
-custom_instructions = "Watch for SQL injection in ORM queries."
-gitnexus = true
-
-[[repos]]
-owner = "nicholai"
-name = "openmarketui"
-local_path = "/mnt/work/dev/openmarketui"
-harness = "codex"
-model = "gpt-5.3-codex"
-fork_policy = "ignore"
-trusted_authors = []
-ignore_paths = ["*.lock", "vendor/**", "dist/**"]
-gitnexus = true

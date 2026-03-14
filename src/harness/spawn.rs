@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
 use crate::harness::Harness;
@@ -36,10 +38,38 @@ pub async fn run_harness(
     scrub_environment(&mut command);
 
     let start = Instant::now();
-    let output = timeout(Duration::from_secs(req.timeout_secs), command.output())
+
+    let output = if harness.uses_stdin() {
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        command.kill_on_drop(true);
+        let mut child = command.spawn().context("failed to spawn harness")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let prompt = req.prompt.clone();
+            tokio::spawn(async move {
+                if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                    tracing::warn!("harness stdin write failed: {e}");
+                }
+                if let Err(e) = stdin.shutdown().await {
+                    tracing::warn!("harness stdin shutdown failed: {e}");
+                }
+            });
+        }
+        timeout(
+            Duration::from_secs(req.timeout_secs),
+            child.wait_with_output(),
+        )
         .await
         .map_err(|_| anyhow!("harness timed out after {}s", req.timeout_secs))?
-        .context("failed to spawn harness")?;
+        .context("failed to wait on harness")?
+    } else {
+        timeout(Duration::from_secs(req.timeout_secs), command.output())
+            .await
+            .map_err(|_| anyhow!("harness timed out after {}s", req.timeout_secs))?
+            .context("failed to spawn harness")?
+    };
 
     let duration = start.elapsed().as_secs_f64();
 

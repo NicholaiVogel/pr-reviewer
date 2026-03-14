@@ -3,3 +3,7 @@ target/
 .config/
 *.db
 *.pid
+.gitnexus
+.claude/
+tmp/
+test_file.txt
