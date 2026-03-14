@@ -1,6 +1,16 @@
-# pr-reviewer
+<p align="center">
+  <img src="public/logo.png" alt="pr-reviewer" width="280" />
+</p>
 
-An open-source, self-hosted PR review tool, similar to Greptile or Coderabbit. It watches your GitHub repositories for pull requests, spawns a local AI coding CLI to review them, and posts comments back to GitHub automatically.
+<h1 align="center">pr-reviewer</h1>
+
+<p align="center">
+  Open-source, self-hosted PR review tool. Like Greptile or CodeRabbit, but runs on your machine.
+</p>
+
+---
+
+Watches your GitHub repositories for pull requests, spawns a local AI coding CLI to review them, and posts structured comments back to GitHub automatically.
 
 No API keys required -- pr-reviewer uses your existing CLI subscriptions (Claude Code, OpenCode, Codex) instead of calling AI APIs directly.
 
