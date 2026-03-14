@@ -506,6 +506,12 @@ impl ReviewEngine {
         let post_result = if let Err(ref first_err) = post_result {
             let err_str = format!("{first_err}");
             if err_str.contains("(422") || err_str.contains("Can not approve") {
+                tracing::warn!(
+                    repo = %repo_cfg.full_name(),
+                    pr = pr_data.number,
+                    error = %first_err,
+                    "review post failed with 422; retrying as COMMENT with inline comments folded into body"
+                );
                 let mut retry_body = body.clone();
                 if !inline_comments.is_empty() {
                     retry_body

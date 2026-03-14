@@ -64,13 +64,17 @@ impl ConfidenceRatings {
         let sum = self.style_maintainability as u32
             + self.repo_convention_adherence as u32
             + self.merge_conflict_detection as u32
+            + self.security_vulnerability_detection as u32
+            + self.injection_risk_detection as u32
+            + self.attack_surface_risk_assessment as u32
+            + self.future_hardening_guidance as u32
             + self.scope_alignment as u32
             + self.duplication_awareness as u32
             + self.tooling_pattern_leverage as u32
             + self.functional_completeness as u32
             + self.pattern_correctness as u32
             + self.documentation_coverage as u32;
-        sum as f32 / 9.0
+        sum as f32 / 13.0
     }
 }
 
