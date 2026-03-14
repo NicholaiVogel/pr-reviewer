@@ -305,6 +305,20 @@ impl GitHubClient {
         handle_json(resp).await
     }
 
+    pub async fn get_authenticated_user(&self) -> Result<String> {
+        let resp = self
+            .request(Method::GET, "/user")
+            .send()
+            .await
+            .context("GitHub get authenticated user failed")?;
+        self.update_rate_state(resp.headers());
+        let payload: serde_json::Value = handle_json(resp).await?;
+        payload["login"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("no login in /user response"))
+    }
+
     fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
         self.client
             .request(method, format!("{}{}", self.base_url, path))

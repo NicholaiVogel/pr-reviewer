@@ -352,9 +352,22 @@ impl ReviewEngine {
             });
         }
 
+        // GitHub rejects APPROVE/REQUEST_CHANGES on your own PRs — downgrade to COMMENT
+        let event = match verdict {
+            ReviewVerdict::Approve | ReviewVerdict::RequestChanges => {
+                let authenticated_user = self.github.get_authenticated_user().await.ok();
+                if authenticated_user.as_deref() == Some(pr_data.user.login.as_str()) {
+                    "COMMENT"
+                } else {
+                    verdict.as_github_event()
+                }
+            }
+            _ => verdict.as_github_event(),
+        };
+
         let request = CreateReviewRequest {
             body: body.clone(),
-            event: verdict.as_github_event().to_string(),
+            event: event.to_string(),
             comments: inline_comments.clone(),
         };
 
@@ -367,9 +380,33 @@ impl ReviewEngine {
         )
         .await;
 
+        // If review post failed (e.g. 422 on self-review), retry as COMMENT without inline comments
+        let post_result = if let Err(ref first_err) = post_result {
+            let err_str = format!("{first_err}");
+            if err_str.contains("422") || err_str.contains("Can not approve") {
+                let retry_request = CreateReviewRequest {
+                    body: body.clone(),
+                    event: "COMMENT".to_string(),
+                    comments: vec![],
+                };
+                comments::create_review(
+                    &self.github,
+                    &repo_cfg.owner,
+                    &repo_cfg.name,
+                    pr_data.number,
+                    &retry_request,
+                )
+                .await
+            } else {
+                post_result
+            }
+        } else {
+            post_result
+        };
+
         if let Err(err) = post_result {
             let fallback = format!(
-                "Review post failed with inline comments; fallback summary posted.\n\nError: {err}\n\n{body}"
+                "Review post failed; fallback summary posted.\n\nError: {err}\n\n{body}"
             );
             comments::create_issue_comment(
                 &self.github,
