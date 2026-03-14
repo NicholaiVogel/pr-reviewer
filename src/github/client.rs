@@ -36,6 +36,11 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
+    /// Returns a reference to the raw token for use in git operations.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     pub fn new(token: String) -> Result<Self> {
         Self::new_with_base(token, "https://api.github.com")
     }

@@ -6,10 +6,15 @@ Self-hosted PR review daemon in Rust. Spawns existing AI CLI tools (claude-code,
 
 ```
 src/
-├── main.rs              # CLI entry (clap) — init, add, remove, review, start, stop, status, logs, stats, config
+├── main.rs              # CLI entry (clap) — init, add, remove, cleanup, review, start, stop, status, logs, stats, config
 ├── daemon.rs            # Polling loop with ETag caching, adaptive backoff, jitter, rate budgeting
 ├── config.rs            # TOML config (serde) at ~/.config/pr-reviewer/config.toml, CLI config commands
+├── repo_manager.rs      # Managed clone lifecycle: clone, fetch, purge, cleanup under ~/.config/pr-reviewer/repos/
 ├── safety.rs            # Path canonicalization, symlink rejection, fork policy evaluation
+├── token/
+│   ├── mod.rs           # Token resolution chain: signet → encrypted → plain text → env var
+│   ├── crypto.rs        # Double-layer AES-256-GCM encryption (keyfile + passphrase/machine-derived)
+│   └── signet.rs        # Optional Signet CLI integration for secret storage
 ├── github/
 │   ├── client.rs        # reqwest GitHub REST API client with rate-limit tracking (Arc<Mutex<RateState>>)
 │   ├── types.rs         # GitHub API response/request types (serde)
@@ -55,6 +60,14 @@ All harnesses run in a sandboxed environment:
 - `kill_on_drop(true)` on child process to prevent orphans on timeout
 - claude-code uses stdin piping (`-p -`) because prompts exceed Linux `MAX_ARG_STRLEN` (~128KB)
 
+### Token Resolution (token/mod.rs)
+
+GitHub tokens are resolved in priority order: Signet secret → encrypted config → plain-text config (warns) → `GITHUB_TOKEN` env var. Encrypted tokens use double-layer AES-256-GCM: outer layer with a machine-bound keyfile at `~/.config/pr-reviewer/keyfile` (primary security boundary, `0600` permissions), inner layer with either an Argon2id-derived passphrase key (strong, recommended) or a machine-identity-derived key (weak — uses world-readable `/etc/machine-id` + username, so keyfile is the real protection). For daemon mode with passphrase-protected tokens, set `PR_REVIEWER_PASSPHRASE` env var (required, not optional — will error if missing).
+
+### Managed Repo Clones (repo_manager.rs)
+
+When `local_path` is omitted from a repo config, the repo is auto-cloned to `~/.config/pr-reviewer/repos/{owner}/{name}/` via `git clone --single-branch`. Auth uses `http.extraHeader` (token never stored in `.git/config`). Git hooks are disabled via `core.hooksPath=/dev/null`. `fetch_latest()` is called before each review to keep the GitNexus index fresh.
+
 ### GitNexus Integration (context/gitnexus.rs)
 
 GitNexus outputs to **stderr** because KuzuDB captures stdout at OS level. The code checks both streams (preferring stderr) so it won't silently break if this behavior changes. Falls back to `None` if gitnexus CLI isn't installed or the repo isn't indexed.
@@ -93,12 +106,17 @@ Cached `authenticated_user` at engine init. Falls back to live API call if cache
 - Symlinks resolved and rejected if target is outside repo
 - Fork PRs handled per-repo policy: `ignore` (default), `limited` (diff only), `full` (trusted orgs)
 - Environment scrubbed before spawning any harness process
+- GitHub tokens encrypted at rest with double-layer AES-256-GCM; never stored in plain text by default
+- Managed repo clones use `core.hooksPath=/dev/null` and strip auth from stored remote URLs
+- Token never embedded in git clone URLs stored in `.git/config`
 
 ## State
 
 - Config: `~/.config/pr-reviewer/config.toml`
 - Database: `~/.config/pr-reviewer/state.db` (SQLite, WAL mode)
 - PID file: `~/.config/pr-reviewer/daemon.pid`
+- Keyfile: `~/.config/pr-reviewer/keyfile` (32-byte AES key, permissions `0600`)
+- Managed repos: `~/.config/pr-reviewer/repos/{owner}/{name}/`
 - Tables: `pr_state`, `review_log`, `daemon_status`, `repo_etags`, `schema_version`
 
 ## Testing

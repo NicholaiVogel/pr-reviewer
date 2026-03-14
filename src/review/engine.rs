@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -270,9 +269,29 @@ impl ReviewEngine {
             .collect();
 
         let gitnexus_context = if repo_cfg.gitnexus {
-            match gitnexus::query_context(Path::new(&repo_cfg.local_path), &changed_files).await {
-                Ok(Some(value)) => Some(value),
-                _ => None,
+            match repo_cfg.effective_local_path() {
+                Ok(local) => {
+                    // Fetch latest for managed clones so GitNexus index is fresh
+                    if repo_cfg.is_managed() {
+                        if let Err(err) = crate::repo_manager::fetch_latest(
+                            &local,
+                            self.github.token(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                repo = %repo_cfg.full_name(),
+                                error = %err,
+                                "failed to fetch latest for managed clone; using stale state"
+                            );
+                        }
+                    }
+                    match gitnexus::query_context(&local, &changed_files).await {
+                        Ok(Some(value)) => Some(value),
+                        _ => None,
+                    }
+                }
+                Err(_) => None,
             }
         } else {
             None

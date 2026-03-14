@@ -1,6 +1,16 @@
-# pr-reviewer
+<p align="center">
+  <img src="public/logo.png" alt="pr-reviewer" width="280" />
+</p>
 
-A self-hosted PR review daemon written in Rust. It watches your GitHub repositories for pull requests, spawns a local AI coding CLI to review them, and posts comments back to GitHub automatically.
+<h1 align="center">pr-reviewer</h1>
+
+<p align="center">
+  Open-source, self-hosted PR review tool. Like Greptile or CodeRabbit, but runs on your machine.
+</p>
+
+---
+
+Watches your GitHub repositories for pull requests, spawns a local AI coding CLI to review them, and posts structured comments back to GitHub automatically.
 
 No API keys required -- pr-reviewer uses your existing CLI subscriptions (Claude Code, OpenCode, Codex) instead of calling AI APIs directly.
 
@@ -62,15 +72,29 @@ This creates `~/.config/pr-reviewer/config.toml` and the SQLite state database.
 ### 2. Set your GitHub token
 
 ```bash
-pr-reviewer config set github.token ghp_your_token_here
+# encrypt and store (prompted for token + optional passphrase)
+pr-reviewer config set-token --passphrase
+
+# or pipe from stdin
+echo "ghp_..." | pr-reviewer config set-token --stdin
+
+# or store in Signet (if installed)
+pr-reviewer config set-token --signet
+
+# check what's configured
+pr-reviewer config token-status
 ```
 
 ### 3. Add a repository
 
 ```bash
-pr-reviewer add owner/repo --path /path/to/local/clone \
+# auto-clones to ~/.config/pr-reviewer/repos/ (recommended)
+pr-reviewer add owner/repo \
   --harness claude-code \
   --model claude-sonnet-4-6
+
+# or point to an existing local clone
+pr-reviewer add owner/repo --path /path/to/local/clone
 ```
 
 If GitNexus is installed, this automatically runs `gitnexus analyze` to index the repo.
@@ -125,7 +149,8 @@ Each repo can override the global harness, model, fork policy, and review instru
 [[repos]]
 owner = "nicholai"
 name = "openmarketui"
-local_path = "/mnt/work/dev/openmarketui"
+# local_path is optional — omit to use auto-managed clone at ~/.config/pr-reviewer/repos/
+# local_path = "/mnt/work/dev/openmarketui"
 harness = "codex"
 model = "gpt-5.3-codex"
 fork_policy = "ignore"
@@ -154,10 +179,14 @@ Creates config and SQLite state in `~/.config/pr-reviewer/`.
 
 ### `add`
 ```bash
-pr-reviewer add <owner/repo> --path <local_path> \
+# auto-clones to managed directory
+pr-reviewer add <owner/repo> \
   [--harness claude-code|opencode|codex] \
   [--model <model>] \
   [--fork-policy ignore|limited|full]
+
+# or use an existing local clone
+pr-reviewer add <owner/repo> --path <local_path> [...]
 
 pr-reviewer add --scan <directory>
 pr-reviewer add --org <org>   # currently not implemented
@@ -166,6 +195,12 @@ pr-reviewer add --org <org>   # currently not implemented
 ### `remove`
 ```bash
 pr-reviewer remove <owner/repo>
+pr-reviewer remove <owner/repo> --purge   # also deletes managed clone
+```
+
+### `cleanup`
+```bash
+pr-reviewer cleanup   # removes orphaned managed clones
 ```
 
 ### `list`
@@ -226,13 +261,19 @@ pr-reviewer stats [--repo <owner/repo>] [--since <datetime>]
 pr-reviewer config list
 pr-reviewer config get <key>
 pr-reviewer config set <key> <value>
+
+# Token management
+pr-reviewer config set-token [--passphrase] [--signet] [--stdin] [TOKEN]
+pr-reviewer config remove-token
+pr-reviewer config token-status
 ```
 
 Examples:
 ```bash
 pr-reviewer config set harness.default codex
 pr-reviewer config set daemon.poll_interval_secs 60
-pr-reviewer config get github.token
+pr-reviewer config set-token --passphrase
+pr-reviewer config token-status
 ```
 
 ## Supported harnesses
@@ -250,10 +291,30 @@ Model resolution: per-repo config > global `harness.model` > harness default.
 pr-reviewer runs AI tools against potentially untrusted code. The safety model includes:
 
 - **Sandboxed execution**: harnesses run in a temporary directory, not the repo root
+- **Managed repo clones**: repos are auto-cloned to `~/.config/pr-reviewer/repos/`, keeping your working repos isolated from review agents
+- **Encrypted token storage**: GitHub tokens encrypted at rest with double-layer AES-256-GCM (machine-bound keyfile + passphrase/machine-derived key)
 - **Environment scrubbing**: `HOME`, `SSH_AUTH_SOCK`, `GH_TOKEN`, `AWS_*`, `ANTHROPIC_API_KEY`, and other sensitive variables are stripped from the harness environment
 - **Fork policy**: configurable per-repo (`ignore`, `limited`, `full`) with trusted author allowlists
 - **Path validation**: canonicalization and containment checks reject traversal attacks and symlink escapes
 - **Signet bypass**: `SIGNET_NO_HOOKS=1` prevents hook invocation in spawned processes
+- **Optional Signet secrets**: tokens can be stored in Signet's encrypted secret store for unified credential management
+
+## Token security
+
+GitHub tokens are never stored in plain text by default. The `set-token` command encrypts tokens with two independent AES-256-GCM layers:
+
+1. **Machine-bound key**: a random 32-byte key stored at `~/.config/pr-reviewer/keyfile` (permissions `0600`) -- this is the primary protection layer; anyone who can read this file can decrypt the token
+2. **Passphrase or machine identity**: if `--passphrase` is used, the inner layer is derived via Argon2id from your passphrase, providing strong protection even if the keyfile is compromised. Without `--passphrase`, the inner layer uses `/etc/machine-id` + username (world-readable inputs, so the keyfile is your real security boundary)
+
+Token resolution order:
+1. Signet secret store (if Signet is installed and has the secret)
+2. Encrypted config (`github.encrypted_token`)
+3. Plain-text config (`github.token`) -- legacy, emits a warning
+4. `GITHUB_TOKEN` environment variable
+
+For daemon mode with passphrase-protected tokens, set `PR_REVIEWER_PASSPHRASE` as an environment variable.
+
+Run `pr-reviewer config token-status` to see which source is active.
 
 ## GitNexus integration
 

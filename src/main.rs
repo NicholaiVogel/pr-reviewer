@@ -3,10 +3,12 @@ mod context;
 mod daemon;
 mod github;
 mod harness;
+mod repo_manager;
 mod review;
 mod safety;
 mod serve;
 mod store;
+mod token;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,7 +33,10 @@ enum Commands {
     Add(AddArgs),
     Remove {
         repo: String,
+        #[arg(long)]
+        purge: bool,
     },
+    Cleanup,
     List,
     Index {
         repo: Option<String>,
@@ -105,6 +110,22 @@ enum ConfigCommand {
     Set { key: String, value: String },
     Get { key: String },
     List,
+    /// Encrypt and store a GitHub token
+    SetToken {
+        /// Read token from stdin instead of prompting
+        #[arg(long)]
+        stdin: bool,
+        /// Protect with a passphrase (prompted interactively)
+        #[arg(long)]
+        passphrase: bool,
+        /// Store in Signet secret store instead of config file
+        #[arg(long)]
+        signet: bool,
+    },
+    /// Remove stored GitHub token
+    RemoveToken,
+    /// Show which token source is active
+    TokenStatus,
 }
 
 #[tokio::main]
@@ -145,18 +166,27 @@ async fn main() -> Result<()> {
             let repo = args
                 .repo
                 .ok_or_else(|| anyhow!("repo argument required (owner/repo)"))?;
-            let path = args
-                .path
-                .ok_or_else(|| anyhow!("--path is required for add"))?;
 
             let (owner, name) = parse_repo_full_name(&repo)?;
-            config::ensure_repo_path_exists(&path)?;
+
+            // If --path is provided, validate it exists. Otherwise, auto-clone.
+            let local_path = if let Some(ref path) = args.path {
+                config::ensure_repo_path_exists(path)?;
+                Some(path.clone())
+            } else {
+                // Auto-clone: need a token to authenticate the clone
+                let token_cfg = AppConfig::load_or_default()?;
+                let (tok, _) = token::resolve_github_token(&token_cfg).await?;
+                let clone_path = repo_manager::ensure_cloned(&owner, &name, &tok).await?;
+                println!("cloned to {}", clone_path.display());
+                None // managed path, not stored in config
+            };
 
             let fork_policy = parse_fork_policy(&args.fork_policy)?;
             let repo_cfg = RepoConfig {
                 owner,
                 name,
-                local_path: path.clone(),
+                local_path,
                 harness: args.harness,
                 model: args.model,
                 fork_policy,
@@ -176,19 +206,47 @@ async fn main() -> Result<()> {
             println!("added repo {repo_name}");
 
             if repo_cfg.gitnexus {
-                match context::gitnexus::run_analyze(Path::new(&repo_cfg.local_path)).await {
-                    Ok(_) => println!("gitnexus index built for {repo_name}"),
-                    Err(err) => println!("warning: gitnexus analyze failed for {repo_name}: {err}"),
+                if let Ok(effective_path) = repo_cfg.effective_local_path() {
+                    match context::gitnexus::run_analyze(&effective_path).await {
+                        Ok(_) => println!("gitnexus index built for {repo_name}"),
+                        Err(err) => {
+                            println!("warning: gitnexus analyze failed for {repo_name}: {err}")
+                        }
+                    }
                 }
             }
         }
-        Commands::Remove { repo } => {
+        Commands::Remove { repo, purge } => {
             let mut cfg = AppConfig::load_or_default()?;
+            let was_managed = cfg
+                .get_repo(&repo)
+                .map(|r| r.is_managed())
+                .unwrap_or(false);
             if cfg.remove_repo(&repo) {
                 cfg.save()?;
                 println!("removed {repo}");
+                if purge && was_managed {
+                    let (owner, name) = parse_repo_full_name(&repo)?;
+                    match repo_manager::purge(&owner, &name).await {
+                        Ok(true) => println!("purged managed clone for {repo}"),
+                        Ok(false) => println!("no managed clone found for {repo}"),
+                        Err(err) => println!("warning: failed to purge clone: {err}"),
+                    }
+                }
             } else {
                 println!("repo not found: {repo}");
+            }
+        }
+        Commands::Cleanup => {
+            let cfg = AppConfig::load_or_default()?;
+            let removed = repo_manager::cleanup(&cfg.repos).await?;
+            if removed.is_empty() {
+                println!("no orphaned managed clones found");
+            } else {
+                for r in &removed {
+                    println!("removed orphaned clone: {r}");
+                }
+                println!("cleaned up {} orphaned clone(s)", removed.len());
             }
         }
         Commands::List => {
@@ -199,10 +257,15 @@ async fn main() -> Result<()> {
                 for repo in &cfg.repos {
                     let harness = repo.resolved_harness(&cfg);
                     let model = repo.resolved_model(&cfg);
+                    let path = repo
+                        .effective_local_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "(unresolved)".to_string());
+                    let managed = if repo.is_managed() { " [managed]" } else { "" };
                     println!(
-                        "{}  path={}  harness={}  model={}  fork_policy={:?}",
+                        "{}  path={}{managed}  harness={}  model={}  fork_policy={:?}",
                         repo.full_name(),
-                        repo.local_path.display(),
+                        path,
                         harness,
                         model,
                         repo.fork_policy
@@ -215,9 +278,12 @@ async fn main() -> Result<()> {
             if all {
                 for repo in &cfg.repos {
                     println!("indexing {}...", repo.full_name());
-                    match context::gitnexus::run_analyze(Path::new(&repo.local_path)).await {
-                        Ok(_) => println!("  ok"),
-                        Err(err) => println!("  failed: {err}"),
+                    match repo.effective_local_path() {
+                        Ok(path) => match context::gitnexus::run_analyze(&path).await {
+                            Ok(_) => println!("  ok"),
+                            Err(err) => println!("  failed: {err}"),
+                        },
+                        Err(err) => println!("  failed to resolve path: {err}"),
                     }
                 }
             } else {
@@ -225,14 +291,15 @@ async fn main() -> Result<()> {
                 let repo_cfg = cfg
                     .get_repo(&target)
                     .ok_or_else(|| anyhow!("repo not configured: {target}"))?;
-                context::gitnexus::run_analyze(Path::new(&repo_cfg.local_path)).await?;
+                let path = repo_cfg.effective_local_path()?;
+                context::gitnexus::run_analyze(&path).await?;
                 println!("index refreshed for {target}");
             }
         }
         Commands::Start { daemon: daemonize } => {
             let cfg = AppConfig::load_or_default()?;
             let db = Database::new(AppConfig::db_file()?).await?;
-            let gh = github_client_from_config(&cfg)?;
+            let gh = github_client_from_config(&cfg).await?;
             daemon::start(cfg, db, gh, daemonize).await?;
         }
         Commands::Stop => {
@@ -246,7 +313,7 @@ async fn main() -> Result<()> {
         } => {
             let cfg = Arc::new(AppConfig::load_or_default()?);
             let db = Database::new(AppConfig::db_file()?).await?;
-            let gh = github_client_from_config(&cfg)?;
+            let gh = github_client_from_config(&cfg).await?;
 
             let (repo_name, pr_number) = parse_target(&target)?;
             let repo_cfg = cfg
@@ -280,7 +347,7 @@ async fn main() -> Result<()> {
         Commands::Status => {
             let cfg = AppConfig::load_or_default()?;
             let db = Database::new(AppConfig::db_file()?).await?;
-            let gh = github_client_from_config(&cfg)?;
+            let gh = github_client_from_config(&cfg).await?;
             let status = daemon::status(&db).await?;
             let rate = gh.rate_state();
             println!("{status}");
@@ -360,6 +427,107 @@ async fn main() -> Result<()> {
                 ConfigCommand::List => {
                     println!("{}", cfg.list_toml()?);
                 }
+                ConfigCommand::SetToken {
+                    stdin,
+                    passphrase,
+                    signet,
+                } => {
+                    if stdin && passphrase {
+                        return Err(anyhow!(
+                            "--stdin and --passphrase are mutually exclusive; \
+                             use PR_REVIEWER_PASSPHRASE env var with --stdin instead"
+                        ));
+                    }
+
+                    // Read the token from stdin, existing config, or interactive prompt (no echo)
+                    let raw_token = if stdin {
+                        let mut buf = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                            .context("failed to read token from stdin")?;
+                        buf.trim().to_string()
+                    } else if let Some(ref existing) = cfg.github.token {
+                        // Migrate existing plain-text token
+                        println!("migrating existing plain-text token to encrypted storage");
+                        existing.clone()
+                    } else {
+                        // Interactive prompt with no echo
+                        rpassword::prompt_password("GitHub token: ")
+                            .context("failed to read token")?
+                            .trim()
+                            .to_string()
+                    };
+
+                    if raw_token.is_empty() {
+                        return Err(anyhow!("token cannot be empty"));
+                    }
+
+                    // Validate format (warn but don't block)
+                    if let Err(warn) = token::crypto::validate_token_format(&raw_token) {
+                        eprintln!("warning: {warn}");
+                    }
+
+                    if signet {
+                        token::signet::store_token(&raw_token).await?;
+                        // Clear any config-stored tokens
+                        cfg.github.token = None;
+                        cfg.github.encrypted_token = None;
+                        cfg.github.passphrase_protected = false;
+                        cfg.save()?;
+                        println!("token stored in Signet secret store");
+                    } else {
+                        let pp = if passphrase {
+                            let pp = rpassword::prompt_password("passphrase: ")
+                                .context("failed to read passphrase")?
+                                .trim()
+                                .to_string();
+                            if pp.is_empty() {
+                                return Err(anyhow!("passphrase cannot be empty"));
+                            }
+                            Some(pp)
+                        } else {
+                            None
+                        };
+
+                        let encrypted =
+                            token::crypto::encrypt_token(&raw_token, pp.as_deref())?;
+
+                        cfg.github.encrypted_token = Some(encrypted);
+                        cfg.github.passphrase_protected = pp.is_some();
+                        cfg.github.token = None; // remove legacy plain text
+                        cfg.save()?;
+
+                        let method = if pp.is_some() {
+                            "passphrase-protected"
+                        } else {
+                            "machine-bound"
+                        };
+                        println!("token encrypted ({method}) and saved to config");
+                    }
+                }
+                ConfigCommand::RemoveToken => {
+                    cfg.github.token = None;
+                    cfg.github.encrypted_token = None;
+                    cfg.github.passphrase_protected = false;
+                    cfg.save()?;
+                    println!("token removed from config");
+
+                    // Also attempt to remove from Signet
+                    if let Err(err) = token::signet::delete_token().await {
+                        tracing::debug!(error = %err, "signet token deletion failed");
+                    }
+                    println!("done");
+                }
+                ConfigCommand::TokenStatus => {
+                    match token::token_status(&cfg).await {
+                        Some((source, preview)) => {
+                            println!("source: {source}");
+                            println!("preview: {preview}");
+                        }
+                        None => {
+                            println!("no GitHub token configured");
+                        }
+                    }
+                }
             }
         }
     }
@@ -392,16 +560,9 @@ fn parse_fork_policy(raw: &str) -> Result<ForkPolicy> {
     }
 }
 
-fn github_client_from_config(config: &AppConfig) -> Result<GitHubClient> {
-    let token = config
-        .github
-        .token
-        .clone()
-        .or_else(|| std::env::var("GITHUB_TOKEN").ok())
-        .ok_or_else(|| {
-            anyhow!("GitHub token missing: set github.token in config or GITHUB_TOKEN env")
-        })?;
-
+async fn github_client_from_config(config: &AppConfig) -> Result<GitHubClient> {
+    let (token, source) = token::resolve_github_token(config).await?;
+    tracing::info!(source = %source, "GitHub token resolved");
     GitHubClient::new(token)
 }
 
@@ -426,7 +587,7 @@ fn add_scanned_repos(cfg: &mut AppConfig, scan_dir: &Path) -> Result<()> {
         let repo = RepoConfig {
             owner: "local".to_string(),
             name: name.to_string(),
-            local_path: path,
+            local_path: Some(path),
             harness: None,
             model: None,
             fork_policy: ForkPolicy::Ignore,
