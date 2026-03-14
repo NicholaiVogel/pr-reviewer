@@ -136,34 +136,103 @@ gitnexus = true
 
 ## CLI reference
 
-### Repo management
 ```
-pr-reviewer add <owner/repo> --path <local>   add a repo
-  [--harness <name>] [--model <model>]        set harness and model
-  [--fork-policy <policy>]                    ignore | limited | full
-pr-reviewer remove <owner/repo>               remove a repo
-pr-reviewer list                              list all configured repos
-pr-reviewer index <owner/repo>                re-run gitnexus analyze
+pr-reviewer <COMMAND> [OPTIONS]
 ```
 
-### Reviewing
-```
-pr-reviewer review <owner/repo>#<number>      review a specific PR
-  [--dry-run]                                 log without posting
-  [--harness <name>] [--model <model>]        override for this review
-```
-
-### Daemon
-```
-pr-reviewer start [--daemon]                  start polling (--daemon for background)
-pr-reviewer stop                              stop backgrounded daemon
-pr-reviewer status                            daemon state, rate limits, recent reviews
+### Global help
+```bash
+pr-reviewer --help
+pr-reviewer <command> --help
 ```
 
-### Usage tracking
+### `init`
+```bash
+pr-reviewer init
 ```
-pr-reviewer logs [--repo <r>] [--since <d>]   review history
-pr-reviewer stats [--repo <r>] [--since <d>]  usage summary by repo, model, harness
+Creates config and SQLite state in `~/.config/pr-reviewer/`.
+
+### `add`
+```bash
+pr-reviewer add <owner/repo> --path <local_path> \
+  [--harness claude-code|opencode|codex] \
+  [--model <model>] \
+  [--fork-policy ignore|limited|full]
+
+pr-reviewer add --scan <directory>
+pr-reviewer add --org <org>   # currently not implemented
+```
+
+### `remove`
+```bash
+pr-reviewer remove <owner/repo>
+```
+
+### `list`
+```bash
+pr-reviewer list
+```
+
+### `index`
+```bash
+pr-reviewer index <owner/repo>
+pr-reviewer index --all
+```
+Runs `gitnexus analyze` for the target repo(s).
+
+### `review`
+```bash
+pr-reviewer review <owner/repo>#<pr_number> \
+  [--dry-run] \
+  [--harness claude-code|opencode|codex] \
+  [--model <model>]
+```
+
+### `start`
+```bash
+pr-reviewer start
+pr-reviewer start --daemon
+```
+Starts polling loop in foreground or background.
+
+### `stop`
+```bash
+pr-reviewer stop
+```
+
+### `status`
+```bash
+pr-reviewer status
+```
+Shows daemon/process state and recent polling metadata.
+
+### `logs`
+```bash
+pr-reviewer logs \
+  [--repo <owner/repo>] \
+  [--since <datetime>] \
+  [--model <model>] \
+  [--harness <harness>] \
+  [--limit <n>]
+```
+
+### `stats`
+```bash
+pr-reviewer stats [--repo <owner/repo>] [--since <datetime>]
+```
+
+### `config`
+```bash
+pr-reviewer config list
+pr-reviewer config get <key>
+pr-reviewer config set <key> <value>
+```
+
+Examples:
+```bash
+pr-reviewer config set harness.default codex
+pr-reviewer config set daemon.poll_interval_secs 60
+pr-reviewer config get github.token
 ```
 
 ## Supported harnesses
