@@ -62,8 +62,15 @@ pub async fn query_context(repo_root: &Path, files: &[String]) -> Result<Option<
         return Ok(None);
     }
 
-    // GitNexus outputs to stderr because KuzuDB captures stdout at OS level
-    let text = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    // GitNexus currently outputs to stderr because KuzuDB captures stdout at OS level.
+    // Check both streams so this doesn't silently break if that behavior changes.
+    let stderr_text = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let text = if !stderr_text.is_empty() {
+        stderr_text
+    } else {
+        stdout_text
+    };
     if text.is_empty() {
         return Ok(None);
     }

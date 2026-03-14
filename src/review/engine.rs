@@ -145,29 +145,50 @@ impl ReviewEngine {
         }
 
         let dry_run = options.dry_run || self.config.defaults.dry_run;
+
+        // Check if we already posted a review for this SHA before posting in-progress comment,
+        // to avoid orphaned "started reviewing" comments when the already-posted guard fires.
         if !dry_run {
-            let in_progress = format!(
-                "🔍 `{}` started reviewing commit `{}` with `{}` (`{}`). I will post findings when the review completes.",
-                self.config.defaults.bot_name,
-                short_sha(&pr_data.head.sha),
-                harness_kind.as_str(),
-                model
-            );
-            if let Err(err) = comments::create_issue_comment(
+            let existing_reviews = comments::get_existing_reviews(
                 &self.github,
                 &repo_cfg.owner,
                 &repo_cfg.name,
                 pr_data.number,
-                &in_progress,
             )
             .await
-            {
-                tracing::warn!(
-                    repo = %repo_cfg.full_name(),
-                    pr = pr_data.number,
-                    error = %err,
-                    "failed to post in-progress review comment"
+            .unwrap_or_default();
+
+            let already_posted = existing_reviews.iter().any(|r| {
+                r.commit_id.as_deref() == Some(pr_data.head.sha.as_str())
+                    && r.user
+                        .login
+                        .eq_ignore_ascii_case(self.config.defaults.bot_name.as_str())
+            });
+
+            if !already_posted {
+                let in_progress = format!(
+                    "🔍 `{}` started reviewing commit `{}` with `{}` (`{}`). I will post findings when the review completes.",
+                    self.config.defaults.bot_name,
+                    short_sha(&pr_data.head.sha),
+                    harness_kind.as_str(),
+                    model
                 );
+                if let Err(err) = comments::create_issue_comment(
+                    &self.github,
+                    &repo_cfg.owner,
+                    &repo_cfg.name,
+                    pr_data.number,
+                    &in_progress,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        repo = %repo_cfg.full_name(),
+                        pr = pr_data.number,
+                        error = %err,
+                        "failed to post in-progress review comment"
+                    );
+                }
             }
         }
 
@@ -456,7 +477,10 @@ impl ReviewEngine {
                 match bot_login.as_deref() {
                     Some(u) if u.eq_ignore_ascii_case(&pr_data.user.login) => "COMMENT",
                     Some(_) => verdict.as_github_event(),
-                    None => "COMMENT",
+                    None => {
+                        tracing::warn!("could not determine authenticated user; downgrading verdict to COMMENT");
+                        "COMMENT"
+                    }
                 }
             }
         };
@@ -478,6 +502,7 @@ impl ReviewEngine {
 
         // If review post failed (e.g. 422 on self-review), retry as COMMENT without inline comments.
         // Append the inline comments to the body so they're not silently lost.
+        let mut used_retry = false;
         let post_result = if let Err(ref first_err) = post_result {
             let err_str = format!("{first_err}");
             if err_str.contains("(422") || err_str.contains("Can not approve") {
@@ -494,6 +519,7 @@ impl ReviewEngine {
                     event: "COMMENT".to_string(),
                     comments: vec![],
                 };
+                used_retry = true;
                 comments::create_review(
                     &self.github,
                     &repo_cfg.owner,
@@ -522,10 +548,16 @@ impl ReviewEngine {
             .await?;
         }
 
+        // When 422 retry posted comments in the body instead of inline, record 0 inline comments
+        let posted_inline = if used_retry {
+            0
+        } else {
+            inline_comments.len() as i64
+        };
         self.db
             .complete_review(
                 &dedupe,
-                inline_comments.len() as i64,
+                posted_inline,
                 Some(confidence_verdict_label(verdict, confidence.as_ref())),
                 harness_output.duration_secs,
                 assembled.files_included as i64,
@@ -607,7 +639,7 @@ impl ReviewEngine {
         prompt.push_str("Use the latest diff and thread context to determine whether the issue appears fixed.\n");
         prompt.push_str("If fixed, say so explicitly and reference concrete evidence. If not fixed, explain what remains.\n");
         prompt.push_str("Output JSON in a fenced block tagged exactly `pr-review-reply-json` with this schema:\n");
-        prompt.push_str("{\"reply\": string, \"confidence\": {style_maintainability, repo_convention_adherence, merge_conflict_detection, scope_alignment, duplication_awareness, tooling_pattern_leverage, functional_completeness, pattern_correctness, documentation_coverage}}\n");
+        prompt.push_str("{\"reply\": string, \"confidence\": {style_maintainability, repo_convention_adherence, merge_conflict_detection, security_vulnerability_detection, injection_risk_detection, attack_surface_risk_assessment, future_hardening_guidance, scope_alignment, duplication_awareness, tooling_pattern_leverage, functional_completeness, pattern_correctness, documentation_coverage}}\n");
         prompt.push_str("All confidence values must be integers from 1 to 10.\n\n");
         prompt.push_str(&format!("Repo: {}/{}\n", repo_cfg.owner, repo_cfg.name));
         prompt.push_str(&format!("PR: #{}\n", pr_data.number));
@@ -819,10 +851,7 @@ fn confidence_verdict_label(
 
 fn format_confidence_markdown(conf: &ConfidenceRatings) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "### Confidence: {:.1}/10\n",
-        conf.average()
-    ));
+    out.push_str(&format!("### Confidence: {:.1}/10\n", conf.average()));
     out.push_str(&format!(
         "- Style consistency & maintainability: {}\n",
         conf.style_maintainability
@@ -834,6 +863,22 @@ fn format_confidence_markdown(conf: &ConfidenceRatings) -> String {
     out.push_str(&format!(
         "- Merge conflict detection confidence: {}\n",
         conf.merge_conflict_detection
+    ));
+    out.push_str(&format!(
+        "- Security vulnerability detection confidence: {}\n",
+        conf.security_vulnerability_detection
+    ));
+    out.push_str(&format!(
+        "- Injection risk detection confidence: {}\n",
+        conf.injection_risk_detection
+    ));
+    out.push_str(&format!(
+        "- Attack-surface risk assessment confidence: {}\n",
+        conf.attack_surface_risk_assessment
+    ));
+    out.push_str(&format!(
+        "- Future hardening guidance confidence: {}\n",
+        conf.future_hardening_guidance
     ));
     out.push_str(&format!(
         "- Scope alignment confidence: {}\n",

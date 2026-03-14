@@ -24,6 +24,10 @@ pub struct ConfidenceRatings {
     pub style_maintainability: u8,
     pub repo_convention_adherence: u8,
     pub merge_conflict_detection: u8,
+    pub security_vulnerability_detection: u8,
+    pub injection_risk_detection: u8,
+    pub attack_surface_risk_assessment: u8,
+    pub future_hardening_guidance: u8,
     pub scope_alignment: u8,
     pub duplication_awareness: u8,
     pub tooling_pattern_leverage: u8,
@@ -37,6 +41,16 @@ impl ConfidenceRatings {
         validate_confidence("style_maintainability", self.style_maintainability)?;
         validate_confidence("repo_convention_adherence", self.repo_convention_adherence)?;
         validate_confidence("merge_conflict_detection", self.merge_conflict_detection)?;
+        validate_confidence(
+            "security_vulnerability_detection",
+            self.security_vulnerability_detection,
+        )?;
+        validate_confidence("injection_risk_detection", self.injection_risk_detection)?;
+        validate_confidence(
+            "attack_surface_risk_assessment",
+            self.attack_surface_risk_assessment,
+        )?;
+        validate_confidence("future_hardening_guidance", self.future_hardening_guidance)?;
         validate_confidence("scope_alignment", self.scope_alignment)?;
         validate_confidence("duplication_awareness", self.duplication_awareness)?;
         validate_confidence("tooling_pattern_leverage", self.tooling_pattern_leverage)?;
@@ -263,7 +277,7 @@ mod tests {
     use super::*;
 
     fn confidence_json() -> &'static str {
-        r#""confidence":{"style_maintainability":8,"repo_convention_adherence":8,"merge_conflict_detection":7,"scope_alignment":9,"duplication_awareness":8,"tooling_pattern_leverage":8,"functional_completeness":7,"pattern_correctness":8,"documentation_coverage":6}"#
+        r#""confidence":{"style_maintainability":8,"repo_convention_adherence":8,"merge_conflict_detection":7,"security_vulnerability_detection":8,"injection_risk_detection":8,"attack_surface_risk_assessment":7,"future_hardening_guidance":7,"scope_alignment":9,"duplication_awareness":8,"tooling_pattern_leverage":8,"functional_completeness":7,"pattern_correctness":8,"documentation_coverage":6}"#
     }
 
     #[test]
@@ -303,7 +317,7 @@ mod tests {
     #[test]
     fn confidence_out_of_range_falls_back_to_raw() {
         let input = r#"```pr-review-json
-{"summary":"bad","verdict":"comment","confidence":{"style_maintainability":0,"repo_convention_adherence":8,"merge_conflict_detection":7,"scope_alignment":9,"duplication_awareness":8,"tooling_pattern_leverage":8,"functional_completeness":7,"pattern_correctness":8,"documentation_coverage":6},"comments":[]}
+{"summary":"bad","verdict":"comment","confidence":{"style_maintainability":0,"repo_convention_adherence":8,"merge_conflict_detection":7,"security_vulnerability_detection":8,"injection_risk_detection":8,"attack_surface_risk_assessment":7,"future_hardening_guidance":7,"scope_alignment":9,"duplication_awareness":8,"tooling_pattern_leverage":8,"functional_completeness":7,"pattern_correctness":8,"documentation_coverage":6},"comments":[]}
 ```"#;
         let parsed = parse_review_output(input, "").expect("parse output");
         assert!(matches!(parsed, ParseOutcome::RawSummary(_)));

@@ -20,6 +20,10 @@ pub fn build_review_prompt(
     prompt.push_str("  - style_maintainability\n");
     prompt.push_str("  - repo_convention_adherence\n");
     prompt.push_str("  - merge_conflict_detection\n");
+    prompt.push_str("  - security_vulnerability_detection\n");
+    prompt.push_str("  - injection_risk_detection\n");
+    prompt.push_str("  - attack_surface_risk_assessment\n");
+    prompt.push_str("  - future_hardening_guidance\n");
     prompt.push_str("  - scope_alignment\n");
     prompt.push_str("  - duplication_awareness\n");
     prompt.push_str("  - tooling_pattern_leverage\n");
@@ -35,6 +39,12 @@ pub fn build_review_prompt(
     prompt.push_str(
         "If prior review history is provided, explicitly mention what was fixed and what remains unresolved.\n\n",
     );
+    prompt.push_str(
+        "Always check for introduced security vulnerabilities, injection risks, and attack-surface expansion.\n",
+    );
+    prompt.push_str(
+        "If risk increases, include future hardening adjustments in your summary or comments.\n\n",
+    );
 
     prompt.push_str("Example output:\n");
     prompt.push_str("```pr-review-json\n");
@@ -45,6 +55,10 @@ pub fn build_review_prompt(
     prompt.push_str("    \"style_maintainability\": 8,\n");
     prompt.push_str("    \"repo_convention_adherence\": 9,\n");
     prompt.push_str("    \"merge_conflict_detection\": 7,\n");
+    prompt.push_str("    \"security_vulnerability_detection\": 8,\n");
+    prompt.push_str("    \"injection_risk_detection\": 8,\n");
+    prompt.push_str("    \"attack_surface_risk_assessment\": 7,\n");
+    prompt.push_str("    \"future_hardening_guidance\": 7,\n");
     prompt.push_str("    \"scope_alignment\": 8,\n");
     prompt.push_str("    \"duplication_awareness\": 8,\n");
     prompt.push_str("    \"tooling_pattern_leverage\": 7,\n");

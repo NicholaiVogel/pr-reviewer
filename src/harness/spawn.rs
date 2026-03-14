@@ -49,8 +49,12 @@ pub async fn run_harness(
         if let Some(mut stdin) = child.stdin.take() {
             let prompt = req.prompt.clone();
             tokio::spawn(async move {
-                let _ = stdin.write_all(prompt.as_bytes()).await;
-                let _ = stdin.shutdown().await;
+                if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                    tracing::warn!("harness stdin write failed: {e}");
+                }
+                if let Err(e) = stdin.shutdown().await {
+                    tracing::warn!("harness stdin shutdown failed: {e}");
+                }
             });
         }
         timeout(
