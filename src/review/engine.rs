@@ -354,6 +354,7 @@ impl ReviewEngine {
 
         // GitHub rejects APPROVE/REQUEST_CHANGES on your own PRs — downgrade to COMMENT
         let event = match verdict {
+            ReviewVerdict::Comment => verdict.as_github_event(),
             ReviewVerdict::Approve | ReviewVerdict::RequestChanges => {
                 let authenticated_user = self.github.get_authenticated_user().await.ok();
                 if authenticated_user.as_deref() == Some(pr_data.user.login.as_str()) {
@@ -362,7 +363,6 @@ impl ReviewEngine {
                     verdict.as_github_event()
                 }
             }
-            _ => verdict.as_github_event(),
         };
 
         let request = CreateReviewRequest {
@@ -380,12 +380,20 @@ impl ReviewEngine {
         )
         .await;
 
-        // If review post failed (e.g. 422 on self-review), retry as COMMENT without inline comments
+        // If review post failed (e.g. 422 on self-review), retry as COMMENT without inline comments.
+        // Append the inline comments to the body so they're not silently lost.
         let post_result = if let Err(ref first_err) = post_result {
             let err_str = format!("{first_err}");
             if err_str.contains("422") || err_str.contains("Can not approve") {
+                let mut retry_body = body.clone();
+                if !inline_comments.is_empty() {
+                    retry_body.push_str("\n\n**Inline comments (could not post as line comments):**\n");
+                    for c in &inline_comments {
+                        retry_body.push_str(&format!("- `{}:{}` — {}\n", c.path, c.line, c.body));
+                    }
+                }
                 let retry_request = CreateReviewRequest {
-                    body: body.clone(),
+                    body: retry_body,
                     event: "COMMENT".to_string(),
                     comments: vec![],
                 };
