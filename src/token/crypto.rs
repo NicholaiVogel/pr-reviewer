@@ -30,8 +30,12 @@ pub fn ensure_keyfile() -> Result<[u8; KEY_LEN]> {
     OsRng.fill_bytes(&mut key);
     match write_keyfile_exclusive(&path, &key) {
         Ok(()) => return Ok(key),
-        Err(_) => {
-            // File already exists — read it
+        Err(err) => {
+            // Only fall through to reading if the file actually exists now;
+            // otherwise propagate the real error (permission denied, disk full, etc.)
+            if !path.exists() {
+                return Err(err);
+            }
             let data = fs::read(&path).context("failed to read keyfile")?;
             check_keyfile_permissions(&path);
             if data.len() != KEY_LEN {

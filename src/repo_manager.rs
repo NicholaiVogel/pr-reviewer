@@ -159,7 +159,7 @@ pub async fn fetch_latest(repo_path: &Path, token: &str) -> Result<()> {
 
     if !reset.status.success() {
         let stderr = String::from_utf8_lossy(&reset.stderr);
-        tracing::warn!(path = %repo_path.display(), "git reset failed: {}", stderr.trim());
+        return Err(anyhow!("git reset --hard failed: {}", stderr.trim()));
     }
 
     Ok(())
