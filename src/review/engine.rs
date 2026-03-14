@@ -146,18 +146,20 @@ impl ReviewEngine {
 
         let dry_run = options.dry_run || self.config.defaults.dry_run;
 
+        // Fetch existing reviews once — used for both in-progress guard and duplicate check
+        // inside run_review_pipeline, avoiding a redundant API call.
+        let existing_reviews = comments::get_existing_reviews(
+            &self.github,
+            &repo_cfg.owner,
+            &repo_cfg.name,
+            pr_data.number,
+        )
+        .await
+        .unwrap_or_default();
+
         // Check if we already posted a review for this SHA before posting in-progress comment,
         // to avoid orphaned "started reviewing" comments when the already-posted guard fires.
         if !dry_run {
-            let existing_reviews = comments::get_existing_reviews(
-                &self.github,
-                &repo_cfg.owner,
-                &repo_cfg.name,
-                pr_data.number,
-            )
-            .await
-            .unwrap_or_default();
-
             let already_posted = existing_reviews.iter().any(|r| {
                 r.commit_id.as_deref() == Some(pr_data.head.sha.as_str())
                     && r.user
@@ -194,7 +196,7 @@ impl ReviewEngine {
 
         let started = Instant::now();
         let outcome = self
-            .run_review_pipeline(repo_cfg, pr_data, options, harness_kind, &model)
+            .run_review_pipeline(repo_cfg, pr_data, options, harness_kind, &model, existing_reviews)
             .await;
 
         match outcome {
@@ -228,6 +230,7 @@ impl ReviewEngine {
         options: ReviewOptions,
         harness_kind: HarnessKind,
         model: &str,
+        existing_reviews: Vec<PullRequestReview>,
     ) -> Result<ReviewRunResult> {
         let repo_name = repo_cfg.full_name();
         let dedupe = dedupe_key(
@@ -244,14 +247,6 @@ impl ReviewEngine {
         let prior_sha = prior_state
             .and_then(|s| s.last_reviewed_sha)
             .filter(|sha| sha != &pr_data.head.sha);
-
-        let existing_reviews = comments::get_existing_reviews(
-            &self.github,
-            &repo_cfg.owner,
-            &repo_cfg.name,
-            pr_data.number,
-        )
-        .await?;
 
         let diff = pr::get_diff(
             &self.github,
@@ -554,17 +549,16 @@ impl ReviewEngine {
             .await?;
         }
 
-        // When 422 retry posted comments in the body instead of inline, record 0 inline comments
-        let posted_inline = if used_retry {
-            0
-        } else {
-            inline_comments.len() as i64
-        };
+        // When 422 retry posted comments in the body instead of inline, record 0 inline comments.
+        // Also store the actual posted event (which may differ from the LLM verdict after
+        // self-review downgrade or 422 retry).
+        let posted_inline = if used_retry { 0 } else { inline_comments.len() as i64 };
+        let actual_event = if used_retry { "COMMENT" } else { event };
         self.db
             .complete_review(
                 &dedupe,
                 posted_inline,
-                Some(confidence_verdict_label(verdict, confidence.as_ref())),
+                Some(actual_event),
                 harness_output.duration_secs,
                 assembled.files_included as i64,
                 assembled.diff_lines as i64,
@@ -577,7 +571,7 @@ impl ReviewEngine {
             sha: pr_data.head.sha.clone(),
             status: "completed".to_string(),
             verdict: Some(verdict),
-            comments_posted: inline_comments.len(),
+            comments_posted: if used_retry { 0 } else { inline_comments.len() },
         })
     }
 

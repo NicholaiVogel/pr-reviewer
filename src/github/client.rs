@@ -347,7 +347,7 @@ impl GitHubClient {
             );
             if let Some(since) = since {
                 path.push_str("&since=");
-                path.push_str(since);
+                path.push_str(&urlencoding::encode(since));
             }
             let resp = self
                 .request(Method::GET, &path)
