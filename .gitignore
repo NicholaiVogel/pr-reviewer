@@ -4,3 +4,4 @@ target/
 *.db
 *.pid
 .gitnexus
+.claude/
