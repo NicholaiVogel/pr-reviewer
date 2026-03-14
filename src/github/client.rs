@@ -302,14 +302,35 @@ impl GitHubClient {
         repo: &str,
         pr_number: u64,
     ) -> Result<Vec<PullRequestReview>> {
-        let path = format!("/repos/{owner}/{repo}/pulls/{pr_number}/reviews");
-        let resp = self
-            .request(Method::GET, &path)
-            .send()
-            .await
-            .context("GitHub get existing reviews failed")?;
-        self.update_rate_state(resp.headers());
-        handle_json(resp).await
+        let mut all_reviews = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let path = format!(
+                "/repos/{owner}/{repo}/pulls/{pr_number}/reviews?per_page=100&page={page}"
+            );
+            let resp = self
+                .request(Method::GET, &path)
+                .send()
+                .await
+                .context("GitHub get existing reviews failed")?;
+            self.update_rate_state(resp.headers());
+
+            let has_next = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("rel=\"next\""));
+
+            let batch: Vec<PullRequestReview> = handle_json(resp).await?;
+            let batch_empty = batch.is_empty();
+            all_reviews.extend(batch);
+
+            if !has_next || batch_empty || page >= 10 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(all_reviews)
     }
 
     pub async fn get_review_comments(
@@ -322,8 +343,9 @@ impl GitHubClient {
         let mut all_comments = Vec::new();
         let mut page = 1u32;
         loop {
-            let mut path =
-                format!("/repos/{owner}/{repo}/pulls/{pr_number}/comments?per_page=100&page={page}");
+            let mut path = format!(
+                "/repos/{owner}/{repo}/pulls/{pr_number}/comments?per_page=100&page={page}"
+            );
             if let Some(since) = since {
                 path.push_str("&since=");
                 path.push_str(since);

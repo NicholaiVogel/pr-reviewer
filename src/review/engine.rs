@@ -141,6 +141,33 @@ impl ReviewEngine {
             });
         }
 
+        let dry_run = options.dry_run || self.config.defaults.dry_run;
+        if !dry_run {
+            let in_progress = format!(
+                "🔍 `{}` started reviewing commit `{}` with `{}` (`{}`). I will post findings when the review completes.",
+                self.config.defaults.bot_name,
+                short_sha(&pr_data.head.sha),
+                harness_kind.as_str(),
+                model
+            );
+            if let Err(err) = comments::create_issue_comment(
+                &self.github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                pr_data.number,
+                &in_progress,
+            )
+            .await
+            {
+                tracing::warn!(
+                    repo = %repo_cfg.full_name(),
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to post in-progress review comment"
+                );
+            }
+        }
+
         let started = Instant::now();
         let outcome = self
             .run_review_pipeline(repo_cfg, pr_data, options, harness_kind, &model)
@@ -406,11 +433,15 @@ impl ReviewEngine {
         }
 
         // GitHub rejects APPROVE/REQUEST_CHANGES on your own PRs — downgrade to COMMENT.
-        // Fail-closed: if we can't determine the authenticated user, default to COMMENT.
+        // Use cached user from init(), fall back to live API call, fail-closed on total failure.
         let event = match verdict {
             ReviewVerdict::Comment => verdict.as_github_event(),
             ReviewVerdict::Approve | ReviewVerdict::RequestChanges => {
-                match self.authenticated_user.as_deref() {
+                let bot_login = match &self.authenticated_user {
+                    Some(u) => Some(u.clone()),
+                    None => self.github.get_authenticated_user().await.ok(),
+                };
+                match bot_login.as_deref() {
                     Some(u) if u.eq_ignore_ascii_case(&pr_data.user.login) => "COMMENT",
                     Some(_) => verdict.as_github_event(),
                     None => "COMMENT",
@@ -635,9 +666,10 @@ fn build_prior_reviews_context(
     for review in tail {
         let sha = review.commit_id.as_deref().unwrap_or("unknown-sha");
         let state = review.state.as_deref().unwrap_or("UNKNOWN");
+        let submitted = review.submitted_at.as_deref().unwrap_or("unknown");
         out.push_str(&format!(
-            "- sha={} state={} submitted_at={:?}\n",
-            sha, state, review.submitted_at
+            "- sha={} state={} submitted_at={}\n",
+            sha, state, submitted
         ));
         if let Some(body) = review.body.as_deref() {
             let summary = body.lines().take(8).collect::<Vec<_>>().join("\n");
@@ -723,4 +755,12 @@ fn extract_file_snippet(content: &str, line: usize, radius: usize) -> String {
         out.push_str(&format!("{:>5}: {}\n", idx + 1, lines[idx]));
     }
     out
+}
+
+fn short_sha(sha: &str) -> &str {
+    if sha.len() <= 8 {
+        sha
+    } else {
+        &sha[..8]
+    }
 }
