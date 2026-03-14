@@ -142,7 +142,7 @@ pr-reviewer runs AI tools against potentially untrusted code. The safety model i
 
 ## GitNexus integration
 
-If [GitNexus](https://github.com/nicholai/gitnexus) is installed and a repo has been indexed (`.gitnexus/` directory exists), pr-reviewer enriches review context with:
+If [GitNexus](https://github.com/abhigyanpatwari/GitNexus) is installed and a repo has been indexed (`.gitnexus/` directory exists), pr-reviewer enriches review context with:
 
 - Impact analysis (blast radius of changed symbols)
 - Call chain tracing (upstream/downstream dependencies)
