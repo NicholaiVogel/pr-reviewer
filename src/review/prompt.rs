@@ -22,6 +22,9 @@ pub fn build_review_prompt(
     prompt.push_str(
         "Line numbers must refer to changed lines in the current diff whenever possible.\n\n",
     );
+    prompt.push_str(
+        "If prior review history is provided, explicitly mention what was fixed and what remains unresolved.\n\n",
+    );
 
     prompt.push_str("Example output:\n");
     prompt.push_str("```pr-review-json\n");

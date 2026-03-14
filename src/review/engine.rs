@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -10,7 +11,9 @@ use crate::context::diff_parser::{parse_unified_diff, DiffSide};
 use crate::context::gitnexus;
 use crate::context::retriever::{assemble_context, ContextMode};
 use crate::github::comments;
-use crate::github::types::{CreateReviewComment, CreateReviewRequest, PullRequest};
+use crate::github::types::{
+    CreateReviewComment, CreateReviewRequest, PullRequest, PullRequestReview, ReviewComment,
+};
 use crate::github::{client::GitHubClient, pr};
 use crate::harness;
 use crate::harness::spawn::{run_harness, HarnessRunRequest};
@@ -173,6 +176,22 @@ impl ReviewEngine {
             harness_kind.as_str(),
         );
 
+        let prior_state = self
+            .db
+            .get_pr_state(&repo_name, pr_data.number as i64)
+            .await?;
+        let prior_sha = prior_state
+            .and_then(|s| s.last_reviewed_sha)
+            .filter(|sha| sha != &pr_data.head.sha);
+
+        let existing_reviews = comments::get_existing_reviews(
+            &self.github,
+            &repo_cfg.owner,
+            &repo_cfg.name,
+            pr_data.number,
+        )
+        .await?;
+
         let diff = pr::get_diff(
             &self.github,
             &repo_cfg.owner,
@@ -220,10 +239,42 @@ impl ReviewEngine {
         )
         .await?;
 
+        let mut context_with_history = assembled.text.clone();
+        let prior_reviews_context = build_prior_reviews_context(
+            &existing_reviews,
+            self.config.defaults.bot_name.as_str(),
+            pr_data.head.sha.as_str(),
+        );
+        if !prior_reviews_context.is_empty() {
+            context_with_history.push_str("\n## Prior Bot Reviews\n");
+            context_with_history.push_str(&prior_reviews_context);
+            context_with_history.push('\n');
+        }
+
+        if let Some(previous_sha) = prior_sha.as_deref() {
+            if let Ok(delta_diff) = self
+                .github
+                .get_compare_diff(
+                    &repo_cfg.owner,
+                    &repo_cfg.name,
+                    previous_sha,
+                    &pr_data.head.sha,
+                )
+                .await
+            {
+                context_with_history.push_str(&format!(
+                    "\n## Incremental Diff Since Last Reviewed SHA ({previous_sha} -> {})\n```diff\n",
+                    pr_data.head.sha
+                ));
+                context_with_history.push_str(&truncate_lines(&delta_diff, 400));
+                context_with_history.push_str("\n```\n");
+            }
+        }
+
         let prompt = build_review_prompt(
             repo_cfg,
             pr_data,
-            &assembled.text,
+            &context_with_history,
             &self.config.defaults.bot_name,
         );
 
@@ -317,14 +368,6 @@ impl ReviewEngine {
             });
         }
 
-        let existing_reviews = comments::get_existing_reviews(
-            &self.github,
-            &repo_cfg.owner,
-            &repo_cfg.name,
-            pr_data.number,
-        )
-        .await?;
-
         if existing_reviews.iter().any(|r| {
             r.commit_id.as_deref() == Some(pr_data.head.sha.as_str())
                 && r.user
@@ -387,7 +430,8 @@ impl ReviewEngine {
             if err_str.contains("422") || err_str.contains("Can not approve") {
                 let mut retry_body = body.clone();
                 if !inline_comments.is_empty() {
-                    retry_body.push_str("\n\n**Inline comments (could not post as line comments):**\n");
+                    retry_body
+                        .push_str("\n\n**Inline comments (could not post as line comments):**\n");
                     for c in &inline_comments {
                         retry_body.push_str(&format!("- `{}:{}` — {}\n", c.path, c.line, c.body));
                     }
@@ -413,9 +457,8 @@ impl ReviewEngine {
         };
 
         if let Err(err) = post_result {
-            let fallback = format!(
-                "Review post failed; fallback summary posted.\n\nError: {err}\n\n{body}"
-            );
+            let fallback =
+                format!("Review post failed; fallback summary posted.\n\nError: {err}\n\n{body}");
             comments::create_issue_comment(
                 &self.github,
                 &repo_cfg.owner,
@@ -451,24 +494,69 @@ impl ReviewEngine {
         &self,
         repo_cfg: &RepoConfig,
         pr_data: &PullRequest,
-        comment_id: u64,
-        comment_body: &str,
+        comment: &ReviewComment,
     ) -> Result<()> {
         let harness_kind = repo_cfg.resolved_harness(&self.config);
         let model = repo_cfg.resolved_model(&self.config).to_string();
 
+        let latest_diff = pr::get_diff(
+            &self.github,
+            &repo_cfg.owner,
+            &repo_cfg.name,
+            pr_data.number,
+        )
+        .await
+        .unwrap_or_default();
+
+        let all_comments = comments::get_review_comments(
+            &self.github,
+            &repo_cfg.owner,
+            &repo_cfg.name,
+            pr_data.number,
+            None,
+        )
+        .await
+        .unwrap_or_default();
+        let thread_history = build_thread_history(&all_comments, comment.id);
+
+        let mut file_snippet = String::new();
+        if let Some(line) = comment.line {
+            if let Ok(Some(content)) = self
+                .github
+                .get_file_content(
+                    &repo_cfg.owner,
+                    &repo_cfg.name,
+                    &comment.path,
+                    &pr_data.head.sha,
+                )
+                .await
+            {
+                file_snippet = extract_file_snippet(&content, line as usize, 12);
+            }
+        }
+
         let mut prompt = String::new();
         prompt.push_str("You are replying as an automated code review assistant.\n");
         prompt.push_str("Write a concise, technical response to this review thread comment.\n");
-        prompt.push_str(
-            "Acknowledge valid points, clarify misunderstandings, and avoid style debates.\n",
-        );
+        prompt.push_str("Use the latest diff and thread context to determine whether the issue appears fixed.\n");
+        prompt.push_str("If fixed, say so explicitly and reference concrete evidence. If not fixed, explain what remains.\n");
         prompt.push_str("Output plain text only.\n\n");
         prompt.push_str(&format!("Repo: {}/{}\n", repo_cfg.owner, repo_cfg.name));
         prompt.push_str(&format!("PR: #{}\n", pr_data.number));
-        prompt.push_str("Incoming comment:\n");
-        prompt.push_str(comment_body);
-        prompt.push('\n');
+        prompt.push_str(&format!("Target comment id: {}\n", comment.id));
+        prompt.push_str(&format!("Target comment path: {}\n", comment.path));
+        prompt.push_str(&format!("Target comment line: {:?}\n", comment.line));
+        prompt.push_str("\nThread history:\n");
+        prompt.push_str(&thread_history);
+        prompt.push_str("\n\nLatest diff (truncated):\n```diff\n");
+        prompt.push_str(&truncate_lines(&latest_diff, 300));
+        prompt.push_str("\n```\n");
+
+        if !file_snippet.is_empty() {
+            prompt.push_str("\nLatest file snippet around referenced line:\n```\n");
+            prompt.push_str(&file_snippet);
+            prompt.push_str("\n```\n");
+        }
 
         let temp = tempdir().context("failed to create temp dir for reply")?;
         let harness_impl = harness::for_kind(harness_kind);
@@ -498,7 +586,7 @@ impl ReviewEngine {
             &repo_cfg.owner,
             &repo_cfg.name,
             pr_data.number,
-            comment_id,
+            comment.id,
             &reply,
         )
         .await?;
@@ -509,4 +597,120 @@ impl ReviewEngine {
 
 fn clean_comment_path(path: &str) -> String {
     path.trim().trim_start_matches("./").to_string()
+}
+
+fn build_prior_reviews_context(
+    reviews: &[PullRequestReview],
+    bot_name: &str,
+    current_sha: &str,
+) -> String {
+    let mut relevant: Vec<&PullRequestReview> = reviews
+        .iter()
+        .filter(|r| {
+            r.user.login.eq_ignore_ascii_case(bot_name)
+                && r.commit_id.as_deref() != Some(current_sha)
+        })
+        .collect();
+    if relevant.is_empty() {
+        return String::new();
+    }
+    relevant.sort_by(|a, b| a.submitted_at.cmp(&b.submitted_at));
+    let tail = if relevant.len() > 5 {
+        &relevant[relevant.len() - 5..]
+    } else {
+        &relevant[..]
+    };
+
+    let mut out = String::new();
+    for review in tail {
+        let sha = review.commit_id.as_deref().unwrap_or("unknown-sha");
+        let state = review.state.as_deref().unwrap_or("UNKNOWN");
+        out.push_str(&format!(
+            "- sha={} state={} submitted_at={:?}\n",
+            sha, state, review.submitted_at
+        ));
+        if let Some(body) = review.body.as_deref() {
+            let summary = body.lines().take(8).collect::<Vec<_>>().join("\n");
+            out.push_str(summary.trim());
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn truncate_lines(input: &str, max_lines: usize) -> String {
+    let mut out = String::new();
+    for (idx, line) in input.lines().enumerate() {
+        if idx >= max_lines {
+            out.push_str("... [truncated]\n");
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn build_thread_history(comments: &[ReviewComment], target_comment_id: u64) -> String {
+    if comments.is_empty() {
+        return "No thread history available.".to_string();
+    }
+
+    let parent_map: HashMap<u64, Option<u64>> =
+        comments.iter().map(|c| (c.id, c.in_reply_to_id)).collect();
+    let target_root = find_thread_root_id(&parent_map, target_comment_id);
+
+    let mut thread_comments: Vec<&ReviewComment> = comments
+        .iter()
+        .filter(|c| find_thread_root_id(&parent_map, c.id) == target_root)
+        .collect();
+
+    thread_comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+    let mut out = String::new();
+    for c in thread_comments {
+        out.push_str(&format!(
+            "- [{}] {}: {}\n",
+            c.created_at,
+            c.user.login,
+            c.body.replace('\n', " ")
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("No thread history available.");
+    }
+    out
+}
+
+fn find_thread_root_id(parent_map: &HashMap<u64, Option<u64>>, id: u64) -> u64 {
+    let mut current = id;
+    let mut guard = 0usize;
+    while guard < 64 {
+        guard += 1;
+        match parent_map.get(&current).copied().flatten() {
+            Some(parent) => current = parent,
+            None => return current,
+        }
+    }
+    current
+}
+
+fn extract_file_snippet(content: &str, line: usize, radius: usize) -> String {
+    if line == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let start = line.saturating_sub(radius + 1);
+    let end = (line + radius).min(lines.len());
+
+    let mut out = String::new();
+    for idx in start..end {
+        out.push_str(&format!("{:>5}: {}\n", idx + 1, lines[idx]));
+    }
+    out
 }

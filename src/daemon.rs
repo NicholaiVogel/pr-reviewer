@@ -149,20 +149,14 @@ pub async fn start(
                                 let engine = engine.clone();
                                 let repo_cfg = repo_cfg.clone();
                                 let pr_for_reply = pr.clone();
-                                let comment_id = comment.id;
-                                let comment_body = comment.body.clone();
+                                let comment_for_reply = comment.clone();
                                 workers.spawn(async move {
                                     let _permit = permit;
                                     let res = engine
-                                        .reply_to_comment(
-                                            &repo_cfg,
-                                            &pr_for_reply,
-                                            comment_id,
-                                            &comment_body,
-                                        )
+                                        .reply_to_comment(&repo_cfg, &pr_for_reply, &comment_for_reply)
                                         .await;
                                     if let Err(err) = res {
-                                        tracing::error!(repo = %repo_cfg.full_name(), pr = pr_for_reply.number, comment_id, error = %err, "reply failed");
+                                        tracing::error!(repo = %repo_cfg.full_name(), pr = pr_for_reply.number, comment_id = comment_for_reply.id, error = %err, "reply failed");
                                     }
                                 });
                             }

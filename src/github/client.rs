@@ -139,6 +139,34 @@ impl GitHubClient {
         Ok(resp.text().await.context("failed to read diff response")?)
     }
 
+    pub async fn get_compare_diff(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<String> {
+        let path = format!("/repos/{owner}/{repo}/compare/{base}...{head}");
+        let resp = self
+            .request(Method::GET, &path)
+            .header(ACCEPT, "application/vnd.github.v3.diff")
+            .send()
+            .await
+            .context("GitHub get compare diff failed")?;
+        self.update_rate_state(resp.headers());
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("GitHub compare diff failed ({status}): {body}"));
+        }
+
+        Ok(resp
+            .text()
+            .await
+            .context("failed to read compare diff response")?)
+    }
+
     pub async fn get_file_content(
         &self,
         owner: &str,

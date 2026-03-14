@@ -52,10 +52,13 @@ pub async fn run_harness(
                 let _ = stdin.shutdown().await;
             });
         }
-        timeout(Duration::from_secs(req.timeout_secs), child.wait_with_output())
-            .await
-            .map_err(|_| anyhow!("harness timed out after {}s", req.timeout_secs))?
-            .context("failed to wait on harness")?
+        timeout(
+            Duration::from_secs(req.timeout_secs),
+            child.wait_with_output(),
+        )
+        .await
+        .map_err(|_| anyhow!("harness timed out after {}s", req.timeout_secs))?
+        .context("failed to wait on harness")?
     } else {
         timeout(Duration::from_secs(req.timeout_secs), command.output())
             .await
