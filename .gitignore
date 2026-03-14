@@ -5,3 +5,4 @@ target/
 *.pid
 .gitnexus
 .claude/
+tmp/
