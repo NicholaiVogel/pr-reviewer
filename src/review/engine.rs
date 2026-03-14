@@ -808,13 +808,21 @@ fn confidence_verdict_label(
     verdict: ReviewVerdict,
     confidence: Option<&ConfidenceRatings>,
 ) -> &'static str {
-    let _ = confidence;
+    // If confidence is low (average < 5), downgrade approve to comment
+    if let Some(conf) = confidence {
+        if verdict == ReviewVerdict::Approve && conf.average() < 5.0 {
+            return "COMMENT";
+        }
+    }
     verdict.as_github_event()
 }
 
 fn format_confidence_markdown(conf: &ConfidenceRatings) -> String {
     let mut out = String::new();
-    out.push_str("### Confidence Ratings (1-10)\n");
+    out.push_str(&format!(
+        "### Confidence: {:.1}/10\n",
+        conf.average()
+    ));
     out.push_str(&format!(
         "- Style consistency & maintainability: {}\n",
         conf.style_maintainability

@@ -45,6 +45,19 @@ impl ConfidenceRatings {
         validate_confidence("documentation_coverage", self.documentation_coverage)?;
         Ok(())
     }
+
+    pub fn average(&self) -> f32 {
+        let sum = self.style_maintainability as u32
+            + self.repo_convention_adherence as u32
+            + self.merge_conflict_detection as u32
+            + self.scope_alignment as u32
+            + self.duplication_awareness as u32
+            + self.tooling_pattern_leverage as u32
+            + self.functional_completeness as u32
+            + self.pattern_correctness as u32
+            + self.documentation_coverage as u32;
+        sum as f32 / 9.0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -6,3 +6,4 @@ target/
 .gitnexus
 .claude/
 tmp/
+test_file.txt
