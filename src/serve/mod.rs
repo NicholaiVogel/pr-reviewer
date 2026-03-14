@@ -18,7 +18,9 @@ use crate::config::{AppConfig, WorkflowStep};
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
 /// Hard limits for user-supplied strings to keep prompt context bounded.
+const MAX_STEP_ID_LEN: usize = 64;
 const MAX_STEP_NAME_LEN: usize = 256;
+const MAX_MODEL_LEN: usize = 256;
 const MAX_INSTRUCTIONS_LEN: usize = 8_192;
 const MAX_PATTERN_LEN: usize = 512;
 const MAX_PATTERNS: usize = 64;
@@ -143,6 +145,12 @@ fn validate_workflow(steps: &[WorkflowStep]) -> Result<(), ApiError> {
         if step.id.is_empty() {
             return Err(ApiError::BadRequest("step id must not be empty".into()));
         }
+        if step.id.len() > MAX_STEP_ID_LEN {
+            return Err(ApiError::BadRequest(format!(
+                "step id too long ({} chars, max {MAX_STEP_ID_LEN})",
+                step.id.len()
+            )));
+        }
         if !seen_ids.insert(step.id.clone()) {
             return Err(ApiError::BadRequest(format!("duplicate step id: {}", step.id)));
         }
@@ -159,6 +167,16 @@ fn validate_workflow(steps: &[WorkflowStep]) -> Result<(), ApiError> {
                 step.id,
                 step.name.len()
             )));
+        }
+
+        if let Some(ref model) = step.model {
+            if model.len() > MAX_MODEL_LEN {
+                return Err(ApiError::BadRequest(format!(
+                    "step '{}' model too long ({} chars, max {MAX_MODEL_LEN})",
+                    step.id,
+                    model.len()
+                )));
+            }
         }
 
         if let Some(ref instr) = step.custom_instructions {
@@ -181,7 +199,7 @@ fn validate_workflow(steps: &[WorkflowStep]) -> Result<(), ApiError> {
         for pat in &cond.file_patterns {
             if pat.len() > MAX_PATTERN_LEN {
                 return Err(ApiError::BadRequest(format!(
-                    "step '{}' file_pattern too long",
+                    "step '{}' file_pattern too long (max {MAX_PATTERN_LEN} chars)",
                     step.id
                 )));
             }
@@ -191,6 +209,14 @@ fn validate_workflow(steps: &[WorkflowStep]) -> Result<(), ApiError> {
                 "step '{}' has too many label_patterns (max {MAX_PATTERNS})",
                 step.id
             )));
+        }
+        for pat in &cond.label_patterns {
+            if pat.len() > MAX_PATTERN_LEN {
+                return Err(ApiError::BadRequest(format!(
+                    "step '{}' label_pattern too long (max {MAX_PATTERN_LEN} chars)",
+                    step.id
+                )));
+            }
         }
     }
 
