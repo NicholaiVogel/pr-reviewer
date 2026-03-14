@@ -448,11 +448,14 @@ async fn main() -> Result<()> {
                         println!("migrating existing plain-text token to encrypted storage");
                         existing.clone()
                     } else {
-                        // Prompt interactively
+                        // Prompt interactively (read_line, not read_to_string, to preserve stdin for passphrase)
                         eprint!("GitHub token: ");
                         let mut buf = String::new();
-                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-                            .context("failed to read token")?;
+                        std::io::BufRead::read_line(
+                            &mut std::io::stdin().lock(),
+                            &mut buf,
+                        )
+                        .context("failed to read token")?;
                         buf.trim().to_string()
                     };
 
@@ -478,8 +481,11 @@ async fn main() -> Result<()> {
                         let pp = if passphrase {
                             eprint!("passphrase: ");
                             let mut buf = String::new();
-                            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-                                .context("failed to read passphrase")?;
+                            std::io::BufRead::read_line(
+                                &mut std::io::stdin().lock(),
+                                &mut buf,
+                            )
+                            .context("failed to read passphrase")?;
                             let pp = buf.trim().to_string();
                             if pp.is_empty() {
                                 return Err(anyhow!("passphrase cannot be empty"));

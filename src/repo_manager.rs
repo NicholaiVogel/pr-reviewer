@@ -11,8 +11,26 @@ pub fn repos_dir() -> Result<PathBuf> {
 }
 
 /// Returns the managed clone path for a given owner/name.
+/// Rejects path traversal attempts (.. or path separators in components).
 pub fn managed_path(owner: &str, name: &str) -> Result<PathBuf> {
+    validate_path_component(owner, "owner")?;
+    validate_path_component(name, "name")?;
     Ok(repos_dir()?.join(owner).join(name))
+}
+
+fn validate_path_component(component: &str, label: &str) -> Result<()> {
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.contains('/')
+        || component.contains('\\')
+        || component.contains('\0')
+    {
+        return Err(anyhow!(
+            "invalid repo {label}: {component:?} (path traversal rejected)"
+        ));
+    }
+    Ok(())
 }
 
 /// Resolves the effective local path for a repo.
@@ -43,14 +61,11 @@ pub async fn ensure_cloned(owner: &str, name: &str, token: &str) -> Result<PathB
     }
 
     let url = format!("https://github.com/{owner}/{name}.git");
-    let auth_header = format!("Authorization: Bearer {token}");
 
     tracing::info!(repo = %format!("{owner}/{name}"), path = %path.display(), "cloning repository");
 
     let output = Command::new("git")
         .args([
-            "-c",
-            &format!("http.extraHeader={auth_header}"),
             "-c",
             "core.hooksPath=/dev/null",
             "clone",
@@ -58,6 +73,10 @@ pub async fn ensure_cloned(owner: &str, name: &str, token: &str) -> Result<PathB
             &url,
         ])
         .arg(&path)
+        // Pass auth via env vars instead of -c args to avoid leaking token in /proc/pid/cmdline
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+        .env("GIT_CONFIG_VALUE_0", format!("Authorization: Bearer {token}"))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -90,18 +109,17 @@ pub async fn fetch_latest(repo_path: &Path, token: &str) -> Result<()> {
         ));
     }
 
-    let auth_header = format!("Authorization: Bearer {token}");
-
     let fetch = Command::new("git")
         .args([
-            "-c",
-            &format!("http.extraHeader={auth_header}"),
             "-c",
             "core.hooksPath=/dev/null",
             "fetch",
             "origin",
         ])
         .current_dir(repo_path)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+        .env("GIT_CONFIG_VALUE_0", format!("Authorization: Bearer {token}"))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -197,7 +215,7 @@ pub async fn cleanup(active_repos: &[RepoConfig]) -> Result<Vec<String>> {
 
             let is_active = active_repos
                 .iter()
-                .any(|r| r.full_name().eq_ignore_ascii_case(&full_name));
+                .any(|r| r.is_managed() && r.full_name().eq_ignore_ascii_case(&full_name));
 
             if !is_active {
                 if let Err(err) = tokio::fs::remove_dir_all(repo_entry.path()).await {
