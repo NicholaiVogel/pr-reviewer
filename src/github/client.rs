@@ -305,9 +305,8 @@ impl GitHubClient {
         let mut all_reviews = Vec::new();
         let mut page = 1u32;
         loop {
-            let path = format!(
-                "/repos/{owner}/{repo}/pulls/{pr_number}/reviews?per_page=100&page={page}"
-            );
+            let path =
+                format!("/repos/{owner}/{repo}/pulls/{pr_number}/reviews?per_page=100&page={page}");
             let resp = self
                 .request(Method::GET, &path)
                 .send()

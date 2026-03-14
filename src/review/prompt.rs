@@ -16,6 +16,16 @@ pub fn build_review_prompt(
     prompt.push_str("Schema:\n");
     prompt.push_str("- summary: string\n");
     prompt.push_str("- verdict: one of [\"approve\", \"comment\", \"request_changes\"]\n");
+    prompt.push_str("- confidence: object with integer ratings from 1 to 10 for:\n");
+    prompt.push_str("  - style_maintainability\n");
+    prompt.push_str("  - repo_convention_adherence\n");
+    prompt.push_str("  - merge_conflict_detection\n");
+    prompt.push_str("  - scope_alignment\n");
+    prompt.push_str("  - duplication_awareness\n");
+    prompt.push_str("  - tooling_pattern_leverage\n");
+    prompt.push_str("  - functional_completeness\n");
+    prompt.push_str("  - pattern_correctness\n");
+    prompt.push_str("  - documentation_coverage\n");
     prompt.push_str(
         "- comments: array of objects with fields { file: string, line: integer, body: string }\n",
     );
@@ -31,6 +41,17 @@ pub fn build_review_prompt(
     prompt.push_str("{\n");
     prompt.push_str("  \"summary\": \"Found one security issue and one null handling bug.\",\n");
     prompt.push_str("  \"verdict\": \"request_changes\",\n");
+    prompt.push_str("  \"confidence\": {\n");
+    prompt.push_str("    \"style_maintainability\": 8,\n");
+    prompt.push_str("    \"repo_convention_adherence\": 9,\n");
+    prompt.push_str("    \"merge_conflict_detection\": 7,\n");
+    prompt.push_str("    \"scope_alignment\": 8,\n");
+    prompt.push_str("    \"duplication_awareness\": 8,\n");
+    prompt.push_str("    \"tooling_pattern_leverage\": 7,\n");
+    prompt.push_str("    \"functional_completeness\": 8,\n");
+    prompt.push_str("    \"pattern_correctness\": 7,\n");
+    prompt.push_str("    \"documentation_coverage\": 6\n");
+    prompt.push_str("  },\n");
     prompt.push_str("  \"comments\": [\n");
     prompt.push_str("    {\"file\": \"src/auth.rs\", \"line\": 41, \"body\": \"Potential SQL injection when interpolating user input into query string.\"}\n");
     prompt.push_str("  ]\n");

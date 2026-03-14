@@ -19,6 +19,34 @@ impl ReviewVerdict {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ConfidenceRatings {
+    pub style_maintainability: u8,
+    pub repo_convention_adherence: u8,
+    pub merge_conflict_detection: u8,
+    pub scope_alignment: u8,
+    pub duplication_awareness: u8,
+    pub tooling_pattern_leverage: u8,
+    pub functional_completeness: u8,
+    pub pattern_correctness: u8,
+    pub documentation_coverage: u8,
+}
+
+impl ConfidenceRatings {
+    pub fn validate(&self) -> Result<()> {
+        validate_confidence("style_maintainability", self.style_maintainability)?;
+        validate_confidence("repo_convention_adherence", self.repo_convention_adherence)?;
+        validate_confidence("merge_conflict_detection", self.merge_conflict_detection)?;
+        validate_confidence("scope_alignment", self.scope_alignment)?;
+        validate_confidence("duplication_awareness", self.duplication_awareness)?;
+        validate_confidence("tooling_pattern_leverage", self.tooling_pattern_leverage)?;
+        validate_confidence("functional_completeness", self.functional_completeness)?;
+        validate_confidence("pattern_correctness", self.pattern_correctness)?;
+        validate_confidence("documentation_coverage", self.documentation_coverage)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewComment {
     pub file: String,
@@ -30,6 +58,7 @@ pub struct ReviewComment {
 pub struct StructuredReview {
     pub summary: String,
     pub verdict: ReviewVerdict,
+    pub confidence: ConfidenceRatings,
     #[serde(default)]
     pub comments: Vec<ReviewComment>,
 }
@@ -41,13 +70,26 @@ pub enum ParseOutcome {
     Empty,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredReplyUpdate {
+    pub reply: String,
+    pub confidence: ConfidenceRatings,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReplyParseOutcome {
+    Structured(StructuredReplyUpdate),
+    Raw(String),
+    Empty,
+}
+
 pub fn parse_review_output(stdout: &str, stderr: &str) -> Result<ParseOutcome> {
     let combined = normalize_output(stdout, stderr);
     if combined.trim().is_empty() {
         return Ok(ParseOutcome::Empty);
     }
 
-    if let Some(marked) = extract_marked_json(&combined) {
+    if let Some(marked) = extract_marked_json(&combined, "pr-review-json") {
         if let Ok(parsed) = parse_and_validate(&marked) {
             return Ok(ParseOutcome::Structured(parsed));
         }
@@ -63,6 +105,30 @@ pub fn parse_review_output(stdout: &str, stderr: &str) -> Result<ParseOutcome> {
     }
 
     Ok(ParseOutcome::RawSummary(combined.trim().to_string()))
+}
+
+pub fn parse_reply_output(stdout: &str, stderr: &str) -> Result<ReplyParseOutcome> {
+    let combined = normalize_output(stdout, stderr);
+    if combined.trim().is_empty() {
+        return Ok(ReplyParseOutcome::Empty);
+    }
+
+    if let Some(marked) = extract_marked_json(&combined, "pr-review-reply-json") {
+        if let Ok(parsed) = parse_reply_and_validate(&marked) {
+            return Ok(ReplyParseOutcome::Structured(parsed));
+        }
+    }
+
+    let mut candidates = extract_json_objects(&combined);
+    candidates.reverse();
+
+    for candidate in candidates {
+        if let Ok(parsed) = parse_reply_and_validate(&candidate) {
+            return Ok(ReplyParseOutcome::Structured(parsed));
+        }
+    }
+
+    Ok(ReplyParseOutcome::Raw(combined.trim().to_string()))
 }
 
 fn normalize_output(stdout: &str, stderr: &str) -> String {
@@ -85,6 +151,7 @@ fn parse_and_validate(json: &str) -> Result<StructuredReview> {
     if parsed.summary.trim().is_empty() {
         return Err(anyhow!("summary cannot be empty"));
     }
+    parsed.confidence.validate()?;
 
     for comment in &parsed.comments {
         if comment.file.trim().is_empty() {
@@ -101,9 +168,28 @@ fn parse_and_validate(json: &str) -> Result<StructuredReview> {
     Ok(parsed)
 }
 
-fn extract_marked_json(text: &str) -> Option<String> {
-    let marker = "```pr-review-json";
-    let start = text.find(marker)?;
+fn parse_reply_and_validate(json: &str) -> Result<StructuredReplyUpdate> {
+    let parsed: StructuredReplyUpdate =
+        serde_json::from_str(json).map_err(|e| anyhow!("reply JSON parse failed: {e}"))?;
+
+    if parsed.reply.trim().is_empty() {
+        return Err(anyhow!("reply cannot be empty"));
+    }
+    parsed.confidence.validate()?;
+    Ok(parsed)
+}
+
+fn validate_confidence(name: &str, value: u8) -> Result<()> {
+    if (1..=10).contains(&value) {
+        Ok(())
+    } else {
+        Err(anyhow!("{name} confidence must be within 1..=10"))
+    }
+}
+
+fn extract_marked_json(text: &str, marker_name: &str) -> Option<String> {
+    let marker = format!("```{marker_name}");
+    let start = text.find(&marker)?;
     let after = &text[start + marker.len()..];
     let after = after.strip_prefix('\n').unwrap_or(after);
     let end = after.find("```")?;
@@ -163,19 +249,22 @@ fn extract_json_objects(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn confidence_json() -> &'static str {
+        r#""confidence":{"style_maintainability":8,"repo_convention_adherence":8,"merge_conflict_detection":7,"scope_alignment":9,"duplication_awareness":8,"tooling_pattern_leverage":8,"functional_completeness":7,"pattern_correctness":8,"documentation_coverage":6}"#
+    }
+
     #[test]
     fn parses_marked_json_block() {
-        let input = r#"
-analysis
-```pr-review-json
-{"summary":"ok","verdict":"comment","comments":[]}
-```
-"#;
-        let parsed = parse_review_output(input, "").expect("parse output");
+        let input = format!(
+            "analysis\n```pr-review-json\n{{\"summary\":\"ok\",\"verdict\":\"comment\",{},\"comments\":[]}}\n```\n",
+            confidence_json()
+        );
+        let parsed = parse_review_output(&input, "").expect("parse output");
         match parsed {
             ParseOutcome::Structured(review) => {
                 assert_eq!(review.summary, "ok");
                 assert_eq!(review.verdict, ReviewVerdict::Comment);
+                assert_eq!(review.confidence.scope_alignment, 9);
             }
             _ => panic!("expected structured review"),
         }
@@ -183,14 +272,43 @@ analysis
 
     #[test]
     fn picks_last_json_object() {
-        let input = r#"{"summary":"old","verdict":"comment","comments":[]} {"summary":"new","verdict":"approve","comments":[]}"#;
-        let parsed = parse_review_output(input, "").expect("parse output");
+        let input = format!(
+            "{{\"summary\":\"old\",\"verdict\":\"comment\",{},\"comments\":[]}} {{\"summary\":\"new\",\"verdict\":\"approve\",{},\"comments\":[]}}",
+            confidence_json(),
+            confidence_json()
+        );
+        let parsed = parse_review_output(&input, "").expect("parse output");
         match parsed {
             ParseOutcome::Structured(review) => {
                 assert_eq!(review.summary, "new");
                 assert_eq!(review.verdict, ReviewVerdict::Approve);
             }
             _ => panic!("expected structured review"),
+        }
+    }
+
+    #[test]
+    fn confidence_out_of_range_falls_back_to_raw() {
+        let input = r#"```pr-review-json
+{"summary":"bad","verdict":"comment","confidence":{"style_maintainability":0,"repo_convention_adherence":8,"merge_conflict_detection":7,"scope_alignment":9,"duplication_awareness":8,"tooling_pattern_leverage":8,"functional_completeness":7,"pattern_correctness":8,"documentation_coverage":6},"comments":[]}
+```"#;
+        let parsed = parse_review_output(input, "").expect("parse output");
+        assert!(matches!(parsed, ParseOutcome::RawSummary(_)));
+    }
+
+    #[test]
+    fn parses_reply_json_block() {
+        let input = format!(
+            "```pr-review-reply-json\n{{\"reply\":\"Thanks, verified fix.\",{}}}\n```",
+            confidence_json()
+        );
+        let parsed = parse_reply_output(&input, "").expect("parse output");
+        match parsed {
+            ReplyParseOutcome::Structured(reply) => {
+                assert!(reply.reply.contains("verified"));
+                assert_eq!(reply.confidence.pattern_correctness, 8);
+            }
+            _ => panic!("expected structured reply"),
         }
     }
 

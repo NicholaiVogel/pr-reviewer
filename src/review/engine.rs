@@ -17,7 +17,10 @@ use crate::github::types::{
 use crate::github::{client::GitHubClient, pr};
 use crate::harness;
 use crate::harness::spawn::{run_harness, HarnessRunRequest};
-use crate::review::parser::{parse_review_output, ParseOutcome, ReviewVerdict};
+use crate::review::parser::{
+    parse_reply_output, parse_review_output, ConfidenceRatings, ParseOutcome, ReplyParseOutcome,
+    ReviewVerdict,
+};
 use crate::review::prompt::build_review_prompt;
 use crate::safety::{evaluate_fork_policy, ForkDecision};
 use crate::store::db::{dedupe_key, Database, ReviewClaim};
@@ -337,6 +340,7 @@ impl ReviewEngine {
 
         let mut body = String::new();
         let mut verdict = ReviewVerdict::Comment;
+        let mut confidence: Option<ConfidenceRatings> = None;
         let mut inline_comments: Vec<CreateReviewComment> = Vec::new();
         let mut unmapped_comments: Vec<String> = Vec::new();
 
@@ -344,6 +348,11 @@ impl ReviewEngine {
             ParseOutcome::Structured(review) => {
                 body.push_str(&review.summary);
                 verdict = review.verdict;
+                confidence = Some(review.confidence.clone());
+                body.push_str("\n\n");
+                body.push_str(&format_confidence_markdown(&review.confidence));
+                body.push_str("\n\n");
+                body.push_str(&format_confidence_json_block(&review.confidence));
                 for comment in review.comments {
                     let path = clean_comment_path(&comment.file);
                     let right = parsed_diff.position_for(&path, comment.line, DiffSide::Right);
@@ -388,7 +397,7 @@ impl ReviewEngine {
                 .complete_review(
                     &dedupe,
                     inline_comments.len() as i64,
-                    Some(verdict.as_github_event()),
+                    Some(confidence_verdict_label(verdict, confidence.as_ref())),
                     harness_output.duration_secs,
                     assembled.files_included as i64,
                     assembled.diff_lines as i64,
@@ -415,7 +424,10 @@ impl ReviewEngine {
                 .complete_review(
                     &dedupe,
                     0,
-                    Some("COMMENT"),
+                    Some(confidence_verdict_label(
+                        ReviewVerdict::Comment,
+                        confidence.as_ref(),
+                    )),
                     harness_output.duration_secs,
                     assembled.files_included as i64,
                     assembled.diff_lines as i64,
@@ -514,7 +526,7 @@ impl ReviewEngine {
             .complete_review(
                 &dedupe,
                 inline_comments.len() as i64,
-                Some(verdict.as_github_event()),
+                Some(confidence_verdict_label(verdict, confidence.as_ref())),
                 harness_output.duration_secs,
                 assembled.files_included as i64,
                 assembled.diff_lines as i64,
@@ -558,7 +570,20 @@ impl ReviewEngine {
         )
         .await
         .unwrap_or_default();
+        let existing_reviews = comments::get_existing_reviews(
+            &self.github,
+            &repo_cfg.owner,
+            &repo_cfg.name,
+            pr_data.number,
+        )
+        .await
+        .unwrap_or_default();
         let thread_history = build_thread_history(&all_comments, comment.id);
+        let baseline_confidence = extract_latest_confidence_snapshot(
+            self.config.defaults.bot_name.as_str(),
+            &existing_reviews,
+            &all_comments,
+        );
 
         let mut file_snippet = String::new();
         if let Some(line) = comment.line {
@@ -581,12 +606,19 @@ impl ReviewEngine {
         prompt.push_str("Write a concise, technical response to this review thread comment.\n");
         prompt.push_str("Use the latest diff and thread context to determine whether the issue appears fixed.\n");
         prompt.push_str("If fixed, say so explicitly and reference concrete evidence. If not fixed, explain what remains.\n");
-        prompt.push_str("Output plain text only.\n\n");
+        prompt.push_str("Output JSON in a fenced block tagged exactly `pr-review-reply-json` with this schema:\n");
+        prompt.push_str("{\"reply\": string, \"confidence\": {style_maintainability, repo_convention_adherence, merge_conflict_detection, scope_alignment, duplication_awareness, tooling_pattern_leverage, functional_completeness, pattern_correctness, documentation_coverage}}\n");
+        prompt.push_str("All confidence values must be integers from 1 to 10.\n\n");
         prompt.push_str(&format!("Repo: {}/{}\n", repo_cfg.owner, repo_cfg.name));
         prompt.push_str(&format!("PR: #{}\n", pr_data.number));
         prompt.push_str(&format!("Target comment id: {}\n", comment.id));
         prompt.push_str(&format!("Target comment path: {}\n", comment.path));
         prompt.push_str(&format!("Target comment line: {:?}\n", comment.line));
+        if let Some(conf) = baseline_confidence.as_ref() {
+            prompt.push_str("\nLatest known confidence ratings:\n");
+            prompt.push_str(&format_confidence_markdown(conf));
+            prompt.push('\n');
+        }
         prompt.push_str("\nThread history:\n");
         prompt.push_str(&thread_history);
         prompt.push_str("\n\nLatest diff (truncated):\n```diff\n");
@@ -612,10 +644,17 @@ impl ReviewEngine {
         )
         .await?;
 
-        let reply = if output.stdout.trim().is_empty() {
-            output.stderr.trim().to_string()
-        } else {
-            output.stdout.trim().to_string()
+        let reply = match parse_reply_output(&output.stdout, &output.stderr)? {
+            ReplyParseOutcome::Structured(update) => {
+                let mut text = update.reply;
+                text.push_str("\n\n");
+                text.push_str(&format_confidence_markdown(&update.confidence));
+                text.push_str("\n\n");
+                text.push_str(&format_confidence_json_block(&update.confidence));
+                text
+            }
+            ReplyParseOutcome::Raw(raw) => raw,
+            ReplyParseOutcome::Empty => String::new(),
         };
 
         if reply.is_empty() {
@@ -763,4 +802,107 @@ fn short_sha(sha: &str) -> &str {
     } else {
         &sha[..8]
     }
+}
+
+fn confidence_verdict_label(
+    verdict: ReviewVerdict,
+    confidence: Option<&ConfidenceRatings>,
+) -> &'static str {
+    let _ = confidence;
+    verdict.as_github_event()
+}
+
+fn format_confidence_markdown(conf: &ConfidenceRatings) -> String {
+    let mut out = String::new();
+    out.push_str("### Confidence Ratings (1-10)\n");
+    out.push_str(&format!(
+        "- Style consistency & maintainability: {}\n",
+        conf.style_maintainability
+    ));
+    out.push_str(&format!(
+        "- Repository conventions adherence: {}\n",
+        conf.repo_convention_adherence
+    ));
+    out.push_str(&format!(
+        "- Merge conflict detection confidence: {}\n",
+        conf.merge_conflict_detection
+    ));
+    out.push_str(&format!(
+        "- Scope alignment confidence: {}\n",
+        conf.scope_alignment
+    ));
+    out.push_str(&format!(
+        "- Existing functionality awareness: {}\n",
+        conf.duplication_awareness
+    ));
+    out.push_str(&format!(
+        "- Existing tooling/pattern leverage: {}\n",
+        conf.tooling_pattern_leverage
+    ));
+    out.push_str(&format!(
+        "- Functional completeness confidence: {}\n",
+        conf.functional_completeness
+    ));
+    out.push_str(&format!(
+        "- Pattern correctness confidence: {}\n",
+        conf.pattern_correctness
+    ));
+    out.push_str(&format!(
+        "- Documentation coverage confidence: {}\n",
+        conf.documentation_coverage
+    ));
+    out
+}
+
+fn format_confidence_json_block(conf: &ConfidenceRatings) -> String {
+    let json = serde_json::to_string_pretty(conf).unwrap_or_else(|_| "{}".to_string());
+    format!("```pr-review-confidence-json\n{}\n```", json)
+}
+
+fn extract_latest_confidence_snapshot(
+    bot_name: &str,
+    reviews: &[PullRequestReview],
+    comments: &[ReviewComment],
+) -> Option<ConfidenceRatings> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+
+    for review in reviews {
+        if !review.user.login.eq_ignore_ascii_case(bot_name) {
+            continue;
+        }
+        let ts = review
+            .submitted_at
+            .clone()
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+        if let Some(body) = review.body.as_deref() {
+            entries.push((ts, body.to_string()));
+        }
+    }
+
+    for comment in comments {
+        if !comment.user.login.eq_ignore_ascii_case(bot_name) {
+            continue;
+        }
+        entries.push((comment.created_at.clone(), comment.body.clone()));
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.reverse();
+
+    for (_, text) in entries {
+        if let Some(conf) = extract_confidence_from_text(&text) {
+            return Some(conf);
+        }
+    }
+
+    None
+}
+
+fn extract_confidence_from_text(text: &str) -> Option<ConfidenceRatings> {
+    let marker = "```pr-review-confidence-json";
+    let start = text.find(marker)?;
+    let after = &text[start + marker.len()..];
+    let after = after.strip_prefix('\n').unwrap_or(after);
+    let end = after.find("```")?;
+    serde_json::from_str::<ConfidenceRatings>(after[..end].trim()).ok()
 }

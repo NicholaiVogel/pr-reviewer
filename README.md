@@ -26,37 +26,83 @@ No API keys required -- pr-reviewer uses your existing CLI subscriptions (Claude
 - **Signet compatible** -- runs with `SIGNET_NO_HOOKS=1` to avoid memory pollution and statistical bias
 - **Dry-run mode** -- log reviews without posting to GitHub
 
+## Prerequisites
+
+- **Rust toolchain** -- install via [rustup](https://rustup.rs/)
+- **GitHub Personal Access Token** -- fine-grained PAT with `pull_requests:read+write` and `contents:read` scopes, or a classic PAT with `repo` scope
+- **At least one AI CLI tool** installed and authenticated:
+  - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) -- requires a Pro/Max subscription
+  - [OpenCode](https://github.com/opencode-ai/opencode) (`opencode`)
+  - [Codex](https://github.com/openai/codex) (`codex`)
+- **GitNexus** (optional) -- `npm install -g gitnexus` or use `npx gitnexus`. Enriches reviews with codebase impact analysis
+
 ## Installation
 
 ```bash
-# from source
-cargo install --path .
-
-# or just build
+# clone and build
+git clone https://github.com/NicholaiVogel/pr-reviewer.git
+cd pr-reviewer
 cargo build --release
+
+# the binary is at ./target/release/pr-reviewer
+# optionally install it to your PATH
+cargo install --path .
 ```
 
-## Quick start
+## Getting started
+
+### 1. Initialize
 
 ```bash
-# initialize config and state database
 pr-reviewer init
+```
 
-# add a repo (runs gitnexus analyze if gitnexus is installed)
-pr-reviewer add nicholai/signetai --path ~/signet/signetai --harness claude-code --model claude-sonnet-4-6
+This creates `~/.config/pr-reviewer/config.toml` and the SQLite state database.
 
-# test with a dry run on a specific PR
-pr-reviewer review nicholai/signetai#42 --dry-run
+### 2. Set your GitHub token
 
-# review for real
-pr-reviewer review nicholai/signetai#42
+```bash
+pr-reviewer config set github.token ghp_your_token_here
+```
 
-# start the daemon
+### 3. Add a repository
+
+```bash
+pr-reviewer add owner/repo --path /path/to/local/clone \
+  --harness claude-code \
+  --model claude-sonnet-4-6
+```
+
+If GitNexus is installed, this automatically runs `gitnexus analyze` to index the repo.
+
+### 4. Test with a dry run
+
+```bash
+pr-reviewer review owner/repo#42 --dry-run
+```
+
+This runs the full review pipeline but logs the output instead of posting to GitHub.
+
+### 5. Review for real
+
+```bash
+pr-reviewer review owner/repo#42
+```
+
+### 6. Start the daemon
+
+```bash
+# foreground (see logs in terminal)
 pr-reviewer start
 
-# or run in the background
+# background (writes PID file, stop with `pr-reviewer stop`)
 pr-reviewer start --daemon
+
+# check status
+pr-reviewer status
 ```
+
+The daemon polls GitHub for new/updated PRs and automatically reviews them. It uses ETag caching and adaptive backoff to stay well within GitHub's rate limits.
 
 ## Configuration
 
