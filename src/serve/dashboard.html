@@ -821,8 +821,14 @@
   // ── Helpers ──────────────────────────────────────────────
   function updateSidebarCount(repo) {
     const key = repo.owner + '/' + repo.name;
-    const el = document.querySelector(`.repo-item[data-key="${key}"] .step-count`);
-    if (el) el.textContent = (repo.workflow || []).length;
+    // Iterate instead of using an interpolated CSS selector to avoid
+    // selector-injection if owner/name contain special characters.
+    document.querySelectorAll('.repo-item').forEach(item => {
+      if (item.dataset.key === key) {
+        const badge = item.querySelector('.step-count');
+        if (badge) badge.textContent = (repo.workflow || []).length;
+      }
+    });
   }
 
   function buildField(labelText, type, value, onChange) {
