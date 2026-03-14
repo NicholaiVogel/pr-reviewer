@@ -91,9 +91,6 @@ pub struct GitHubConfig {
     /// Whether a user passphrase was used for the inner encryption layer.
     #[serde(default)]
     pub passphrase_protected: bool,
-    /// Preferred token source hint (e.g. "signet", "encrypted").
-    #[serde(default)]
-    pub token_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -432,7 +432,14 @@ async fn main() -> Result<()> {
                     passphrase,
                     signet,
                 } => {
-                    // Read the token from stdin, existing config, or interactive prompt
+                    if stdin && passphrase {
+                        return Err(anyhow!(
+                            "--stdin and --passphrase are mutually exclusive; \
+                             use PR_REVIEWER_PASSPHRASE env var with --stdin instead"
+                        ));
+                    }
+
+                    // Read the token from stdin, existing config, or interactive prompt (no echo)
                     let raw_token = if stdin {
                         let mut buf = String::new();
                         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
@@ -443,15 +450,11 @@ async fn main() -> Result<()> {
                         println!("migrating existing plain-text token to encrypted storage");
                         existing.clone()
                     } else {
-                        // Prompt interactively (read_line, not read_to_string, to preserve stdin for passphrase)
-                        eprint!("GitHub token: ");
-                        let mut buf = String::new();
-                        std::io::BufRead::read_line(
-                            &mut std::io::stdin().lock(),
-                            &mut buf,
-                        )
-                        .context("failed to read token")?;
-                        buf.trim().to_string()
+                        // Interactive prompt with no echo
+                        rpassword::prompt_password("GitHub token: ")
+                            .context("failed to read token")?
+                            .trim()
+                            .to_string()
                     };
 
                     if raw_token.is_empty() {
@@ -469,19 +472,14 @@ async fn main() -> Result<()> {
                         cfg.github.token = None;
                         cfg.github.encrypted_token = None;
                         cfg.github.passphrase_protected = false;
-                        cfg.github.token_source = Some("signet".to_string());
                         cfg.save()?;
                         println!("token stored in Signet secret store");
                     } else {
                         let pp = if passphrase {
-                            eprint!("passphrase: ");
-                            let mut buf = String::new();
-                            std::io::BufRead::read_line(
-                                &mut std::io::stdin().lock(),
-                                &mut buf,
-                            )
-                            .context("failed to read passphrase")?;
-                            let pp = buf.trim().to_string();
+                            let pp = rpassword::prompt_password("passphrase: ")
+                                .context("failed to read passphrase")?
+                                .trim()
+                                .to_string();
                             if pp.is_empty() {
                                 return Err(anyhow!("passphrase cannot be empty"));
                             }
@@ -496,7 +494,6 @@ async fn main() -> Result<()> {
                         cfg.github.encrypted_token = Some(encrypted);
                         cfg.github.passphrase_protected = pp.is_some();
                         cfg.github.token = None; // remove legacy plain text
-                        cfg.github.token_source = Some("encrypted".to_string());
                         cfg.save()?;
 
                         let method = if pp.is_some() {
@@ -511,7 +508,6 @@ async fn main() -> Result<()> {
                     cfg.github.token = None;
                     cfg.github.encrypted_token = None;
                     cfg.github.passphrase_protected = false;
-                    cfg.github.token_source = None;
                     cfg.save()?;
                     println!("token removed from config");
 

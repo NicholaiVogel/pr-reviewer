@@ -19,6 +19,7 @@ globset = "0.4"
 nix = { version = "0.30", features = ["signal", "process"] }
 rand = "0.9"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rpassword = "7"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

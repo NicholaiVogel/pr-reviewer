@@ -20,35 +20,47 @@ pub fn keyfile_path() -> Result<PathBuf> {
 }
 
 /// Ensures the keyfile exists, creating it with a random 32-byte key if missing.
+/// Uses O_EXCL (create_new) to avoid TOCTOU races between concurrent writers.
 /// Returns the 32-byte key.
 pub fn ensure_keyfile() -> Result<[u8; KEY_LEN]> {
     let path = keyfile_path()?;
-    if path.exists() {
-        let data = fs::read(&path).context("failed to read keyfile")?;
-        check_keyfile_permissions(&path);
-        if data.len() != KEY_LEN {
-            return Err(anyhow!(
-                "keyfile is corrupt ({} bytes, expected {})",
-                data.len(),
-                KEY_LEN
-            ));
+
+    // Try to create the keyfile atomically first
+    let mut key = [0u8; KEY_LEN];
+    OsRng.fill_bytes(&mut key);
+    match write_keyfile_exclusive(&path, &key) {
+        Ok(()) => return Ok(key),
+        Err(_) => {
+            // File already exists — read it
+            let data = fs::read(&path).context("failed to read keyfile")?;
+            check_keyfile_permissions(&path);
+            if data.len() != KEY_LEN {
+                return Err(anyhow!(
+                    "keyfile is corrupt ({} bytes, expected {})",
+                    data.len(),
+                    KEY_LEN
+                ));
+            }
+            key.copy_from_slice(&data);
+            Ok(key)
         }
-        let mut key = [0u8; KEY_LEN];
-        key.copy_from_slice(&data);
-        Ok(key)
-    } else {
-        let mut key = [0u8; KEY_LEN];
-        OsRng.fill_bytes(&mut key);
-        write_keyfile(&path, &key)?;
-        Ok(key)
     }
 }
 
-fn write_keyfile(path: &Path, key: &[u8; KEY_LEN]) -> Result<()> {
+/// Atomically create the keyfile using O_EXCL to prevent TOCTOU races.
+/// Returns Err if the file already exists.
+fn write_keyfile_exclusive(path: &Path, key: &[u8; KEY_LEN]) -> Result<()> {
+    use std::io::Write;
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("failed to create keyfile directory")?;
     }
-    fs::write(path, key).context("failed to write keyfile")?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true) // O_EXCL: fail if file exists
+        .open(path)
+        .context("failed to create keyfile (may already exist)")?;
+    file.write_all(key).context("failed to write keyfile")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
