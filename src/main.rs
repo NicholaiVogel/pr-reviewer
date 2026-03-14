@@ -121,8 +121,6 @@ enum ConfigCommand {
         /// Store in Signet secret store instead of config file
         #[arg(long)]
         signet: bool,
-        /// The token value (omit to be prompted or use --stdin)
-        token: Option<String>,
     },
     /// Remove stored GitHub token
     RemoveToken,
@@ -433,12 +431,9 @@ async fn main() -> Result<()> {
                     stdin,
                     passphrase,
                     signet,
-                    token: token_arg,
                 } => {
-                    // Read the token from argument, stdin, existing config, or prompt
-                    let raw_token = if let Some(t) = token_arg {
-                        t
-                    } else if stdin {
+                    // Read the token from stdin, existing config, or interactive prompt
+                    let raw_token = if stdin {
                         let mut buf = String::new();
                         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
                             .context("failed to read token from stdin")?;

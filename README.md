@@ -293,8 +293,8 @@ pr-reviewer runs AI tools against potentially untrusted code. The safety model i
 
 GitHub tokens are never stored in plain text by default. The `set-token` command encrypts tokens with two independent AES-256-GCM layers:
 
-1. **Machine-bound key**: a random 32-byte key stored at `~/.config/pr-reviewer/keyfile` (permissions `0600`)
-2. **Passphrase or machine identity**: if `--passphrase` is used, the inner layer is derived via Argon2id from your passphrase. Otherwise, it uses a key derived from the machine's identity (`/etc/machine-id` + username)
+1. **Machine-bound key**: a random 32-byte key stored at `~/.config/pr-reviewer/keyfile` (permissions `0600`) -- this is the primary protection layer; anyone who can read this file can decrypt the token
+2. **Passphrase or machine identity**: if `--passphrase` is used, the inner layer is derived via Argon2id from your passphrase, providing strong protection even if the keyfile is compromised. Without `--passphrase`, the inner layer uses `/etc/machine-id` + username (world-readable inputs, so the keyfile is your real security boundary)
 
 Token resolution order:
 1. Signet secret store (if Signet is installed and has the secret)

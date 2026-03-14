@@ -49,18 +49,33 @@ pub async fn get_token() -> Result<Option<String>> {
 }
 
 /// Store the GitHub token in Signet's secret store.
+/// Pipes the token via stdin to avoid leaking it in /proc/pid/cmdline.
 pub async fn store_token(token: &str) -> Result<()> {
     if !is_available().await {
         return Err(anyhow!("signet CLI not found on PATH"));
     }
 
-    let output = Command::new("signet")
-        .args(["secret", "set", SECRET_NAME, "--value", token])
+    let mut child = Command::new("signet")
+        .args(["secret", "set", SECRET_NAME, "--stdin"])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
+        .context("failed to spawn signet secret set")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin
+            .write_all(token.as_bytes())
+            .await
+            .context("failed to write token to signet stdin")?;
+        // Drop stdin to close the pipe and signal EOF
+    }
+
+    let output = child
+        .wait_with_output()
         .await
-        .context("failed to run signet secret set")?;
+        .context("failed to wait for signet secret set")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

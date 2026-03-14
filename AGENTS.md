@@ -62,7 +62,7 @@ All harnesses run in a sandboxed environment:
 
 ### Token Resolution (token/mod.rs)
 
-GitHub tokens are resolved in priority order: Signet secret → encrypted config → plain-text config (warns) → `GITHUB_TOKEN` env var. Encrypted tokens use double-layer AES-256-GCM: outer layer with a machine-bound keyfile at `~/.config/pr-reviewer/keyfile`, inner layer with either an Argon2id-derived passphrase key or a machine-identity-derived key. For daemon mode with passphrase-protected tokens, set `PR_REVIEWER_PASSPHRASE` env var.
+GitHub tokens are resolved in priority order: Signet secret → encrypted config → plain-text config (warns) → `GITHUB_TOKEN` env var. Encrypted tokens use double-layer AES-256-GCM: outer layer with a machine-bound keyfile at `~/.config/pr-reviewer/keyfile` (primary security boundary, `0600` permissions), inner layer with either an Argon2id-derived passphrase key (strong, recommended) or a machine-identity-derived key (weak — uses world-readable `/etc/machine-id` + username, so keyfile is the real protection). For daemon mode with passphrase-protected tokens, set `PR_REVIEWER_PASSPHRASE` env var (required, not optional — will error if missing).
 
 ### Managed Repo Clones (repo_manager.rs)
 

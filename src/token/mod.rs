@@ -47,8 +47,14 @@ pub async fn resolve_github_token(config: &AppConfig) -> Result<(String, TokenSo
     if let Some(ref encrypted) = config.github.encrypted_token {
         let passphrase = if config.github.passphrase_protected {
             // In daemon mode we can't prompt interactively.
-            // Check for PR_REVIEWER_PASSPHRASE env var.
-            std::env::var("PR_REVIEWER_PASSPHRASE").ok()
+            // Require PR_REVIEWER_PASSPHRASE env var for passphrase-protected tokens.
+            let pp = std::env::var("PR_REVIEWER_PASSPHRASE").map_err(|_| {
+                anyhow!(
+                    "token is passphrase-protected; set PR_REVIEWER_PASSPHRASE env var \
+                     or re-encrypt without --passphrase"
+                )
+            })?;
+            Some(pp)
         } else {
             None
         };
