@@ -319,18 +319,38 @@ impl GitHubClient {
         pr_number: u64,
         since: Option<&str>,
     ) -> Result<Vec<ReviewComment>> {
-        let mut path = format!("/repos/{owner}/{repo}/pulls/{pr_number}/comments?per_page=100");
-        if let Some(since) = since {
-            path.push_str("&since=");
-            path.push_str(since);
+        let mut all_comments = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let mut path =
+                format!("/repos/{owner}/{repo}/pulls/{pr_number}/comments?per_page=100&page={page}");
+            if let Some(since) = since {
+                path.push_str("&since=");
+                path.push_str(since);
+            }
+            let resp = self
+                .request(Method::GET, &path)
+                .send()
+                .await
+                .context("GitHub get review comments failed")?;
+            self.update_rate_state(resp.headers());
+
+            let has_next = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("rel=\"next\""));
+
+            let batch: Vec<ReviewComment> = handle_json(resp).await?;
+            let batch_empty = batch.is_empty();
+            all_comments.extend(batch);
+
+            if !has_next || batch_empty || page >= 10 {
+                break;
+            }
+            page += 1;
         }
-        let resp = self
-            .request(Method::GET, &path)
-            .send()
-            .await
-            .context("GitHub get review comments failed")?;
-        self.update_rate_state(resp.headers());
-        handle_json(resp).await
+        Ok(all_comments)
     }
 
     pub async fn get_authenticated_user(&self) -> Result<String> {

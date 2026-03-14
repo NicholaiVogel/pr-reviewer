@@ -44,6 +44,7 @@ pub async fn run_harness(
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
+        command.kill_on_drop(true);
         let mut child = command.spawn().context("failed to spawn harness")?;
         if let Some(mut stdin) = child.stdin.take() {
             let prompt = req.prompt.clone();

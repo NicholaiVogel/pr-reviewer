@@ -41,7 +41,8 @@ pub async fn start(
     let pid_file = AppConfig::pid_file()?;
     write_pid(&pid_file)?;
 
-    let engine = ReviewEngine::new(Arc::new(config.clone()), github.clone(), db.clone());
+    let mut engine = ReviewEngine::new(Arc::new(config.clone()), github.clone(), db.clone());
+    engine.init().await;
     let semaphore = Arc::new(Semaphore::new(config.daemon.max_concurrent_reviews));
     let mut workers: JoinSet<()> = JoinSet::new();
     let bot_mention = format!("@{}", config.defaults.bot_name);

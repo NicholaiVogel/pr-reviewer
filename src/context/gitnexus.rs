@@ -50,7 +50,6 @@ pub async fn query_context(repo_root: &Path, files: &[String]) -> Result<Option<
     let output = match Command::new("gitnexus")
         .arg("query")
         .arg(&search_query)
-        .arg("--content")
         .current_dir(repo_root)
         .output()
         .await

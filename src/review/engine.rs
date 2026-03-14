@@ -44,11 +44,21 @@ pub struct ReviewEngine {
     config: Arc<AppConfig>,
     github: GitHubClient,
     db: Database,
+    authenticated_user: Option<String>,
 }
 
 impl ReviewEngine {
     pub fn new(config: Arc<AppConfig>, github: GitHubClient, db: Database) -> Self {
-        Self { config, github, db }
+        Self {
+            config,
+            github,
+            db,
+            authenticated_user: None,
+        }
+    }
+
+    pub async fn init(&mut self) {
+        self.authenticated_user = self.github.get_authenticated_user().await.ok();
     }
 
     pub async fn review_pr(
@@ -395,18 +405,15 @@ impl ReviewEngine {
             });
         }
 
-        // GitHub rejects APPROVE/REQUEST_CHANGES on your own PRs — downgrade to COMMENT
+        // GitHub rejects APPROVE/REQUEST_CHANGES on your own PRs — downgrade to COMMENT.
+        // Fail-closed: if we can't determine the authenticated user, default to COMMENT.
         let event = match verdict {
             ReviewVerdict::Comment => verdict.as_github_event(),
             ReviewVerdict::Approve | ReviewVerdict::RequestChanges => {
-                let authenticated_user = self.github.get_authenticated_user().await.ok();
-                if authenticated_user
-                    .as_deref()
-                    .is_some_and(|u| u.eq_ignore_ascii_case(&pr_data.user.login))
-                {
-                    "COMMENT"
-                } else {
-                    verdict.as_github_event()
+                match self.authenticated_user.as_deref() {
+                    Some(u) if u.eq_ignore_ascii_case(&pr_data.user.login) => "COMMENT",
+                    Some(_) => verdict.as_github_event(),
+                    None => "COMMENT",
                 }
             }
         };
