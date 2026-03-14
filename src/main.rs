@@ -5,6 +5,7 @@ mod github;
 mod harness;
 mod review;
 mod safety;
+mod serve;
 mod store;
 
 use std::path::{Path, PathBuf};
@@ -73,6 +74,12 @@ enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Start the local workflow builder UI.
+    Serve {
+        /// Port to listen on (default: 3848).
+        #[arg(long, default_value_t = 3848)]
+        port: u16,
     },
 }
 
@@ -161,6 +168,7 @@ async fn main() -> Result<()> {
                 ],
                 custom_instructions: None,
                 gitnexus: true,
+                workflow: vec![],
             };
             let repo_name = repo_cfg.full_name();
             cfg.add_repo(repo_cfg.clone())?;
@@ -325,6 +333,10 @@ async fn main() -> Result<()> {
             let stats = db.usage_stats(since.as_deref(), repo.as_deref()).await?;
             println!("{}", format_stats(&stats));
         }
+        Commands::Serve { port } => {
+            let cfg = AppConfig::load_or_default()?;
+            serve::start(cfg, port).await?;
+        }
         Commands::Config { command } => {
             let mut cfg = AppConfig::load_or_default()?;
             match command {
@@ -417,6 +429,7 @@ fn add_scanned_repos(cfg: &mut AppConfig, scan_dir: &Path) -> Result<()> {
             ignore_paths: vec![],
             custom_instructions: None,
             gitnexus: true,
+            workflow: vec![],
         };
 
         if cfg

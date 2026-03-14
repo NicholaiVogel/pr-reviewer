@@ -120,6 +120,51 @@ pub struct DefaultsConfig {
     pub max_prompt_bytes: usize,
 }
 
+/// Conditions that must be met for a workflow step to run.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowConditions {
+    /// Only run if the PR touches files matching any of these globs.
+    #[serde(default)]
+    pub file_patterns: Vec<String>,
+    /// Only run if the diff has at least this many lines.
+    #[serde(default)]
+    pub min_diff_lines: Option<usize>,
+    /// Skip draft PRs.
+    #[serde(default)]
+    pub skip_drafts: bool,
+    /// Only run if the PR has at least one of these labels.
+    #[serde(default)]
+    pub label_patterns: Vec<String>,
+}
+
+/// A single step in a repo's review workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    /// Unique identifier (UUID or user-defined slug).
+    pub id: String,
+    /// Human-readable name shown in the UI.
+    pub name: String,
+    /// Override the harness for this step. Falls back to repo/global default.
+    #[serde(default)]
+    pub harness: Option<HarnessKind>,
+    /// Override the model for this step. Falls back to repo/global default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Additional instructions injected into the prompt for this step.
+    #[serde(default)]
+    pub custom_instructions: Option<String>,
+    /// Conditions that must be met for this step to run.
+    #[serde(default)]
+    pub conditions: WorkflowConditions,
+    /// Whether this step is active. Disabled steps are skipped.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
     pub owner: String,
@@ -139,6 +184,10 @@ pub struct RepoConfig {
     pub custom_instructions: Option<String>,
     #[serde(default = "default_gitnexus")]
     pub gitnexus: bool,
+    /// Optional multi-step review workflow. When non-empty the daemon runs
+    /// each enabled step in order instead of the single-step legacy behaviour.
+    #[serde(default)]
+    pub workflow: Vec<WorkflowStep>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,0 +1,962 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pr-reviewer — Workflow Builder</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #0d1117;
+    --surface:  #161b22;
+    --border:   #30363d;
+    --accent:   #58a6ff;
+    --accent2:  #388bfd;
+    --text:     #e6edf3;
+    --muted:    #8b949e;
+    --danger:   #f85149;
+    --success:  #3fb950;
+    --warning:  #d29922;
+    --card:     #21262d;
+    --radius:   8px;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* ── Sidebar ───────────────────────────────────────────── */
+  #sidebar {
+    width: 240px;
+    min-width: 200px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #sidebar-header {
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  #sidebar-header h1 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  #sidebar-header p {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  #repo-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+  }
+
+  .repo-item {
+    padding: 8px 16px;
+    cursor: pointer;
+    border-radius: 0;
+    color: var(--muted);
+    font-size: 13px;
+    transition: background 0.1s, color 0.1s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .repo-item:hover { background: rgba(88,166,255,0.08); color: var(--text); }
+  .repo-item.active { background: rgba(88,166,255,0.15); color: var(--accent); font-weight: 500; }
+  .repo-item .step-count {
+    float: right;
+    font-size: 11px;
+    background: var(--border);
+    border-radius: 10px;
+    padding: 1px 6px;
+    color: var(--muted);
+  }
+
+  /* ── Main area ─────────────────────────────────────────── */
+  #main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  #toolbar h2 {
+    flex: 1;
+    font-size: 14px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  #save-status {
+    font-size: 12px;
+    color: var(--muted);
+    min-width: 60px;
+    text-align: right;
+  }
+  #save-status.saving { color: var(--warning); }
+  #save-status.saved  { color: var(--success); }
+  #save-status.error  { color: var(--danger); }
+
+  #content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+  }
+
+  /* ── Empty state ───────────────────────────────────────── */
+  #empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    gap: 12px;
+    color: var(--muted);
+    text-align: center;
+    padding: 40px;
+  }
+  #empty-state .icon {
+    font-size: 40px;
+    opacity: 0.3;
+  }
+  #empty-state h3 { color: var(--text); font-size: 16px; }
+  #empty-state p  { font-size: 13px; max-width: 320px; }
+
+  /* ── Workflow list ─────────────────────────────────────── */
+  #workflow-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 680px;
+    margin: 0 auto;
+  }
+
+  .step-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    transition: border-color 0.15s, box-shadow 0.15s;
+    cursor: grab;
+    user-select: none;
+  }
+  .step-card:active { cursor: grabbing; }
+  .step-card.dragging {
+    opacity: 0.4;
+  }
+  .step-card.drag-over {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(88,166,255,0.25);
+  }
+  .step-card.disabled-card { opacity: 0.55; }
+
+  .step-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    cursor: pointer;
+  }
+  .drag-handle {
+    color: var(--border);
+    font-size: 16px;
+    cursor: grab;
+    flex-shrink: 0;
+  }
+  .step-name {
+    flex: 1;
+    font-weight: 500;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .harness-badge {
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 12px;
+    background: rgba(88,166,255,0.15);
+    color: var(--accent);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .model-badge {
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
+    flex-shrink: 0;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* toggle switch */
+  .toggle {
+    position: relative;
+    width: 32px;
+    height: 18px;
+    flex-shrink: 0;
+  }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: var(--border);
+    border-radius: 18px;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .toggle-slider::before {
+    content: "";
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    left: 3px;
+    top: 3px;
+    background: var(--muted);
+    border-radius: 50%;
+    transition: transform 0.2s, background 0.2s;
+  }
+  .toggle input:checked + .toggle-slider { background: rgba(63,185,80,0.3); }
+  .toggle input:checked + .toggle-slider::before {
+    transform: translateX(14px);
+    background: var(--success);
+  }
+
+  .expand-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 12px;
+    cursor: pointer;
+    flex-shrink: 0;
+    padding: 2px 4px;
+    transition: color 0.1s;
+  }
+  .expand-btn:hover { color: var(--text); }
+
+  /* Step edit form */
+  .step-body {
+    display: none;
+    padding: 0 14px 14px;
+    border-top: 1px solid var(--border);
+    margin-top: 0;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .step-body.open { display: flex; }
+
+  .field-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  @media (max-width: 480px) { .field-row { grid-template-columns: 1fr; } }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .field label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .field input, .field select, .field textarea {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+    padding: 6px 10px;
+    width: 100%;
+    outline: none;
+    transition: border-color 0.15s;
+    font-family: inherit;
+  }
+  .field input:focus, .field select:focus, .field textarea:focus {
+    border-color: var(--accent);
+  }
+  .field select option { background: var(--surface); }
+  .field textarea { resize: vertical; min-height: 72px; }
+
+  /* tag input */
+  .tag-input-wrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    min-height: 36px;
+    cursor: text;
+    transition: border-color 0.15s;
+  }
+  .tag-input-wrap:focus-within { border-color: var(--accent); }
+  .tag {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    background: rgba(88,166,255,0.15);
+    color: var(--accent);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 12px;
+  }
+  .tag button {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--accent);
+    font-size: 12px;
+    padding: 0;
+    line-height: 1;
+  }
+  .tag-input {
+    background: none;
+    border: none;
+    color: var(--text);
+    font-size: 13px;
+    outline: none;
+    min-width: 80px;
+    flex: 1;
+    padding: 0;
+    font-family: inherit;
+  }
+
+  .conditions-section {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .conditions-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .checkbox-row input[type=checkbox] {
+    accent-color: var(--accent);
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+  }
+
+  .step-footer {
+    display: flex;
+    justify-content: flex-end;
+    padding-top: 4px;
+  }
+  .btn-danger {
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: var(--danger);
+    font-size: 12px;
+    padding: 4px 10px;
+    cursor: pointer;
+    transition: background 0.1s, border-color 0.1s;
+  }
+  .btn-danger:hover { background: rgba(248,81,73,0.1); border-color: var(--danger); }
+
+  /* ── Add step button ───────────────────────────────────── */
+  #add-step-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+    max-width: 680px;
+    margin: 12px auto 0;
+    padding: 10px;
+    background: none;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+    color: var(--muted);
+    font-size: 13px;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  #add-step-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ── No repo selected ──────────────────────────────────── */
+  #no-repo {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- Sidebar -->
+<div id="sidebar">
+  <div id="sidebar-header">
+    <h1>pr-reviewer</h1>
+    <p>Workflow Builder</p>
+  </div>
+  <div id="repo-list"></div>
+</div>
+
+<!-- Main -->
+<div id="main">
+  <div id="toolbar">
+    <h2 id="toolbar-title">Select a repository</h2>
+    <span id="save-status"></span>
+  </div>
+  <div id="content">
+    <div id="no-repo">
+      <span>Choose a repo from the sidebar to manage its workflow.</span>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ── State ────────────────────────────────────────────────
+  let repos = [];       // [{owner, name, workflow: [...]}]
+  let currentRepo = null;
+  let saveTimer = null;
+
+  // ── Fetch repos ──────────────────────────────────────────
+  async function loadRepos() {
+    const res = await fetch('/api/repos');
+    repos = await res.json();
+    renderSidebar();
+    if (repos.length > 0 && !currentRepo) selectRepo(repos[0].owner + '/' + repos[0].name);
+  }
+
+  // ── Sidebar ──────────────────────────────────────────────
+  function renderSidebar() {
+    const list = document.getElementById('repo-list');
+    list.innerHTML = '';
+    repos.forEach(r => {
+      const key = r.owner + '/' + r.name;
+      const el = document.createElement('div');
+      el.className = 'repo-item' + (currentRepo === key ? ' active' : '');
+      el.dataset.key = key;
+      el.innerHTML =
+        escHtml(r.name) +
+        '<span class="step-count">' + (r.workflow ? r.workflow.length : 0) + '</span>';
+      el.title = key;
+      el.addEventListener('click', () => selectRepo(key));
+      list.appendChild(el);
+    });
+  }
+
+  function selectRepo(key) {
+    currentRepo = key;
+    document.querySelectorAll('.repo-item').forEach(el => {
+      el.classList.toggle('active', el.dataset.key === key);
+    });
+    const repo = repos.find(r => (r.owner + '/' + r.name) === key);
+    document.getElementById('toolbar-title').textContent = key;
+    renderWorkflow(repo);
+  }
+
+  // ── Workflow renderer ────────────────────────────────────
+  function renderWorkflow(repo) {
+    const content = document.getElementById('content');
+    content.innerHTML = '';
+
+    if (!repo) {
+      content.innerHTML = '<div id="no-repo"><span>Repo not found.</span></div>';
+      return;
+    }
+
+    const steps = repo.workflow || [];
+
+    if (steps.length === 0) {
+      const empty = document.createElement('div');
+      empty.id = 'empty-state';
+      empty.innerHTML = `
+        <div class="icon">&#9881;</div>
+        <h3>No steps yet</h3>
+        <p>Add your first review step to get started. Steps run in order for each new PR.</p>`;
+      content.appendChild(empty);
+    } else {
+      const list = document.createElement('div');
+      list.id = 'workflow-list';
+      steps.forEach(step => list.appendChild(buildStepCard(step, repo)));
+      content.appendChild(list);
+      initDragAndDrop(list, repo);
+    }
+
+    const addBtn = document.createElement('button');
+    addBtn.id = 'add-step-btn';
+    addBtn.innerHTML = '&#43; Add Step';
+    addBtn.addEventListener('click', () => addStep(repo));
+    content.appendChild(addBtn);
+  }
+
+  // ── Step card ────────────────────────────────────────────
+  function buildStepCard(step, repo) {
+    const card = document.createElement('div');
+    card.className = 'step-card' + (step.enabled ? '' : ' disabled-card');
+    card.dataset.id = step.id;
+    card.draggable = true;
+
+    // Header
+    const hdr = document.createElement('div');
+    hdr.className = 'step-header';
+    hdr.innerHTML = `
+      <span class="drag-handle" title="Drag to reorder">&#8942;&#8942;</span>
+      <span class="step-name">${escHtml(step.name)}</span>
+      ${step.harness ? `<span class="harness-badge">${escHtml(step.harness)}</span>` : ''}
+      ${step.model ? `<span class="model-badge">${escHtml(step.model)}</span>` : ''}
+    `;
+
+    // Toggle
+    const toggle = document.createElement('label');
+    toggle.className = 'toggle';
+    toggle.title = step.enabled ? 'Enabled — click to disable' : 'Disabled — click to enable';
+    const inp = document.createElement('input');
+    inp.type = 'checkbox';
+    inp.checked = step.enabled;
+    inp.addEventListener('change', () => {
+      step.enabled = inp.checked;
+      card.classList.toggle('disabled-card', !step.enabled);
+      toggle.title = step.enabled ? 'Enabled — click to disable' : 'Disabled — click to enable';
+      scheduleSave(repo);
+    });
+    const slider = document.createElement('span');
+    slider.className = 'toggle-slider';
+    toggle.appendChild(inp);
+    toggle.appendChild(slider);
+    toggle.addEventListener('click', e => e.stopPropagation());
+    hdr.appendChild(toggle);
+
+    // Expand button
+    const expBtn = document.createElement('button');
+    expBtn.className = 'expand-btn';
+    expBtn.title = 'Expand / collapse';
+    expBtn.textContent = '▾';
+    hdr.appendChild(expBtn);
+
+    card.appendChild(hdr);
+
+    // Body (edit form)
+    const body = document.createElement('div');
+    body.className = 'step-body';
+
+    body.appendChild(buildField('Name', 'text', step.name, v => {
+      step.name = v;
+      hdr.querySelector('.step-name').textContent = v;
+      scheduleSave(repo);
+      updateSidebarCount(repo);
+    }));
+
+    const fieldRow1 = document.createElement('div');
+    fieldRow1.className = 'field-row';
+    fieldRow1.appendChild(buildSelectField('Harness', ['', 'claude-code', 'opencode', 'codex'],
+      step.harness || '', v => {
+        step.harness = v || null;
+        const badge = hdr.querySelector('.harness-badge');
+        if (v) {
+          if (badge) badge.textContent = v;
+          else {
+            const b = document.createElement('span');
+            b.className = 'harness-badge';
+            b.textContent = v;
+            hdr.querySelector('.step-name').after(b);
+          }
+        } else if (badge) badge.remove();
+        scheduleSave(repo);
+      }));
+    fieldRow1.appendChild(buildField('Model', 'text', step.model || '', v => {
+      step.model = v || null;
+      const badge = hdr.querySelector('.model-badge');
+      if (v) {
+        if (badge) badge.textContent = v;
+        else {
+          const b = document.createElement('span');
+          b.className = 'model-badge';
+          b.textContent = v;
+          hdr.querySelector('.step-name').after(b);
+        }
+      } else if (badge) badge.remove();
+      scheduleSave(repo);
+    }));
+    body.appendChild(fieldRow1);
+
+    // Custom instructions
+    const instrField = buildTextareaField('Custom Instructions',
+      step.custom_instructions || '',
+      v => { step.custom_instructions = v || null; scheduleSave(repo); });
+    body.appendChild(instrField);
+
+    // Conditions
+    const cond = document.createElement('div');
+    cond.className = 'conditions-section';
+    cond.innerHTML = '<div class="conditions-title">Run Conditions</div>';
+
+    // File patterns
+    const fp = buildTagInput('File Patterns (globs)', step.conditions.file_patterns || [],
+      v => { step.conditions.file_patterns = v; scheduleSave(repo); });
+    cond.appendChild(fp);
+
+    // min_diff_lines
+    const condRow = document.createElement('div');
+    condRow.className = 'field-row';
+    condRow.appendChild(buildField('Min Diff Lines', 'number',
+      step.conditions.min_diff_lines != null ? String(step.conditions.min_diff_lines) : '',
+      v => { step.conditions.min_diff_lines = v ? parseInt(v, 10) : null; scheduleSave(repo); }));
+
+    // skip_drafts
+    const skipField = document.createElement('div');
+    skipField.className = 'field';
+    skipField.innerHTML = '<label>Skip Drafts</label>';
+    const skipLbl = document.createElement('label');
+    skipLbl.className = 'checkbox-row';
+    const skipCb = document.createElement('input');
+    skipCb.type = 'checkbox';
+    skipCb.checked = step.conditions.skip_drafts || false;
+    skipCb.addEventListener('change', () => {
+      step.conditions.skip_drafts = skipCb.checked;
+      scheduleSave(repo);
+    });
+    skipLbl.appendChild(skipCb);
+    skipLbl.appendChild(document.createTextNode(' Skip draft PRs'));
+    skipField.appendChild(skipLbl);
+    condRow.appendChild(skipField);
+    cond.appendChild(condRow);
+
+    // label_patterns
+    const lp = buildTagInput('Label Filters', step.conditions.label_patterns || [],
+      v => { step.conditions.label_patterns = v; scheduleSave(repo); });
+    cond.appendChild(lp);
+
+    body.appendChild(cond);
+
+    // Footer with delete
+    const footer = document.createElement('div');
+    footer.className = 'step-footer';
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn-danger';
+    delBtn.textContent = 'Delete step';
+    delBtn.addEventListener('click', () => {
+      repo.workflow = repo.workflow.filter(s => s.id !== step.id);
+      scheduleSave(repo);
+      renderWorkflow(repo);
+      updateSidebarCount(repo);
+    });
+    footer.appendChild(delBtn);
+    body.appendChild(footer);
+
+    card.appendChild(body);
+
+    // Toggle expand
+    hdr.addEventListener('click', e => {
+      if (e.target.closest('.toggle') || e.target === expBtn) return;
+      body.classList.toggle('open');
+      expBtn.textContent = body.classList.contains('open') ? '▴' : '▾';
+    });
+    expBtn.addEventListener('click', () => {
+      body.classList.toggle('open');
+      expBtn.textContent = body.classList.contains('open') ? '▴' : '▾';
+    });
+
+    return card;
+  }
+
+  // ── Drag & drop ──────────────────────────────────────────
+  function initDragAndDrop(list, repo) {
+    let dragSrc = null;
+
+    list.addEventListener('dragstart', e => {
+      const card = e.target.closest('.step-card');
+      if (!card) return;
+      dragSrc = card;
+      card.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+
+    list.addEventListener('dragend', e => {
+      const card = e.target.closest('.step-card');
+      if (card) card.classList.remove('dragging');
+      list.querySelectorAll('.step-card').forEach(c => c.classList.remove('drag-over'));
+    });
+
+    list.addEventListener('dragover', e => {
+      e.preventDefault();
+      const card = e.target.closest('.step-card');
+      if (!card || card === dragSrc) return;
+      list.querySelectorAll('.step-card').forEach(c => c.classList.remove('drag-over'));
+      card.classList.add('drag-over');
+    });
+
+    list.addEventListener('drop', e => {
+      e.preventDefault();
+      const target = e.target.closest('.step-card');
+      if (!target || !dragSrc || target === dragSrc) return;
+
+      const cards = Array.from(list.children);
+      const fromIdx = cards.indexOf(dragSrc);
+      const toIdx = cards.indexOf(target);
+
+      if (fromIdx < toIdx) target.after(dragSrc);
+      else target.before(dragSrc);
+
+      // Sync order to repo.workflow
+      const newOrder = Array.from(list.children).map(c => c.dataset.id);
+      repo.workflow.sort((a, b) => newOrder.indexOf(a.id) - newOrder.indexOf(b.id));
+
+      list.querySelectorAll('.step-card').forEach(c => c.classList.remove('drag-over'));
+      scheduleSave(repo);
+    });
+  }
+
+  // ── Add step ─────────────────────────────────────────────
+  function addStep(repo) {
+    const step = {
+      id: generateId(),
+      name: 'New Step',
+      harness: null,
+      model: null,
+      custom_instructions: null,
+      conditions: { file_patterns: [], min_diff_lines: null, skip_drafts: false, label_patterns: [] },
+      enabled: true,
+    };
+    if (!repo.workflow) repo.workflow = [];
+    repo.workflow.push(step);
+    renderWorkflow(repo);
+    updateSidebarCount(repo);
+    scheduleSave(repo);
+
+    // Auto-expand the new card
+    setTimeout(() => {
+      const list = document.getElementById('workflow-list');
+      if (list) {
+        const last = list.lastElementChild;
+        if (last) {
+          const body = last.querySelector('.step-body');
+          const btn = last.querySelector('.expand-btn');
+          if (body && btn) { body.classList.add('open'); btn.textContent = '▴'; }
+        }
+      }
+    }, 50);
+  }
+
+  // ── Save ─────────────────────────────────────────────────
+  function scheduleSave(repo) {
+    setSaveStatus('saving');
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => saveRepo(repo), 500);
+  }
+
+  async function saveRepo(repo) {
+    try {
+      const res = await fetch(`/api/repos/${repo.owner}/${repo.name}/workflow`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(repo.workflow || []),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setSaveStatus('saved');
+      setTimeout(() => setSaveStatus(''), 2000);
+    } catch (err) {
+      setSaveStatus('error', 'Save failed: ' + err.message);
+    }
+  }
+
+  function setSaveStatus(state, msg) {
+    const el = document.getElementById('save-status');
+    el.className = state;
+    el.textContent = state === 'saving' ? 'Saving...'
+      : state === 'saved'  ? 'Saved'
+      : state === 'error'  ? (msg || 'Error')
+      : '';
+  }
+
+  // ── Helpers ──────────────────────────────────────────────
+  function updateSidebarCount(repo) {
+    const key = repo.owner + '/' + repo.name;
+    // Iterate instead of using an interpolated CSS selector to avoid
+    // selector-injection if owner/name contain special characters.
+    document.querySelectorAll('.repo-item').forEach(item => {
+      if (item.dataset.key === key) {
+        const badge = item.querySelector('.step-count');
+        if (badge) badge.textContent = (repo.workflow || []).length;
+      }
+    });
+  }
+
+  function buildField(labelText, type, value, onChange) {
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    const lbl = document.createElement('label');
+    lbl.textContent = labelText;
+    const inp = document.createElement('input');
+    inp.type = type;
+    inp.value = value;
+    inp.addEventListener('input', () => onChange(inp.value));
+    wrap.appendChild(lbl);
+    wrap.appendChild(inp);
+    return wrap;
+  }
+
+  function buildSelectField(labelText, options, value, onChange) {
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    const lbl = document.createElement('label');
+    lbl.textContent = labelText;
+    const sel = document.createElement('select');
+    options.forEach(o => {
+      const opt = document.createElement('option');
+      opt.value = o;
+      opt.textContent = o || '(inherit)';
+      opt.selected = o === value;
+      sel.appendChild(opt);
+    });
+    sel.addEventListener('change', () => onChange(sel.value));
+    wrap.appendChild(lbl);
+    wrap.appendChild(sel);
+    return wrap;
+  }
+
+  function buildTextareaField(labelText, value, onChange) {
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    const lbl = document.createElement('label');
+    lbl.textContent = labelText;
+    const ta = document.createElement('textarea');
+    ta.value = value;
+    ta.placeholder = 'e.g. "This project uses a custom ORM. Watch for SQL injection."';
+    ta.addEventListener('input', () => onChange(ta.value));
+    wrap.appendChild(lbl);
+    wrap.appendChild(ta);
+    return wrap;
+  }
+
+  function buildTagInput(labelText, tags, onChange) {
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    const lbl = document.createElement('label');
+    lbl.textContent = labelText;
+    wrap.appendChild(lbl);
+
+    const tagWrap = document.createElement('div');
+    tagWrap.className = 'tag-input-wrap';
+
+    const currentTags = [...tags];
+
+    function addTag(val) {
+      val = val.trim();
+      if (!val || currentTags.includes(val)) return;
+      currentTags.push(val);
+      onChange([...currentTags]);
+      renderTags();
+    }
+
+    function removeTag(val) {
+      const idx = currentTags.indexOf(val);
+      if (idx > -1) { currentTags.splice(idx, 1); onChange([...currentTags]); renderTags(); }
+    }
+
+    function renderTags() {
+      tagWrap.innerHTML = '';
+      currentTags.forEach(t => {
+        const tag = document.createElement('span');
+        tag.className = 'tag';
+        tag.innerHTML = escHtml(t);
+        const rm = document.createElement('button');
+        rm.textContent = '×';
+        rm.addEventListener('click', () => removeTag(t));
+        tag.appendChild(rm);
+        tagWrap.appendChild(tag);
+      });
+      tagWrap.appendChild(input);
+      input.focus();
+    }
+
+    const input = document.createElement('input');
+    input.className = 'tag-input';
+    input.placeholder = labelText.includes('glob') ? '*.rs, src/**' : 'press Enter to add';
+    input.addEventListener('keydown', e => {
+      if ((e.key === 'Enter' || e.key === ',') && input.value) {
+        e.preventDefault();
+        addTag(input.value);
+        input.value = '';
+      } else if (e.key === 'Backspace' && !input.value && currentTags.length) {
+        removeTag(currentTags[currentTags.length - 1]);
+      }
+    });
+    input.addEventListener('blur', () => {
+      if (input.value.trim()) { addTag(input.value); input.value = ''; }
+    });
+    tagWrap.appendChild(input);
+    renderTags();
+
+    tagWrap.addEventListener('click', () => input.focus());
+    wrap.appendChild(tagWrap);
+    return wrap;
+  }
+
+  function generateId() {
+    return 'step-' + Math.random().toString(36).slice(2, 9);
+  }
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // ── Boot ─────────────────────────────────────────────────
+  loadRepos();
+})();
+</script>
+</body>
+</html>
