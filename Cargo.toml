@@ -1,0 +1,32 @@
+[package]
+name = "pr-reviewer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Self-hosted PR review daemon that uses local AI CLI tools"
+repository = "https://github.com/nicholai/pr-reviewer"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+globset = "0.4"
+nix = { version = "0.30", features = ["signal", "process"] }
+rand = "0.9"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+urlencoding = "2"
+
+[dev-dependencies]
+httptest = "0.16"
