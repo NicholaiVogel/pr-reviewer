@@ -901,7 +901,10 @@ fn build_in_progress_comment(
 }
 
 fn sanitize_in_progress_title(title: &str) -> String {
-    title.replace('"', "'").replace('`', "'")
+    title
+        .replace(['\r', '\n'], " ")
+        .replace('"', "'")
+        .replace('`', "'")
 }
 
 fn pr_reviewer_project_url() -> &'static str {
@@ -1190,6 +1193,19 @@ mod tests {
             "527fae59",
         );
         assert!(message.contains("`docs [click](https://example.com)`"));
+    }
+
+    #[test]
+    fn in_progress_comment_normalizes_newlines_in_title() {
+        let message = build_in_progress_comment(
+            "octocat",
+            "contributor",
+            "fix quote\nand link\r\nrendering",
+            "527fae59",
+        );
+        assert!(message.contains("`fix quote and link  rendering`"));
+        assert!(!message.contains('\n'));
+        assert!(!message.contains('\r'));
     }
 
     #[test]
