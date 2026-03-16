@@ -901,10 +901,11 @@ fn build_in_progress_comment(
 }
 
 fn sanitize_in_progress_title(title: &str) -> String {
-    title
+    let sanitized = title
         .replace(['\r', '\n'], " ")
         .replace('"', "'")
-        .replace('`', "'")
+        .replace('`', "'");
+    sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn pr_reviewer_project_url() -> &'static str {
@@ -1203,7 +1204,7 @@ mod tests {
             "fix quote\nand link\r\nrendering",
             "527fae59",
         );
-        assert!(message.contains("`fix quote and link  rendering`"));
+        assert!(message.contains("`fix quote and link rendering`"));
         assert!(!message.contains('\n'));
         assert!(!message.contains('\r'));
     }
