@@ -167,12 +167,19 @@ impl ReviewEngine {
             });
 
             if !already_posted {
-                let in_progress = format!(
-                    "🔍 `{}` started reviewing commit `{}` with `{}` (`{}`). I will post findings when the review completes.",
-                    self.config.defaults.bot_name,
-                    short_sha(&pr_data.head.sha),
-                    harness_kind.as_str(),
-                    model
+                let reviewer_owner = match &self.authenticated_user {
+                    Some(login) => login.clone(),
+                    None => self
+                        .github
+                        .get_authenticated_user()
+                        .await
+                        .unwrap_or_else(|_| self.config.defaults.bot_name.clone()),
+                };
+                let in_progress = build_in_progress_comment(
+                    &reviewer_owner,
+                    &pr_data.user.login,
+                    &pr_data.title,
+                    &pr_data.head.sha,
                 );
                 if let Err(err) = comments::create_issue_comment(
                     &self.github,
@@ -855,6 +862,85 @@ fn short_sha(sha: &str) -> &str {
     }
 }
 
+fn build_in_progress_comment(
+    owner_login: &str,
+    pr_author: &str,
+    pr_title: &str,
+    sha: &str,
+) -> String {
+    let clean_owner = owner_login.trim().trim_start_matches('@');
+    let owner_label = if clean_owner.is_empty() {
+        "the connected GitHub account".to_string()
+    } else {
+        format!("@{clean_owner}")
+    };
+
+    let clean_author = pr_author.trim().trim_start_matches('@');
+    let greeting = if clean_author.is_empty() {
+        "Hi there".to_string()
+    } else {
+        format!("Hi @{clean_author}")
+    };
+
+    let clean_title = pr_title.trim();
+    let title_context = if clean_title.is_empty() {
+        "this PR".to_string()
+    } else {
+        format!("\"{clean_title}\"")
+    };
+
+    format!(
+        "👋 {} - I'm {}'s PR-reviewing agent powered by [pr-reviewer]({}). I'm taking a look at {} in {} (commit `{}`) now and I'll follow up shortly with feedback.",
+        greeting,
+        owner_label,
+        env!("CARGO_PKG_REPOSITORY"),
+        infer_pr_focus(pr_title),
+        title_context,
+        short_sha(sha),
+    )
+}
+
+fn infer_pr_focus(pr_title: &str) -> &'static str {
+    let lower = pr_title.to_ascii_lowercase();
+
+    let is_fix = ["fix", "bug", "hotfix", "regression", "issue", "patch"]
+        .iter()
+        .any(|keyword| lower.contains(keyword));
+    if is_fix {
+        return "the fixes";
+    }
+
+    let is_feature = [
+        "feat",
+        "feature",
+        "implement",
+        "introduce",
+        "add",
+        "support",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword));
+    if is_feature {
+        return "the feature work";
+    }
+
+    let is_docs = ["docs", "doc", "readme", "guide", "comment"]
+        .iter()
+        .any(|keyword| lower.contains(keyword));
+    if is_docs {
+        return "the documentation updates";
+    }
+
+    let is_refactor = ["refactor", "cleanup", "chore", "rename", "simplify"]
+        .iter()
+        .any(|keyword| lower.contains(keyword));
+    if is_refactor {
+        return "the refactor and cleanup work";
+    }
+
+    "the changes"
+}
+
 fn confidence_verdict_label(
     verdict: ReviewVerdict,
     confidence: Option<&ConfidenceRatings>,
@@ -977,4 +1063,45 @@ fn extract_confidence_from_text(text: &str) -> Option<ConfidenceRatings> {
     let after = after.strip_prefix('\n').unwrap_or(after);
     let end = after.find("```")?;
     serde_json::from_str::<ConfidenceRatings>(after[..end].trim()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_in_progress_comment, infer_pr_focus};
+
+    #[test]
+    fn in_progress_comment_mentions_owner_and_repo_link() {
+        let message = build_in_progress_comment(
+            "octocat",
+            "contributor",
+            "fix race condition in queue",
+            "527fae59abcde",
+        );
+
+        assert!(message.contains("@octocat's PR-reviewing agent"));
+        assert!(message.contains("Hi @contributor"));
+        assert!(message.contains(&format!(
+            "[pr-reviewer]({})",
+            env!("CARGO_PKG_REPOSITORY")
+        )));
+        assert!(message.contains("commit `527fae59`"));
+    }
+
+    #[test]
+    fn infer_focus_uses_title_keywords() {
+        assert_eq!(infer_pr_focus("fix flaky test"), "the fixes");
+        assert_eq!(
+            infer_pr_focus("feat: add metrics dashboard"),
+            "the feature work"
+        );
+        assert_eq!(
+            infer_pr_focus("docs: update README"),
+            "the documentation updates"
+        );
+        assert_eq!(
+            infer_pr_focus("refactor parser internals"),
+            "the refactor and cleanup work"
+        );
+        assert_eq!(infer_pr_focus("misc updates"), "the changes");
+    }
 }
