@@ -94,3 +94,14 @@ pub struct ContentResponse {
     pub content: String,
     pub encoding: String,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrFile {
+    pub filename: String,
+    pub status: String,
+    pub additions: u32,
+    pub deletions: u32,
+    pub changes: u32,
+    pub patch: Option<String>,
+    pub previous_filename: Option<String>,
+}

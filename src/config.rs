@@ -230,7 +230,7 @@ fn default_model() -> String {
 }
 
 fn default_timeout_secs() -> u64 {
-    600
+    1800
 }
 
 fn default_poll_interval() -> u64 {
