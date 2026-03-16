@@ -901,7 +901,7 @@ fn build_in_progress_comment(
 }
 
 fn sanitize_in_progress_title(title: &str) -> String {
-    title.replace('"', "'")
+    title.replace('"', "'").replace('`', "'")
 }
 
 fn pr_reviewer_project_url() -> &'static str {
@@ -918,44 +918,106 @@ fn resolve_project_url(configured: &'static str) -> &'static str {
 }
 
 fn infer_pr_focus(pr_title: &str) -> &'static str {
-    let lower = pr_title.to_ascii_lowercase();
+    let tokens = title_tokens(pr_title);
 
-    let is_fix = ["fix", "bug", "hotfix", "regression", "issue", "patch"]
-        .iter()
-        .any(|keyword| lower.contains(keyword));
+    let is_fix = has_focus_keyword(
+        &tokens,
+        &[
+            "fix",
+            "fixes",
+            "fixed",
+            "fixing",
+            "bug",
+            "bugs",
+            "hotfix",
+            "regression",
+            "issue",
+            "issues",
+            "patch",
+            "patches",
+        ],
+    );
     if is_fix {
         return "the fixes";
     }
 
-    let is_feature = [
-        "feat",
-        "feature",
-        "implement",
-        "introduce",
-        "add",
-        "support",
-    ]
-    .iter()
-    .any(|keyword| lower.contains(keyword));
+    let is_feature = has_focus_keyword(
+        &tokens,
+        &[
+            "feat",
+            "feature",
+            "features",
+            "implement",
+            "implements",
+            "implemented",
+            "introduce",
+            "introduces",
+            "introduced",
+            "add",
+            "adds",
+            "added",
+            "support",
+            "supports",
+            "supported",
+        ],
+    );
     if is_feature {
         return "the feature work";
     }
 
-    let is_docs = ["docs", "doc", "readme", "guide", "comment"]
-        .iter()
-        .any(|keyword| lower.contains(keyword));
+    let is_docs = has_focus_keyword(
+        &tokens,
+        &[
+            "docs",
+            "doc",
+            "readme",
+            "guide",
+            "guides",
+            "comment",
+            "comments",
+            "documentation",
+        ],
+    );
     if is_docs {
         return "the documentation updates";
     }
 
-    let is_refactor = ["refactor", "cleanup", "chore", "rename", "simplify"]
-        .iter()
-        .any(|keyword| lower.contains(keyword));
+    let is_refactor = has_focus_keyword(
+        &tokens,
+        &[
+            "refactor",
+            "refactors",
+            "cleanup",
+            "cleanups",
+            "chore",
+            "chores",
+            "rename",
+            "renames",
+            "simplify",
+            "simplifies",
+            "simplified",
+        ],
+    );
     if is_refactor {
         return "the refactor and cleanup work";
     }
 
     "the changes"
+}
+
+fn title_tokens(pr_title: &str) -> Vec<String> {
+    pr_title
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn has_focus_keyword(tokens: &[String], keywords: &[&str]) -> bool {
+    tokens
+        .iter()
+        .any(|token| keywords.iter().any(|keyword| token == keyword))
 }
 
 fn confidence_verdict_label(
@@ -1113,6 +1175,13 @@ mod tests {
     }
 
     #[test]
+    fn in_progress_comment_sanitizes_backticks_in_title() {
+        let message =
+            build_in_progress_comment("octocat", "contributor", "fix `foo` crash", "527fae59");
+        assert!(message.contains("\"fix 'foo' crash\""));
+    }
+
+    #[test]
     fn project_url_uses_fallback_when_empty() {
         assert_eq!(
             resolve_project_url(""),
@@ -1136,5 +1205,11 @@ mod tests {
             "the refactor and cleanup work"
         );
         assert_eq!(infer_pr_focus("misc updates"), "the changes");
+    }
+
+    #[test]
+    fn infer_focus_avoids_substring_false_positives() {
+        assert_eq!(infer_pr_focus("address logging"), "the changes");
+        assert_eq!(infer_pr_focus("dismissal policy"), "the changes");
     }
 }
