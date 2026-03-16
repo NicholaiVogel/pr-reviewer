@@ -119,6 +119,12 @@ Cached `authenticated_user` at engine init. Falls back to live API call if cache
 - Managed repos: `~/.config/pr-reviewer/repos/{owner}/{name}/`
 - Tables: `pr_state`, `review_log`, `daemon_status`, `repo_etags`, `schema_version`
 
+## User-facing documentation (`docs/`)
+
+- [docs/troubleshooting.md](docs/troubleshooting.md) — token errors, rate limits, harness failures, daemon issues, GitNexus problems
+- [docs/deployment.md](docs/deployment.md) — systemd unit file, passphrase env var handling, log management, backup/restore, upgrades
+- [docs/configuration.md](docs/configuration.md) — full config reference with explanations, fork policy, confidence scoring, multi-step workflows
+
 ## Testing
 
 ```bash

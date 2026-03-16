@@ -159,6 +159,12 @@ custom_instructions = "This project uses a custom ORM. Watch for SQL injection."
 gitnexus = true
 ```
 
+## Documentation
+
+- [Troubleshooting](docs/troubleshooting.md) — diagnosing common errors
+- [Deployment](docs/deployment.md) — systemd, log management, production setup
+- [Configuration reference](docs/configuration.md) — all config options explained
+
 ## CLI reference
 
 ```
