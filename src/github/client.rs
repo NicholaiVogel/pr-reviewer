@@ -6,7 +6,7 @@ use reqwest::header::{HeaderMap, ACCEPT, ETAG, IF_NONE_MATCH, USER_AGENT};
 use reqwest::{Client, Method};
 
 use crate::github::types::{
-    ContentResponse, CreateIssueCommentRequest, CreateReplyRequest, CreateReviewRequest,
+    ContentResponse, CreateIssueCommentRequest, CreateReplyRequest, CreateReviewRequest, PrFile,
     PullRequest, PullRequestReview, ReviewComment,
 };
 
@@ -135,6 +135,17 @@ impl GitHubClient {
             .context("GitHub get diff failed")?;
         self.update_rate_state(resp.headers());
 
+        if resp.status().as_u16() == 406 {
+            tracing::warn!(
+                owner = owner,
+                repo = repo,
+                number = number,
+                "diff endpoint returned 406 (too large), falling back to files endpoint"
+            );
+            let files = self.get_pr_files(owner, repo, number).await?;
+            return Ok(synthesize_diff_from_files(&files));
+        }
+
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -142,6 +153,54 @@ impl GitHubClient {
         }
 
         Ok(resp.text().await.context("failed to read diff response")?)
+    }
+
+    pub async fn get_pr_files(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<PrFile>> {
+        let mut all_files = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let path = format!(
+                "/repos/{owner}/{repo}/pulls/{number}/files?per_page=100&page={page}"
+            );
+            let resp = self
+                .request(Method::GET, &path)
+                .send()
+                .await
+                .context("GitHub get PR files failed")?;
+            self.update_rate_state(resp.headers());
+
+            let has_next = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("rel=\"next\""));
+
+            let batch: Vec<PrFile> = handle_json(resp).await?;
+            let batch_empty = batch.is_empty();
+            all_files.extend(batch);
+
+            if !has_next || batch_empty || page >= 10 {
+                break;
+            }
+            page += 1;
+        }
+
+        if page >= 10 {
+            tracing::warn!(
+                owner = owner,
+                repo = repo,
+                number = number,
+                file_count = all_files.len(),
+                "PR files pagination hit 10-page cap; review may have partial coverage"
+            );
+        }
+
+        Ok(all_files)
     }
 
     pub async fn get_compare_diff(
@@ -418,6 +477,48 @@ impl GitHubClient {
     }
 }
 
+pub fn synthesize_diff_from_files(files: &[PrFile]) -> String {
+    let mut out = String::new();
+    for file in files {
+        let old_path = match &file.previous_filename {
+            Some(prev) => prev.as_str(),
+            None => file.filename.as_str(),
+        };
+        let new_path = file.filename.as_str();
+
+        out.push_str(&format!("diff --git a/{old_path} b/{new_path}\n"));
+
+        match file.status.as_str() {
+            "added" => {
+                out.push_str("--- /dev/null\n");
+                out.push_str(&format!("+++ b/{new_path}\n"));
+            }
+            "removed" => {
+                out.push_str(&format!("--- a/{old_path}\n"));
+                out.push_str("+++ /dev/null\n");
+            }
+            _ => {
+                out.push_str(&format!("--- a/{old_path}\n"));
+                out.push_str(&format!("+++ b/{new_path}\n"));
+            }
+        }
+
+        match &file.patch {
+            Some(patch) => {
+                out.push_str(patch);
+                if !patch.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            None => {
+                // Binary or too-large file — emit an empty hunk so the file
+                // still appears in ParsedDiff.files for content fetching.
+            }
+        }
+    }
+    out
+}
+
 async fn handle_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
     if !resp.status().is_success() {
         let status = resp.status();
@@ -428,4 +529,109 @@ async fn handle_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response) ->
         .json::<T>()
         .await
         .context("failed decoding GitHub JSON payload")?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::diff_parser::{parse_unified_diff, DiffSide};
+
+    fn make_file(
+        filename: &str,
+        status: &str,
+        patch: Option<&str>,
+        previous_filename: Option<&str>,
+    ) -> PrFile {
+        PrFile {
+            filename: filename.to_string(),
+            status: status.to_string(),
+            additions: 0,
+            deletions: 0,
+            changes: 0,
+            patch: patch.map(|s| s.to_string()),
+            previous_filename: previous_filename.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn synthesize_mixed_statuses_parses_correctly() {
+        let files = vec![
+            make_file(
+                "src/new.rs",
+                "added",
+                Some("@@ -0,0 +1,3 @@\n+line1\n+line2\n+line3\n"),
+                None,
+            ),
+            make_file(
+                "src/lib.rs",
+                "modified",
+                Some("@@ -1,3 +1,4 @@\n line1\n-line2\n+line2 changed\n line3\n+line4\n"),
+                None,
+            ),
+            make_file(
+                "src/old.rs",
+                "removed",
+                Some("@@ -1,2 +0,0 @@\n-goodbye\n-world\n"),
+                None,
+            ),
+        ];
+
+        let diff = synthesize_diff_from_files(&files);
+        let parsed = parse_unified_diff(&diff).expect("parse synthesized diff");
+
+        assert_eq!(parsed.files.len(), 3);
+        assert_eq!(parsed.files[0].new_path, "src/new.rs");
+        assert_eq!(parsed.files[0].old_path, "/dev/null");
+        assert_eq!(parsed.files[1].new_path, "src/lib.rs");
+        assert_eq!(parsed.files[2].old_path, "src/old.rs");
+        assert_eq!(parsed.files[2].new_path, "/dev/null");
+
+        // Verify position mapping works for the modified file
+        let pos = parsed
+            .position_for("src/lib.rs", 2, DiffSide::Right)
+            .expect("modified line should have position");
+        assert!(pos.diff_position >= 1);
+    }
+
+    #[test]
+    fn synthesize_rename_maps_paths() {
+        let files = vec![make_file(
+            "src/renamed.rs",
+            "renamed",
+            Some("@@ -1,2 +1,2 @@\n-old content\n+new content\n"),
+            Some("src/original.rs"),
+        )];
+
+        let diff = synthesize_diff_from_files(&files);
+        let parsed = parse_unified_diff(&diff).expect("parse renamed file diff");
+
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].old_path, "src/original.rs");
+        assert_eq!(parsed.files[0].new_path, "src/renamed.rs");
+    }
+
+    #[test]
+    fn synthesize_missing_patch_does_not_panic() {
+        let files = vec![
+            make_file("binary.png", "modified", None, None),
+            make_file(
+                "src/ok.rs",
+                "modified",
+                Some("@@ -1 +1 @@\n-old\n+new\n"),
+                None,
+            ),
+        ];
+
+        let diff = synthesize_diff_from_files(&files);
+        let parsed = parse_unified_diff(&diff).expect("parse diff with missing patch");
+
+        // The binary file may or may not produce a FileDiff entry (no hunks),
+        // but the valid file must parse correctly.
+        let ok_file = parsed
+            .files
+            .iter()
+            .find(|f| f.new_path == "src/ok.rs")
+            .expect("src/ok.rs should be in parsed files");
+        assert_eq!(ok_file.hunks.len(), 1);
+    }
 }
