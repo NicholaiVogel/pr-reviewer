@@ -886,7 +886,7 @@ fn build_in_progress_comment(
     let title_context = if clean_title.is_empty() {
         "this PR".to_string()
     } else {
-        format!("\"{}\"", sanitize_in_progress_title(clean_title))
+        format!("`{}`", sanitize_in_progress_title(clean_title))
     };
 
     format!(
@@ -1171,14 +1171,25 @@ mod tests {
     #[test]
     fn in_progress_comment_sanitizes_double_quotes_in_title() {
         let message = build_in_progress_comment("octocat", "contributor", "fix \"the\" bug", "527fae59");
-        assert!(message.contains("\"fix 'the' bug\""));
+        assert!(message.contains("`fix 'the' bug`"));
     }
 
     #[test]
     fn in_progress_comment_sanitizes_backticks_in_title() {
         let message =
             build_in_progress_comment("octocat", "contributor", "fix `foo` crash", "527fae59");
-        assert!(message.contains("\"fix 'foo' crash\""));
+        assert!(message.contains("`fix 'foo' crash`"));
+    }
+
+    #[test]
+    fn in_progress_comment_neutralizes_markdown_links_in_title() {
+        let message = build_in_progress_comment(
+            "octocat",
+            "contributor",
+            "docs [click](https://example.com)",
+            "527fae59",
+        );
+        assert!(message.contains("`docs [click](https://example.com)`"));
     }
 
     #[test]
