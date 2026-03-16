@@ -137,6 +137,10 @@ If writing to a file, set up logrotate:
     missingok
     notifempty
     postrotate
+        # pr-reviewer has no SIGHUP handler for log-file reopen, so a full
+        # restart is required. This causes a brief service interruption (~1s)
+        # on each rotation. --no-block returns immediately; systemd handles
+        # the restart asynchronously.
         systemctl restart pr-reviewer --no-block || true
     endscript
 }
