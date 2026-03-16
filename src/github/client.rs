@@ -184,20 +184,20 @@ impl GitHubClient {
             let batch_empty = batch.is_empty();
             all_files.extend(batch);
 
+            let truncated = has_next && !batch_empty && page >= 10;
+            if truncated {
+                tracing::warn!(
+                    owner = owner,
+                    repo = repo,
+                    number = number,
+                    file_count = all_files.len(),
+                    "PR files pagination hit 10-page cap; review may have partial coverage"
+                );
+            }
             if !has_next || batch_empty || page >= 10 {
                 break;
             }
             page += 1;
-        }
-
-        if page >= 10 {
-            tracing::warn!(
-                owner = owner,
-                repo = repo,
-                number = number,
-                file_count = all_files.len(),
-                "PR files pagination hit 10-page cap; review may have partial coverage"
-            );
         }
 
         Ok(all_files)
