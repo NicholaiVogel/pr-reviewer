@@ -886,18 +886,35 @@ fn build_in_progress_comment(
     let title_context = if clean_title.is_empty() {
         "this PR".to_string()
     } else {
-        format!("\"{clean_title}\"")
+        format!("\"{}\"", sanitize_in_progress_title(clean_title))
     };
 
     format!(
         "👋 {} - I'm {}'s PR-reviewing agent powered by [pr-reviewer]({}). I'm taking a look at {} in {} (commit `{}`) now and I'll follow up shortly with feedback.",
         greeting,
         owner_label,
-        env!("CARGO_PKG_REPOSITORY"),
+        pr_reviewer_project_url(),
         infer_pr_focus(pr_title),
         title_context,
         short_sha(sha),
     )
+}
+
+fn sanitize_in_progress_title(title: &str) -> String {
+    title.replace('"', "'")
+}
+
+fn pr_reviewer_project_url() -> &'static str {
+    resolve_project_url(env!("CARGO_PKG_REPOSITORY"))
+}
+
+fn resolve_project_url(configured: &'static str) -> &'static str {
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        "https://github.com/NicholaiVogel/pr-reviewer"
+    } else {
+        trimmed
+    }
 }
 
 fn infer_pr_focus(pr_title: &str) -> &'static str {
@@ -1067,7 +1084,9 @@ fn extract_confidence_from_text(text: &str) -> Option<ConfidenceRatings> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_in_progress_comment, infer_pr_focus};
+    use super::{
+        build_in_progress_comment, infer_pr_focus, pr_reviewer_project_url, resolve_project_url,
+    };
 
     #[test]
     fn in_progress_comment_mentions_owner_and_repo_link() {
@@ -1082,9 +1101,23 @@ mod tests {
         assert!(message.contains("Hi @contributor"));
         assert!(message.contains(&format!(
             "[pr-reviewer]({})",
-            env!("CARGO_PKG_REPOSITORY")
+            pr_reviewer_project_url()
         )));
         assert!(message.contains("commit `527fae59`"));
+    }
+
+    #[test]
+    fn in_progress_comment_sanitizes_double_quotes_in_title() {
+        let message = build_in_progress_comment("octocat", "contributor", "fix \"the\" bug", "527fae59");
+        assert!(message.contains("\"fix 'the' bug\""));
+    }
+
+    #[test]
+    fn project_url_uses_fallback_when_empty() {
+        assert_eq!(
+            resolve_project_url(""),
+            "https://github.com/NicholaiVogel/pr-reviewer"
+        );
     }
 
     #[test]
