@@ -137,7 +137,7 @@ If writing to a file, set up logrotate:
     missingok
     notifempty
     postrotate
-        systemctl kill -s HUP pr-reviewer || true
+        systemctl restart pr-reviewer --no-block || true
     endscript
 }
 ```

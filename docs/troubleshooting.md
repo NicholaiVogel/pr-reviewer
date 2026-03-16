@@ -225,8 +225,19 @@ Stale claims older than `harness.timeout_secs + 30s` are automatically swept on 
 
 ```bash
 # Not yet a CLI command — clear via sqlite3 directly
+
+# Check how many stale claims exist first
+sqlite3 ~/.config/pr-reviewer/state.db \
+  "SELECT COUNT(*) FROM pr_state WHERE status = 'in_progress';"
+
+# Clear them
 sqlite3 ~/.config/pr-reviewer/state.db \
   "UPDATE pr_state SET status = 'pending' WHERE status = 'in_progress';"
+
+# Verify the update took effect (should return 0)
+sqlite3 ~/.config/pr-reviewer/state.db \
+  "SELECT COUNT(*) FROM pr_state WHERE status = 'in_progress';"
+
 pr-reviewer start
 ```
 

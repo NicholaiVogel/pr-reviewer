@@ -215,19 +215,19 @@ The review output includes 13 confidence dimensions, each rated 1–10 by the mo
 
 | Dimension | Description |
 |-----------|-------------|
-| `correctness` | Logic and algorithmic correctness |
+| `style_maintainability` | Readability and future maintainability |
+| `repo_convention_adherence` | Follows established project patterns |
+| `merge_conflict_detection` | Risk of conflicts with concurrent changes |
 | `security_vulnerability_detection` | Known vulnerability patterns |
 | `injection_risk_detection` | SQL, command, and template injection |
 | `attack_surface_risk_assessment` | New attack vectors introduced |
 | `future_hardening_guidance` | Opportunities for future hardening |
-| `test_coverage_assessment` | Adequacy of test changes |
-| `performance_impact` | CPU, memory, I/O implications |
-| `api_contract_stability` | Breaking changes to public interfaces |
-| `dependency_risk` | Third-party dependency changes |
-| `documentation_accuracy` | Docs match implementation |
-| `error_handling_quality` | Error cases handled properly |
-| `code_maintainability` | Readability and future maintainability |
-| `integration_risk` | Risk of breaking downstream integrations |
+| `scope_alignment` | Changes match stated PR intent |
+| `duplication_awareness` | Reuse of existing utilities vs reinvention |
+| `tooling_pattern_leverage` | Correct use of established tooling |
+| `functional_completeness` | All cases handled, no obvious gaps |
+| `pattern_correctness` | Correct application of design patterns |
+| `documentation_coverage` | Docs match implementation |
 
 These are averaged to a global confidence score. **If the average falls below 5, an `APPROVE` verdict is automatically downgraded to `COMMENT`.** The review still posts with its full analysis — the downgrade only affects the verdict type.
 
