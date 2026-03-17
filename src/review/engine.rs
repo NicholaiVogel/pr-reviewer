@@ -1114,11 +1114,10 @@ fn extract_in_progress_comment(stdout: &str, stderr: &str) -> Option<String> {
         }
     }
 
-    if looks_like_harness_error_output(trimmed) {
-        return None;
-    }
-
-    Some(trimmed.to_string())
+    // Do not post arbitrary raw harness output to GitHub comments.
+    // If we cannot parse structured text, fall back to deterministic templates.
+    let _ = looks_like_harness_error_output(trimmed);
+    None
 }
 
 fn preferred_harness_output(stdout: &str, stderr: &str) -> String {
@@ -1610,6 +1609,11 @@ mod tests {
         let output = "```pr-review-in-progress-json\n{\"comment\":\"Hi @you - quick pass on commit `abc12345`.\"}\n```";
         let parsed = extract_in_progress_comment(output, "").expect("parsed comment");
         assert_eq!(parsed, "Hi @you - quick pass on commit `abc12345`.");
+    }
+
+    #[test]
+    fn rejects_unstructured_raw_in_progress_comment_output() {
+        assert!(extract_in_progress_comment("just some raw text", "").is_none());
     }
 
     #[test]
