@@ -38,6 +38,9 @@ pub struct ReviewLogEntry {
     pub comments_posted: Option<i64>,
     pub verdict: Option<String>,
     pub duration_secs: Option<f64>,
+    pub gitnexus_used: Option<bool>,
+    pub gitnexus_latency_ms: Option<i64>,
+    pub gitnexus_hit_count: Option<i64>,
     pub error_message: Option<String>,
     pub created_at: String,
     pub completed_at: Option<String>,
@@ -61,6 +64,9 @@ pub struct UsageStats {
     pub by_repo: Vec<(String, i64)>,
     pub by_model: Vec<(String, i64, f64)>,
     pub verdicts: Vec<(String, i64)>,
+    pub gitnexus_used_reviews: i64,
+    pub gitnexus_avg_latency_ms: f64,
+    pub gitnexus_avg_hit_count: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,6 +129,9 @@ impl Database {
                     comments_posted INTEGER,
                     verdict TEXT,
                     duration_secs REAL,
+                    gitnexus_used INTEGER,
+                    gitnexus_latency_ms INTEGER,
+                    gitnexus_hit_count INTEGER,
                     files_reviewed INTEGER,
                     diff_lines INTEGER,
                     error_message TEXT,
@@ -146,6 +155,10 @@ impl Database {
             if count == 0 {
                 conn.execute("INSERT INTO schema_version(version) VALUES (1)", [])?;
             }
+
+            ensure_column_exists(&conn, "review_log", "gitnexus_used", "INTEGER")?;
+            ensure_column_exists(&conn, "review_log", "gitnexus_latency_ms", "INTEGER")?;
+            ensure_column_exists(&conn, "review_log", "gitnexus_hit_count", "INTEGER")?;
 
             Ok::<(), anyhow::Error>(())
         })
@@ -186,16 +199,30 @@ impl Database {
         duration_secs: f64,
         files_reviewed: i64,
         diff_lines: i64,
+        gitnexus_used: Option<bool>,
+        gitnexus_latency_ms: Option<i64>,
+        gitnexus_hit_count: Option<i64>,
     ) -> Result<()> {
         let path = self.path.clone();
         let dedupe_key = dedupe_key.to_string();
         let verdict = verdict.map(ToString::to_string);
+        let gitnexus_used = gitnexus_used.map(|v| if v { 1_i64 } else { 0_i64 });
 
         tokio::task::spawn_blocking(move || {
             let conn = open_conn(&path)?;
             conn.execute(
-                "UPDATE review_log SET status='completed', comments_posted=?2, verdict=?3, duration_secs=?4, files_reviewed=?5, diff_lines=?6, completed_at=datetime('now') WHERE dedupe_key=?1",
-                params![dedupe_key, comments_posted, verdict, duration_secs, files_reviewed, diff_lines],
+                "UPDATE review_log SET status='completed', comments_posted=?2, verdict=?3, duration_secs=?4, files_reviewed=?5, diff_lines=?6, gitnexus_used=?7, gitnexus_latency_ms=?8, gitnexus_hit_count=?9, completed_at=datetime('now') WHERE dedupe_key=?1",
+                params![
+                    dedupe_key,
+                    comments_posted,
+                    verdict,
+                    duration_secs,
+                    files_reviewed,
+                    diff_lines,
+                    gitnexus_used,
+                    gitnexus_latency_ms,
+                    gitnexus_hit_count
+                ],
             )?;
             Ok::<(), anyhow::Error>(())
         })
@@ -369,7 +396,7 @@ impl Database {
             let conn = open_conn(&path)?;
 
             let mut sql = String::from(
-                "SELECT id, repo, pr_number, sha, harness, model, status, comments_posted, verdict, duration_secs, error_message, created_at, completed_at FROM review_log WHERE 1=1",
+                "SELECT id, repo, pr_number, sha, harness, model, status, comments_posted, verdict, duration_secs, gitnexus_used, gitnexus_latency_ms, gitnexus_hit_count, error_message, created_at, completed_at FROM review_log WHERE 1=1",
             );
             let mut args: Vec<String> = Vec::new();
 
@@ -408,9 +435,12 @@ impl Database {
                     comments_posted: row.get(7)?,
                     verdict: row.get(8)?,
                     duration_secs: row.get(9)?,
-                    error_message: row.get(10)?,
-                    created_at: row.get(11)?,
-                    completed_at: row.get(12)?,
+                    gitnexus_used: row.get(10)?,
+                    gitnexus_latency_ms: row.get(11)?,
+                    gitnexus_hit_count: row.get(12)?,
+                    error_message: row.get(13)?,
+                    created_at: row.get(14)?,
+                    completed_at: row.get(15)?,
                 })
             })?;
 
@@ -436,7 +466,7 @@ impl Database {
             let mut args = values.clone();
 
             let mut stmt = conn.prepare(&format!(
-                "SELECT COUNT(*), SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END), SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), AVG(duration_secs) FROM review_log {where_clause}"
+                "SELECT COUNT(*), SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END), SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), AVG(duration_secs), SUM(CASE WHEN gitnexus_used = 1 THEN 1 ELSE 0 END), AVG(CASE WHEN gitnexus_used = 1 THEN gitnexus_latency_ms END), AVG(CASE WHEN gitnexus_used = 1 THEN gitnexus_hit_count END) FROM review_log {where_clause}"
             ))?;
             let row = stmt.query_row(rusqlite::params_from_iter(args.iter()), |r| {
                 Ok((
@@ -444,12 +474,18 @@ impl Database {
                     r.get::<_, Option<i64>>(1)?.unwrap_or(0),
                     r.get::<_, Option<i64>>(2)?.unwrap_or(0),
                     r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                    r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                    r.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
                 ))
             })?;
             stats.total = row.0;
             stats.completed = row.1;
             stats.failed = row.2;
             stats.avg_duration_secs = row.3;
+            stats.gitnexus_used_reviews = row.4;
+            stats.gitnexus_avg_latency_ms = row.5;
+            stats.gitnexus_avg_hit_count = row.6;
 
             let mut by_repo = conn.prepare(&format!(
                 "SELECT repo, COUNT(*) FROM review_log {where_clause} GROUP BY repo ORDER BY COUNT(*) DESC"
@@ -557,6 +593,27 @@ fn build_where_clause(since: Option<&str>, repo: Option<&str>) -> (String, Vec<S
     }
 }
 
+fn ensure_column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(());
+        }
+    }
+
+    let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}");
+    conn.execute(&alter, [])?;
+    Ok(())
+}
+
 fn open_conn(path: &PathBuf) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open sqlite db {}", path.display()))?;
@@ -603,6 +660,20 @@ pub fn format_stats(stats: &UsageStats) -> String {
         out.push_str(&format!("  {verdict:<18} {count}\n"));
     }
 
+    out.push_str("\nGitNexus:\n");
+    out.push_str(&format!(
+        "  used in reviews: {}\n",
+        stats.gitnexus_used_reviews
+    ));
+    out.push_str(&format!(
+        "  avg latency:     {:.1} ms\n",
+        stats.gitnexus_avg_latency_ms
+    ));
+    out.push_str(&format!(
+        "  avg hit count:   {:.1}\n",
+        stats.gitnexus_avg_hit_count
+    ));
+
     out
 }
 
@@ -640,5 +711,55 @@ mod tests {
 
         assert!(db.claim_review(claim.clone()).await.expect("first claim"));
         assert!(!db.claim_review(claim).await.expect("second claim"));
+    }
+
+    #[tokio::test]
+    async fn migrate_adds_gitnexus_columns_for_existing_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+
+        {
+            let conn = Connection::open(&path).expect("open sqlite");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE schema_version (version INTEGER NOT NULL);
+                INSERT INTO schema_version(version) VALUES (1);
+
+                CREATE TABLE review_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dedupe_key TEXT UNIQUE NOT NULL,
+                    repo TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    sha TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    model TEXT,
+                    status TEXT NOT NULL DEFAULT 'claimed',
+                    comments_posted INTEGER,
+                    verdict TEXT,
+                    duration_secs REAL,
+                    files_reviewed INTEGER,
+                    diff_lines INTEGER,
+                    error_message TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    completed_at TEXT
+                );
+                "#,
+            )
+            .expect("seed old schema");
+        }
+
+        let db = Database::new(path.clone()).await.expect("migrate");
+        let conn = open_conn(db.path()).expect("open migrated db");
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(review_log)")
+            .expect("prepare pragma");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("query table_info");
+        let columns: Vec<String> = rows.map(|r| r.expect("col")).collect();
+
+        assert!(columns.contains(&"gitnexus_used".to_string()));
+        assert!(columns.contains(&"gitnexus_latency_ms".to_string()));
+        assert!(columns.contains(&"gitnexus_hit_count".to_string()));
     }
 }

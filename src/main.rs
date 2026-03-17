@@ -107,8 +107,13 @@ struct AddArgs {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
-    Set { key: String, value: String },
-    Get { key: String },
+    Set {
+        key: String,
+        value: String,
+    },
+    Get {
+        key: String,
+    },
     List,
     /// Encrypt and store a GitHub token
     SetToken {
@@ -218,10 +223,7 @@ async fn main() -> Result<()> {
         }
         Commands::Remove { repo, purge } => {
             let mut cfg = AppConfig::load_or_default()?;
-            let was_managed = cfg
-                .get_repo(&repo)
-                .map(|r| r.is_managed())
-                .unwrap_or(false);
+            let was_managed = cfg.get_repo(&repo).map(|r| r.is_managed()).unwrap_or(false);
             if cfg.remove_repo(&repo) {
                 cfg.save()?;
                 println!("removed {repo}");
@@ -380,7 +382,7 @@ async fn main() -> Result<()> {
             } else {
                 for row in logs {
                     println!(
-                        "#{} {} pr#{} sha={} {} {} comments={:?} verdict={:?} duration={:?} error={:?}",
+                        "#{} {} pr#{} sha={} {} {} comments={:?} verdict={:?} duration={:?} gitnexus_used={:?} gitnexus_latency_ms={:?} gitnexus_hits={:?} error={:?}",
                         row.id,
                         row.created_at,
                         row.pr_number,
@@ -390,6 +392,9 @@ async fn main() -> Result<()> {
                         row.comments_posted,
                         row.verdict,
                         row.duration_secs,
+                        row.gitnexus_used,
+                        row.gitnexus_latency_ms,
+                        row.gitnexus_hit_count,
                         row.error_message,
                     );
                 }
@@ -405,7 +410,9 @@ async fn main() -> Result<()> {
             eprintln!("To enable it, run: pr-reviewer config set serve.enabled true");
             let cfg = AppConfig::load_or_default()?;
             if !cfg.serve_enabled() {
-                return Err(anyhow!("serve is disabled; enable with: pr-reviewer config set serve.enabled true"));
+                return Err(anyhow!(
+                    "serve is disabled; enable with: pr-reviewer config set serve.enabled true"
+                ));
             }
             serve::start(cfg, port).await?;
         }
@@ -488,8 +495,7 @@ async fn main() -> Result<()> {
                             None
                         };
 
-                        let encrypted =
-                            token::crypto::encrypt_token(&raw_token, pp.as_deref())?;
+                        let encrypted = token::crypto::encrypt_token(&raw_token, pp.as_deref())?;
 
                         cfg.github.encrypted_token = Some(encrypted);
                         cfg.github.passphrase_protected = pp.is_some();
@@ -517,17 +523,15 @@ async fn main() -> Result<()> {
                     }
                     println!("done");
                 }
-                ConfigCommand::TokenStatus => {
-                    match token::token_status(&cfg).await {
-                        Some((source, preview)) => {
-                            println!("source: {source}");
-                            println!("preview: {preview}");
-                        }
-                        None => {
-                            println!("no GitHub token configured");
-                        }
+                ConfigCommand::TokenStatus => match token::token_status(&cfg).await {
+                    Some((source, preview)) => {
+                        println!("source: {source}");
+                        println!("preview: {preview}");
                     }
-                }
+                    None => {
+                        println!("no GitHub token configured");
+                    }
+                },
             }
         }
     }
