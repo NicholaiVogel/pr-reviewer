@@ -173,7 +173,12 @@ gitnexus = true
 | `trusted_authors` | Authors whose fork PRs get full context regardless of `fork_policy` |
 | `ignore_paths` | Glob patterns for files to exclude from context |
 | `custom_instructions` | Free-text hints appended to the review prompt |
-| `gitnexus` | Whether to include GitNexus impact analysis in context. Default: `true` if installed |
+| `gitnexus` | Whether to include GitNexus impact analysis in context. Default: `true` (best-effort; gracefully skipped if unavailable) |
+
+When enabled, pr-reviewer enriches context with:
+- ranked GitNexus processes related to changed files
+- top changed symbols with caller/callee context
+- best-effort upstream impact snapshots (short timeout, non-blocking fallback)
 
 ### Auto-managed clones vs local_path
 

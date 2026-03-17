@@ -182,16 +182,13 @@ impl ReviewEngine {
             });
 
             if !already_posted {
-
-                let has_prior_bot_review = existing_reviews
-                    .iter()
-                    .any(|r| {
-                        login_matches_bot(
-                            &r.user.login,
-                            self.config.defaults.bot_name.as_str(),
-                            Some(reviewer_owner.as_str()),
-                        )
-                    });
+                let has_prior_bot_review = existing_reviews.iter().any(|r| {
+                    login_matches_bot(
+                        &r.user.login,
+                        self.config.defaults.bot_name.as_str(),
+                        Some(reviewer_owner.as_str()),
+                    )
+                });
 
                 let in_progress = self
                     .compose_in_progress_comment(
@@ -225,7 +222,14 @@ impl ReviewEngine {
 
         let started = Instant::now();
         let outcome = self
-            .run_review_pipeline(repo_cfg, pr_data, options, harness_kind, &model, existing_reviews)
+            .run_review_pipeline(
+                repo_cfg,
+                pr_data,
+                options,
+                harness_kind,
+                &model,
+                existing_reviews,
+            )
             .await;
 
         match outcome {
@@ -381,16 +385,17 @@ impl ReviewEngine {
             })
             .collect();
 
+        let mut gitnexus_used = if repo_cfg.gitnexus { Some(false) } else { None };
+        let mut gitnexus_latency_ms: Option<i64> = None;
+        let mut gitnexus_hit_count: Option<i64> = None;
+
         let gitnexus_context = if repo_cfg.gitnexus {
             match repo_cfg.effective_local_path() {
                 Ok(local) => {
                     // Fetch latest for managed clones so GitNexus index is fresh
                     if repo_cfg.is_managed() {
-                        if let Err(err) = crate::repo_manager::fetch_latest(
-                            &local,
-                            self.github.token(),
-                        )
-                        .await
+                        if let Err(err) =
+                            crate::repo_manager::fetch_latest(&local, self.github.token()).await
                         {
                             tracing::warn!(
                                 repo = %repo_cfg.full_name(),
@@ -399,9 +404,40 @@ impl ReviewEngine {
                             );
                         }
                     }
-                    match gitnexus::query_context(&local, &changed_files).await {
-                        Ok(Some(value)) => Some(value),
-                        _ => None,
+                    match gitnexus::is_index_stale(&local).await {
+                        Ok(Some(true)) => {
+                            tracing::warn!(
+                                repo = %repo_cfg.full_name(),
+                                "gitnexus index is stale; run `pr-reviewer index {}` to refresh",
+                                repo_cfg.full_name()
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::debug!(
+                                repo = %repo_cfg.full_name(),
+                                error = %err,
+                                "failed to determine gitnexus index freshness"
+                            );
+                        }
+                    }
+
+                    match gitnexus::query_context_with_metrics(
+                        &local,
+                        repo_cfg.name.as_str(),
+                        &changed_files,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            gitnexus_used = Some(result.used);
+                            if result.used {
+                                gitnexus_latency_ms = Some(result.latency_ms);
+                                gitnexus_hit_count = Some(result.hit_count);
+                            }
+                            result.text
+                        }
+                        Err(_) => None,
                     }
                 }
                 Err(_) => None,
@@ -550,6 +586,9 @@ impl ReviewEngine {
                     harness_output.duration_secs,
                     assembled.files_included as i64,
                     assembled.diff_lines as i64,
+                    gitnexus_used,
+                    gitnexus_latency_ms,
+                    gitnexus_hit_count,
                 )
                 .await?;
 
@@ -582,6 +621,9 @@ impl ReviewEngine {
                     harness_output.duration_secs,
                     assembled.files_included as i64,
                     assembled.diff_lines as i64,
+                    gitnexus_used,
+                    gitnexus_latency_ms,
+                    gitnexus_hit_count,
                 )
                 .await?;
 
@@ -687,7 +729,11 @@ impl ReviewEngine {
         // When 422 retry posted comments in the body instead of inline, record 0 inline comments.
         // Also store the actual posted event (which may differ from the LLM verdict after
         // self-review downgrade or 422 retry).
-        let posted_inline = if used_retry { 0 } else { inline_comments.len() as i64 };
+        let posted_inline = if used_retry {
+            0
+        } else {
+            inline_comments.len() as i64
+        };
         let actual_event = if used_retry { "COMMENT" } else { event };
         self.db
             .complete_review(
@@ -697,6 +743,9 @@ impl ReviewEngine {
                 harness_output.duration_secs,
                 assembled.files_included as i64,
                 assembled.diff_lines as i64,
+                gitnexus_used,
+                gitnexus_latency_ms,
+                gitnexus_hit_count,
             )
             .await?;
 
@@ -1337,14 +1386,7 @@ fn infer_pr_focus(pr_title: &str) -> &'static str {
 
     let is_docs = has_focus_keyword(
         &tokens,
-        &[
-            "docs",
-            "doc",
-            "readme",
-            "guide",
-            "guides",
-            "documentation",
-        ],
+        &["docs", "doc", "readme", "guide", "guides", "documentation"],
     );
     if is_docs {
         return "the documentation updates";
@@ -1631,14 +1673,28 @@ mod tests {
 
     #[test]
     fn harness_error_output_is_rejected() {
-        assert!(looks_like_harness_error_output("Error: command returned exit status 1"));
+        assert!(looks_like_harness_error_output(
+            "Error: command returned exit status 1"
+        ));
     }
 
     #[test]
     fn login_match_checks_configured_and_authenticated_names() {
-        assert!(login_matches_bot("pr-reviewer", "pr-reviewer", Some("NicholaiVogel")));
-        assert!(login_matches_bot("NicholaiVogel", "pr-reviewer", Some("NicholaiVogel")));
-        assert!(!login_matches_bot("someone-else", "pr-reviewer", Some("NicholaiVogel")));
+        assert!(login_matches_bot(
+            "pr-reviewer",
+            "pr-reviewer",
+            Some("NicholaiVogel")
+        ));
+        assert!(login_matches_bot(
+            "NicholaiVogel",
+            "pr-reviewer",
+            Some("NicholaiVogel")
+        ));
+        assert!(!login_matches_bot(
+            "someone-else",
+            "pr-reviewer",
+            Some("NicholaiVogel")
+        ));
     }
 
     #[test]
