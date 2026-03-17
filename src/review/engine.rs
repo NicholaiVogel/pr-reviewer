@@ -26,7 +26,7 @@ use crate::safety::{evaluate_fork_policy, ForkDecision};
 use crate::store::db::{dedupe_key, Database, ReviewClaim};
 
 const IN_PROGRESS_COMMENT_TIMEOUT_SECS: u64 = 4;
-const IN_PROGRESS_COMMENT_MAX_CHARS: usize = 280;
+const IN_PROGRESS_COMMENT_MAX_CHARS: usize = 220;
 
 #[derive(Debug, Clone, Default)]
 pub struct ReviewOptions {
@@ -163,26 +163,35 @@ impl ReviewEngine {
         // Check if we already posted a review for this SHA before posting in-progress comment,
         // to avoid orphaned "started reviewing" comments when the already-posted guard fires.
         if !dry_run {
+            let reviewer_owner = match &self.authenticated_user {
+                Some(login) => login.clone(),
+                None => self
+                    .github
+                    .get_authenticated_user()
+                    .await
+                    .unwrap_or_else(|_| self.config.defaults.bot_name.clone()),
+            };
+
             let already_posted = existing_reviews.iter().any(|r| {
                 r.commit_id.as_deref() == Some(pr_data.head.sha.as_str())
-                    && r.user
-                        .login
-                        .eq_ignore_ascii_case(self.config.defaults.bot_name.as_str())
+                    && login_matches_bot(
+                        &r.user.login,
+                        self.config.defaults.bot_name.as_str(),
+                        Some(reviewer_owner.as_str()),
+                    )
             });
 
             if !already_posted {
-                let reviewer_owner = match &self.authenticated_user {
-                    Some(login) => login.clone(),
-                    None => self
-                        .github
-                        .get_authenticated_user()
-                        .await
-                        .unwrap_or_else(|_| self.config.defaults.bot_name.clone()),
-                };
 
                 let has_prior_bot_review = existing_reviews
                     .iter()
-                    .any(|r| r.user.login.eq_ignore_ascii_case(&reviewer_owner));
+                    .any(|r| {
+                        login_matches_bot(
+                            &r.user.login,
+                            self.config.defaults.bot_name.as_str(),
+                            Some(reviewer_owner.as_str()),
+                        )
+                    });
 
                 let in_progress = self
                     .compose_in_progress_comment(
@@ -312,10 +321,11 @@ impl ReviewEngine {
         }
 
         if !has_prior_bot_review && !composed.contains("[pr-reviewer](") {
-            composed.push_str(&format!(
-                " Powered by [pr-reviewer]({}).",
-                pr_reviewer_project_url()
-            ));
+            let suffix = format!(" Powered by [pr-reviewer]({}).", pr_reviewer_project_url());
+            if composed.len() + suffix.len() > IN_PROGRESS_COMMENT_MAX_CHARS {
+                return fallback;
+            }
+            composed.push_str(&suffix);
         }
 
         if composed.len() > IN_PROGRESS_COMMENT_MAX_CHARS {
@@ -554,9 +564,11 @@ impl ReviewEngine {
 
         if existing_reviews.iter().any(|r| {
             r.commit_id.as_deref() == Some(pr_data.head.sha.as_str())
-                && r.user
-                    .login
-                    .eq_ignore_ascii_case(self.config.defaults.bot_name.as_str())
+                && login_matches_bot(
+                    &r.user.login,
+                    self.config.defaults.bot_name.as_str(),
+                    self.authenticated_user.as_deref(),
+                )
         }) {
             self.db
                 .complete_review(
@@ -1100,6 +1112,10 @@ fn extract_in_progress_comment(stdout: &str, stderr: &str) -> Option<String> {
         }
     }
 
+    if looks_like_harness_error_output(trimmed) {
+        return None;
+    }
+
     Some(trimmed.to_string())
 }
 
@@ -1140,6 +1156,26 @@ fn looks_like_reintroduction(comment: &str) -> bool {
         || lower.contains("powered by [pr-reviewer]")
         || lower.contains("powered by pr-reviewer")
         || lower.contains("[pr-reviewer](")
+}
+
+fn looks_like_harness_error_output(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("error:")
+        || lower.contains("failed")
+        || lower.contains("traceback")
+        || lower.contains("panic")
+        || lower.contains("exception")
+        || lower.contains("usage:")
+        || lower.contains("command not found")
+}
+
+fn login_matches_bot(
+    login: &str,
+    configured_bot_name: &str,
+    authenticated_user: Option<&str>,
+) -> bool {
+    login.eq_ignore_ascii_case(configured_bot_name)
+        || authenticated_user.is_some_and(|user| login.eq_ignore_ascii_case(user))
 }
 
 fn extract_marked_json(text: &str, marker_name: &str) -> Option<String> {
@@ -1481,8 +1517,8 @@ fn extract_confidence_from_text(text: &str) -> Option<ConfidenceRatings> {
 mod tests {
     use super::{
         build_in_progress_comment_fallback, extract_in_progress_comment, infer_pr_focus,
-        looks_like_reintroduction, normalize_in_progress_comment, pr_reviewer_project_url,
-        resolve_project_url,
+        login_matches_bot, looks_like_harness_error_output, looks_like_reintroduction,
+        normalize_in_progress_comment, pr_reviewer_project_url, resolve_project_url,
     };
 
     #[test]
@@ -1584,6 +1620,20 @@ mod tests {
         assert!(looks_like_reintroduction(
             "I'm @octocat's PR-reviewing agent powered by [pr-reviewer](https://example.com)."
         ));
+    }
+
+    #[test]
+    fn harness_error_output_is_rejected() {
+        assert!(looks_like_harness_error_output(
+            "Error: command failed with exit status 1"
+        ));
+    }
+
+    #[test]
+    fn login_match_checks_configured_and_authenticated_names() {
+        assert!(login_matches_bot("pr-reviewer", "pr-reviewer", Some("NicholaiVogel")));
+        assert!(login_matches_bot("NicholaiVogel", "pr-reviewer", Some("NicholaiVogel")));
+        assert!(!login_matches_bot("someone-else", "pr-reviewer", Some("NicholaiVogel")));
     }
 
     #[test]
