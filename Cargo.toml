@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Self-hosted PR review daemon that uses local AI CLI tools"
-repository = "https://github.com/nicholai/pr-reviewer"
+repository = "https://github.com/NicholaiVogel/pr-reviewer"
 
 [dependencies]
 aes-gcm = "0.10"
