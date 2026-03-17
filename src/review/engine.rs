@@ -431,6 +431,7 @@ impl ReviewEngine {
         let prior_reviews_context = build_prior_reviews_context(
             &existing_reviews,
             self.config.defaults.bot_name.as_str(),
+            self.authenticated_user.as_deref(),
             pr_data.head.sha.as_str(),
         );
         if !prior_reviews_context.is_empty() {
@@ -848,12 +849,13 @@ fn clean_comment_path(path: &str) -> String {
 fn build_prior_reviews_context(
     reviews: &[PullRequestReview],
     bot_name: &str,
+    bot_alias: Option<&str>,
     current_sha: &str,
 ) -> String {
     let mut relevant: Vec<&PullRequestReview> = reviews
         .iter()
         .filter(|r| {
-            r.user.login.eq_ignore_ascii_case(bot_name)
+            login_matches_bot(&r.user.login, bot_name, bot_alias)
                 && r.commit_id.as_deref() != Some(current_sha)
         })
         .collect();
@@ -1161,10 +1163,10 @@ fn looks_like_reintroduction(comment: &str) -> bool {
 fn looks_like_harness_error_output(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("error:")
-        || lower.contains("failed")
         || lower.contains("traceback")
         || lower.contains("panic")
         || lower.contains("exception")
+        || lower.contains("exit status")
         || lower.contains("usage:")
         || lower.contains("command not found")
 }
@@ -1342,8 +1344,6 @@ fn infer_pr_focus(pr_title: &str) -> &'static str {
             "readme",
             "guide",
             "guides",
-            "comment",
-            "comments",
             "documentation",
         ],
     );
@@ -1515,10 +1515,13 @@ fn extract_confidence_from_text(text: &str) -> Option<ConfidenceRatings> {
 
 #[cfg(test)]
 mod tests {
+    use crate::github::types::{PullRequestReview, User};
+
     use super::{
-        build_in_progress_comment_fallback, extract_in_progress_comment, infer_pr_focus,
-        login_matches_bot, looks_like_harness_error_output, looks_like_reintroduction,
-        normalize_in_progress_comment, pr_reviewer_project_url, resolve_project_url,
+        build_in_progress_comment_fallback, build_prior_reviews_context,
+        extract_in_progress_comment, infer_pr_focus, login_matches_bot,
+        looks_like_harness_error_output, looks_like_reintroduction, normalize_in_progress_comment,
+        pr_reviewer_project_url, resolve_project_url,
     };
 
     #[test]
@@ -1624,9 +1627,7 @@ mod tests {
 
     #[test]
     fn harness_error_output_is_rejected() {
-        assert!(looks_like_harness_error_output(
-            "Error: command failed with exit status 1"
-        ));
+        assert!(looks_like_harness_error_output("Error: command returned exit status 1"));
     }
 
     #[test]
@@ -1666,5 +1667,28 @@ mod tests {
     fn infer_focus_avoids_substring_false_positives() {
         assert_eq!(infer_pr_focus("address logging"), "the changes");
         assert_eq!(infer_pr_focus("dismissal policy"), "the changes");
+        assert_eq!(infer_pr_focus("resolve review comments"), "the changes");
+    }
+
+    #[test]
+    fn prior_reviews_context_uses_alias_match() {
+        let reviews = vec![PullRequestReview {
+            id: 1,
+            body: Some("looks good".to_string()),
+            user: User {
+                login: "NicholaiVogel".to_string(),
+            },
+            state: Some("COMMENTED".to_string()),
+            commit_id: Some("previoussha".to_string()),
+            submitted_at: Some("2026-03-17T00:00:00Z".to_string()),
+        }];
+
+        let context = build_prior_reviews_context(
+            &reviews,
+            "pr-reviewer",
+            Some("NicholaiVogel"),
+            "currentsha",
+        );
+        assert!(context.contains("looks good"));
     }
 }
