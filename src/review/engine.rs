@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
 use tempfile::tempdir;
 
 use crate::config::{AppConfig, HarnessKind, RepoConfig};
@@ -23,6 +24,9 @@ use crate::review::parser::{
 use crate::review::prompt::build_review_prompt;
 use crate::safety::{evaluate_fork_policy, ForkDecision};
 use crate::store::db::{dedupe_key, Database, ReviewClaim};
+
+const IN_PROGRESS_COMMENT_TIMEOUT_SECS: u64 = 4;
+const IN_PROGRESS_COMMENT_MAX_CHARS: usize = 280;
 
 #[derive(Debug, Clone, Default)]
 pub struct ReviewOptions {
@@ -175,12 +179,22 @@ impl ReviewEngine {
                         .await
                         .unwrap_or_else(|_| self.config.defaults.bot_name.clone()),
                 };
-                let in_progress = build_in_progress_comment(
-                    &reviewer_owner,
-                    &pr_data.user.login,
-                    &pr_data.title,
-                    &pr_data.head.sha,
-                );
+
+                let has_prior_bot_review = existing_reviews
+                    .iter()
+                    .any(|r| r.user.login.eq_ignore_ascii_case(&reviewer_owner));
+
+                let in_progress = self
+                    .compose_in_progress_comment(
+                        harness_kind,
+                        &model,
+                        &reviewer_owner,
+                        &pr_data.user.login,
+                        &pr_data.title,
+                        &pr_data.head.sha,
+                        has_prior_bot_review,
+                    )
+                    .await;
                 if let Err(err) = comments::create_issue_comment(
                     &self.github,
                     &repo_cfg.owner,
@@ -227,6 +241,88 @@ impl ReviewEngine {
                 Err(err)
             }
         }
+    }
+
+    async fn compose_in_progress_comment(
+        &self,
+        harness_kind: HarnessKind,
+        model: &str,
+        owner_login: &str,
+        pr_author: &str,
+        pr_title: &str,
+        sha: &str,
+        has_prior_bot_review: bool,
+    ) -> String {
+        let fallback = build_in_progress_comment_fallback(
+            owner_login,
+            pr_author,
+            pr_title,
+            sha,
+            has_prior_bot_review,
+        );
+
+        let prompt = build_in_progress_comment_prompt(
+            owner_login,
+            pr_author,
+            pr_title,
+            sha,
+            has_prior_bot_review,
+        );
+
+        let temp = match tempdir() {
+            Ok(dir) => dir,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to create temp dir for in-progress comment prompt");
+                return fallback;
+            }
+        };
+
+        let harness_impl = harness::for_kind(harness_kind);
+        let output = match run_harness(
+            harness_impl.as_ref(),
+            HarnessRunRequest {
+                prompt,
+                model: model.to_string(),
+                working_dir: temp.path().to_path_buf(),
+                timeout_secs: IN_PROGRESS_COMMENT_TIMEOUT_SECS,
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(
+                    harness = harness_kind.as_str(),
+                    error = %err,
+                    "in-progress comment generation failed; using fallback"
+                );
+                return fallback;
+            }
+        };
+
+        let Some(raw) = extract_in_progress_comment(&output.stdout, &output.stderr) else {
+            return fallback;
+        };
+        let Some(mut composed) = normalize_in_progress_comment(&raw) else {
+            return fallback;
+        };
+
+        if has_prior_bot_review && looks_like_reintroduction(&composed) {
+            return fallback;
+        }
+
+        if !has_prior_bot_review && !composed.contains("[pr-reviewer](") {
+            composed.push_str(&format!(
+                " Powered by [pr-reviewer]({}).",
+                pr_reviewer_project_url()
+            ));
+        }
+
+        if composed.len() > IN_PROGRESS_COMMENT_MAX_CHARS {
+            return fallback;
+        }
+
+        composed
     }
 
     async fn run_review_pipeline(
@@ -862,11 +958,76 @@ fn short_sha(sha: &str) -> &str {
     }
 }
 
-fn build_in_progress_comment(
+#[derive(Debug, Deserialize)]
+struct InProgressCommentPayload {
+    comment: String,
+}
+
+fn build_in_progress_comment_prompt(
     owner_login: &str,
     pr_author: &str,
     pr_title: &str,
     sha: &str,
+    has_prior_bot_review: bool,
+) -> String {
+    let clean_owner = owner_login.trim().trim_start_matches('@');
+    let owner_label = if clean_owner.is_empty() {
+        "@the-owner".to_string()
+    } else {
+        format!("@{clean_owner}")
+    };
+
+    let clean_author = pr_author.trim().trim_start_matches('@');
+    let author_label = if clean_author.is_empty() {
+        "@teammate".to_string()
+    } else {
+        format!("@{clean_author}")
+    };
+
+    let title_context = sanitize_in_progress_title(pr_title.trim());
+    let focus = infer_pr_focus(pr_title);
+    let short = short_sha(sha);
+
+    let mut prompt = String::new();
+    prompt.push_str("Write one short GitHub PR in-progress comment.\n");
+    prompt.push_str("Voice: conversational teammate, calm, direct, plainspoken.\n");
+    prompt.push_str("No emojis. No customer-support phrasing.\n");
+    prompt.push_str("Output MUST be a fenced JSON block tagged `pr-review-in-progress-json` with exactly this schema:\n");
+    prompt.push_str("{\"comment\": string}\n");
+    prompt.push_str("Comment rules:\n");
+    prompt.push_str("- One or two sentences only.\n");
+    prompt.push_str("- Single line only.\n");
+    prompt.push_str("- Keep it under 220 characters.\n");
+    prompt.push_str("- Mention commit `");
+    prompt.push_str(short);
+    prompt.push_str("`.\n");
+    prompt.push_str("- Mention that you're reviewing ");
+    prompt.push_str(focus);
+    prompt.push_str(" in `");
+    prompt.push_str(&title_context);
+    prompt.push_str("`.\n");
+    prompt.push_str("- Address the author as ");
+    prompt.push_str(&author_label);
+    prompt.push_str(".\n");
+    if has_prior_bot_review {
+        prompt.push_str("- This is a follow-up pass on the same PR: do NOT re-introduce yourself and do NOT include a tool/repo link.\n");
+    } else {
+        prompt.push_str("- This is first-touch on this PR: briefly identify as ");
+        prompt.push_str(&owner_label);
+        prompt.push_str("'s PR-reviewing agent and include [pr-reviewer](");
+        prompt.push_str(pr_reviewer_project_url());
+        prompt.push_str(").\n");
+    }
+
+    prompt
+}
+
+fn build_in_progress_comment_fallback(
+    owner_login: &str,
+    pr_author: &str,
+    pr_title: &str,
+    sha: &str,
+    has_prior_bot_review: bool,
 ) -> String {
     let clean_owner = owner_login.trim().trim_start_matches('@');
     let owner_label = if clean_owner.is_empty() {
@@ -889,15 +1050,183 @@ fn build_in_progress_comment(
         format!("`{}`", sanitize_in_progress_title(clean_title))
     };
 
-    format!(
-        "👋 {} - I'm {}'s PR-reviewing agent powered by [pr-reviewer]({}). I'm taking a look at {} in {} (commit `{}`) now and I'll follow up shortly with feedback.",
-        greeting,
-        owner_label,
-        pr_reviewer_project_url(),
-        infer_pr_focus(pr_title),
-        title_context,
-        short_sha(sha),
-    )
+    if has_prior_bot_review {
+        format!(
+            "{} - quick follow-up pass on {} (commit `{}`); taking another look at {} and I will report back shortly.",
+            greeting,
+            title_context,
+            short_sha(sha),
+            infer_pr_focus(pr_title),
+        )
+    } else {
+        format!(
+            "{} - I'm {}'s PR-reviewing agent powered by [pr-reviewer]({}). I'm taking a look at {} in {} (commit `{}`) now and I'll follow up shortly with feedback.",
+            greeting,
+            owner_label,
+            pr_reviewer_project_url(),
+            infer_pr_focus(pr_title),
+            title_context,
+            short_sha(sha),
+        )
+    }
+}
+
+fn extract_in_progress_comment(stdout: &str, stderr: &str) -> Option<String> {
+    let raw = preferred_harness_output(stdout, stderr);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(marked) = extract_marked_json(trimmed, "pr-review-in-progress-json") {
+        if let Ok(parsed) = serde_json::from_str::<InProgressCommentPayload>(&marked) {
+            return Some(parsed.comment);
+        }
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(comment) = find_comment_text(&value) {
+            return Some(comment);
+        }
+    }
+
+    let mut candidates = extract_json_objects(trimmed);
+    candidates.reverse();
+    for candidate in candidates {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate) {
+            if let Some(comment) = find_comment_text(&value) {
+                return Some(comment);
+            }
+        }
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn preferred_harness_output(stdout: &str, stderr: &str) -> String {
+    if !stdout.trim().is_empty() {
+        return stdout.trim().to_string();
+    }
+    stderr.trim().to_string()
+}
+
+fn normalize_in_progress_comment(raw: &str) -> Option<String> {
+    let collapsed = raw
+        .trim()
+        .trim_matches('"')
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    if collapsed.len() > IN_PROGRESS_COMMENT_MAX_CHARS {
+        return None;
+    }
+
+    Some(collapsed)
+}
+
+fn looks_like_reintroduction(comment: &str) -> bool {
+    let lower = comment.to_ascii_lowercase();
+    lower.contains("pr-reviewing agent")
+        || lower.contains("powered by [pr-reviewer]")
+        || lower.contains("powered by pr-reviewer")
+        || lower.contains("[pr-reviewer](")
+}
+
+fn extract_marked_json(text: &str, marker_name: &str) -> Option<String> {
+    let marker = format!("```{marker_name}");
+    let start = text.find(&marker)?;
+    let after = &text[start + marker.len()..];
+    let after = after.strip_prefix('\n').unwrap_or(after);
+    let end = after.find("```")?;
+    Some(after[..end].trim().to_string())
+}
+
+fn extract_json_objects(text: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let mut start_idx: Option<usize> = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start_idx = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth == 0 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = start_idx.take() {
+                        results.push(text[start..=idx].to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    results
+}
+
+fn find_comment_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["comment", "status_comment", "message", "text", "content"] {
+                if let Some(text) = map.get(key).and_then(|v| v.as_str()) {
+                    if !text.trim().is_empty() {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+            for nested in map.values() {
+                if let Some(text) = find_comment_text(nested) {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(text) = find_comment_text(item) {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn sanitize_in_progress_title(title: &str) -> String {
@@ -1151,62 +1480,110 @@ fn extract_confidence_from_text(text: &str) -> Option<ConfidenceRatings> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_in_progress_comment, infer_pr_focus, pr_reviewer_project_url, resolve_project_url,
+        build_in_progress_comment_fallback, extract_in_progress_comment, infer_pr_focus,
+        looks_like_reintroduction, normalize_in_progress_comment, pr_reviewer_project_url,
+        resolve_project_url,
     };
 
     #[test]
-    fn in_progress_comment_mentions_owner_and_repo_link() {
-        let message = build_in_progress_comment(
+    fn first_touch_comment_mentions_owner_and_repo_link() {
+        let message = build_in_progress_comment_fallback(
             "octocat",
             "contributor",
             "fix race condition in queue",
             "527fae59abcde",
+            false,
         );
 
         assert!(message.contains("@octocat's PR-reviewing agent"));
         assert!(message.contains("Hi @contributor"));
-        assert!(message.contains(&format!(
-            "[pr-reviewer]({})",
-            pr_reviewer_project_url()
-        )));
+        assert!(message.contains(&format!("[pr-reviewer]({})", pr_reviewer_project_url())));
         assert!(message.contains("commit `527fae59`"));
     }
 
     #[test]
-    fn in_progress_comment_sanitizes_double_quotes_in_title() {
-        let message = build_in_progress_comment("octocat", "contributor", "fix \"the\" bug", "527fae59");
+    fn follow_up_comment_is_conversational_without_reintro() {
+        let message = build_in_progress_comment_fallback(
+            "octocat",
+            "contributor",
+            "fix race condition in queue",
+            "527fae59abcde",
+            true,
+        );
+
+        assert!(message.contains("quick follow-up pass"));
+        assert!(!message.contains("PR-reviewing agent"));
+        assert!(!message.contains("[pr-reviewer]("));
+    }
+
+    #[test]
+    fn fallback_comment_sanitizes_double_quotes_in_title() {
+        let message = build_in_progress_comment_fallback(
+            "octocat",
+            "contributor",
+            "fix \"the\" bug",
+            "527fae59",
+            false,
+        );
         assert!(message.contains("`fix 'the' bug`"));
     }
 
     #[test]
-    fn in_progress_comment_sanitizes_backticks_in_title() {
-        let message =
-            build_in_progress_comment("octocat", "contributor", "fix `foo` crash", "527fae59");
+    fn fallback_comment_sanitizes_backticks_in_title() {
+        let message = build_in_progress_comment_fallback(
+            "octocat",
+            "contributor",
+            "fix `foo` crash",
+            "527fae59",
+            false,
+        );
         assert!(message.contains("`fix 'foo' crash`"));
     }
 
     #[test]
-    fn in_progress_comment_neutralizes_markdown_links_in_title() {
-        let message = build_in_progress_comment(
+    fn fallback_comment_neutralizes_markdown_links_in_title() {
+        let message = build_in_progress_comment_fallback(
             "octocat",
             "contributor",
             "docs [click](https://example.com)",
             "527fae59",
+            false,
         );
         assert!(message.contains("`docs [click](https://example.com)`"));
     }
 
     #[test]
-    fn in_progress_comment_normalizes_newlines_in_title() {
-        let message = build_in_progress_comment(
+    fn fallback_comment_normalizes_newlines_in_title() {
+        let message = build_in_progress_comment_fallback(
             "octocat",
             "contributor",
             "fix quote\nand link\r\nrendering",
             "527fae59",
+            false,
         );
         assert!(message.contains("`fix quote and link rendering`"));
         assert!(!message.contains('\n'));
         assert!(!message.contains('\r'));
+    }
+
+    #[test]
+    fn parses_marked_json_in_progress_comment() {
+        let output = "```pr-review-in-progress-json\n{\"comment\":\"Hi @you - quick pass on commit `abc12345`.\"}\n```";
+        let parsed = extract_in_progress_comment(output, "").expect("parsed comment");
+        assert_eq!(parsed, "Hi @you - quick pass on commit `abc12345`.");
+    }
+
+    #[test]
+    fn normalizes_generated_comment_whitespace() {
+        let normalized = normalize_in_progress_comment("  hi there \n  doing a pass  ").unwrap();
+        assert_eq!(normalized, "hi there doing a pass");
+    }
+
+    #[test]
+    fn reintroduction_detector_flags_tool_intro() {
+        assert!(looks_like_reintroduction(
+            "I'm @octocat's PR-reviewing agent powered by [pr-reviewer](https://example.com)."
+        ));
     }
 
     #[test]
