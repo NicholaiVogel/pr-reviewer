@@ -49,15 +49,19 @@ No API keys required -- pr-reviewer uses your existing CLI subscriptions (Claude
 ## Installation
 
 ```bash
-# clone and build
+# one-liner
+curl -sSf https://raw.githubusercontent.com/NicholaiVogel/pr-reviewer/main/install.sh | bash
+```
+
+Or from a clone:
+
+```bash
 git clone https://github.com/NicholaiVogel/pr-reviewer.git
 cd pr-reviewer
-cargo build --release
-
-# the binary is at ./target/release/pr-reviewer
-# optionally install it to your PATH
-cargo install --path .
+./install.sh
 ```
+
+The install script checks prerequisites, builds from source, runs `pr-reviewer init`, and audits your runtime dependencies. Run `./install.sh --help` for options.
 
 ## Getting started
 

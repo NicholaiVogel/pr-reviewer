@@ -151,9 +151,6 @@ impl Database {
                     rate_reset_epoch INTEGER,
                     active_reviews INTEGER DEFAULT 0
                 );
-
-                INSERT OR IGNORE INTO daemon_state (id, started_at, last_poll_at, rate_limit_total, rate_remaining, rate_reset_epoch, active_reviews)
-                VALUES (1, NULL, NULL, NULL, NULL, NULL, 0);
                 "#,
             )?;
 
@@ -162,12 +159,20 @@ impl Database {
                 conn.execute("INSERT INTO schema_version(version) VALUES (1)", [])?;
             }
 
+            // Column migrations must run BEFORE the seed INSERT below,
+            // because existing databases have daemon_state without the new columns.
+            // SQLite's OR IGNORE only suppresses constraint violations, not schema errors.
             ensure_column_exists(&conn, "review_log", "gitnexus_used", "INTEGER")?;
             ensure_column_exists(&conn, "review_log", "gitnexus_latency_ms", "INTEGER")?;
             ensure_column_exists(&conn, "review_log", "gitnexus_hit_count", "INTEGER")?;
             ensure_column_exists(&conn, "daemon_state", "started_at", "TEXT")?;
             ensure_column_exists(&conn, "daemon_state", "rate_limit_total", "INTEGER")?;
             ensure_column_exists(&conn, "daemon_state", "rate_reset_epoch", "INTEGER")?;
+
+            conn.execute(
+                "INSERT OR IGNORE INTO daemon_state (id, started_at, last_poll_at, rate_limit_total, rate_remaining, rate_reset_epoch, active_reviews) VALUES (1, NULL, NULL, NULL, NULL, NULL, 0)",
+                [],
+            )?;
 
             Ok::<(), anyhow::Error>(())
         })
