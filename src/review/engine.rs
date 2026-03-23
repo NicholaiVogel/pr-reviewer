@@ -986,17 +986,17 @@ const DISMISSAL_SIGNALS: &[&str] = &[
 
 fn has_dismissal_signal(text: &str) -> bool {
     let lower = text.to_lowercase();
+    // Split on whitespace and punctuation, but keep hyphens attached to words
+    // so "fine-grained" stays as one token and doesn't match "fine"
     let words: Vec<&str> = lower
-        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .split(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-')
         .filter(|w| !w.is_empty())
         .collect();
     let joined = words.join(" ");
     DISMISSAL_SIGNALS.iter().any(|signal| {
-        // Multi-word signals: check substring on the joined word sequence
         if signal.contains(' ') {
             joined.contains(signal)
         } else {
-            // Single-word signals: require word boundary match
             words.iter().any(|w| *w == *signal)
         }
     })
@@ -1005,16 +1005,18 @@ fn has_dismissal_signal(text: &str) -> bool {
 /// Strip confidence markdown/JSON blocks from a review body to save context space.
 fn strip_confidence_blocks(body: &str) -> String {
     let mut out = String::new();
-    let mut skip = false;
+    let mut in_confidence_block = false;
+    let mut in_unmapped = false;
     for line in body.lines() {
+        // Enter confidence block (fenced code or heading)
         if line.starts_with("### Confidence:") || line.starts_with("```pr-review-confidence-json") {
-            skip = true;
+            in_confidence_block = true;
             continue;
         }
-        if skip {
+        // Exit confidence block
+        if in_confidence_block {
             if line.starts_with("```") || (line.starts_with("### ") && !line.starts_with("### Confidence:")) {
-                skip = false;
-                // If this is a new section header, include it
+                in_confidence_block = false;
                 if line.starts_with("### ") {
                     out.push_str(line);
                     out.push('\n');
@@ -1022,7 +1024,20 @@ fn strip_confidence_blocks(body: &str) -> String {
             }
             continue;
         }
-        // Also skip confidence line items and unmapped findings
+        // Enter unmapped findings section
+        if line.starts_with("Unmapped findings (not on changed lines):") {
+            in_unmapped = true;
+            continue;
+        }
+        // Unmapped findings: skip indented lines (list items), exit on anything else
+        if in_unmapped {
+            if line.starts_with("- ") || line.starts_with("  ") || line.trim().is_empty() {
+                continue;
+            }
+            // Non-indented, non-empty line: end of unmapped section
+            in_unmapped = false;
+        }
+        // Skip old confidence dimension line items
         if line.starts_with("- Style consistency")
             || line.starts_with("- Repository conventions adherence")
             || line.starts_with("- Merge conflict detection")
@@ -1037,10 +1052,6 @@ fn strip_confidence_blocks(body: &str) -> String {
             || line.starts_with("- Pattern correctness")
             || line.starts_with("- Documentation coverage")
         {
-            continue;
-        }
-        if line.starts_with("Unmapped findings (not on changed lines):") {
-            skip = true;
             continue;
         }
         out.push_str(line);
@@ -1094,77 +1105,11 @@ fn build_prior_reviews_context(
         out.push('\n');
     }
 
-    // --- Section 2: Inline comment threads ---
-    if !review_comments.is_empty() {
-        let parent_map: HashMap<u64, Option<u64>> = review_comments
-            .iter()
-            .map(|c| (c.id, c.in_reply_to_id))
-            .collect();
+    // Note: Inline comment threads are handled by build_addressed_findings()
+    // which provides status labels ([dismissed], [likely addressed], etc.)
+    // to avoid double-inclusion of the same thread data.
 
-        // Group comments by thread root
-        let mut threads: HashMap<u64, Vec<&ReviewComment>> = HashMap::new();
-        for comment in review_comments {
-            let root = find_thread_root_id(&parent_map, comment.id);
-            threads.entry(root).or_default().push(comment);
-        }
-
-        // Only include threads where the bot participated and a human replied
-        let mut thread_entries: Vec<(u64, &Vec<&ReviewComment>)> = threads
-            .iter()
-            .filter(|(_, comments)| {
-                let bot_posted = comments
-                    .iter()
-                    .any(|c| login_matches_bot(&c.user.login, bot_name, bot_alias));
-                let human_replied = comments
-                    .iter()
-                    .any(|c| !login_matches_bot(&c.user.login, bot_name, bot_alias));
-                bot_posted && human_replied
-            })
-            .map(|(root, comments)| (*root, comments))
-            .collect();
-
-        // Sort by most recent comment in each thread
-        thread_entries.sort_by(|a, b| {
-            let a_latest = a.1.iter().map(|c| &c.created_at).max();
-            let b_latest = b.1.iter().map(|c| &c.created_at).max();
-            a_latest.cmp(&b_latest)
-        });
-
-        // Cap at 15 threads
-        if thread_entries.len() > 15 {
-            thread_entries = thread_entries[thread_entries.len() - 15..].to_vec();
-        }
-
-        if !thread_entries.is_empty() {
-            out.push_str("### Inline Comment Threads\n");
-            for (_, comments) in &thread_entries {
-                let mut sorted: Vec<&&ReviewComment> = comments.iter().collect();
-                sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-
-                for c in sorted {
-                    let is_bot = login_matches_bot(&c.user.login, bot_name, bot_alias);
-                    let role = if is_bot { "bot" } else { "human" };
-                    let body_preview: String = c.body.chars().take(500).collect();
-                    let dismissed = if !is_bot && has_dismissal_signal(&c.body) {
-                        " [dismissed]"
-                    } else {
-                        ""
-                    };
-                    out.push_str(&format!(
-                        "- {}:{:?} ({}): {}{}\n",
-                        c.path,
-                        c.line,
-                        role,
-                        body_preview.replace('\n', " "),
-                        dismissed,
-                    ));
-                }
-                out.push('\n');
-            }
-        }
-    }
-
-    // --- Section 3: PR issue comments (general conversation) ---
+    // --- Section 2: PR issue comments (general conversation) ---
     let human_issue_comments: Vec<&IssueComment> = issue_comments
         .iter()
         .filter(|c| !login_matches_bot(&c.user.login, bot_name, bot_alias))
