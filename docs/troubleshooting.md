@@ -296,9 +296,19 @@ Install it:
 
 ```bash
 npm install -g gitnexus
-# or use npx without installing:
-# pr-reviewer uses `npx gitnexus query` as fallback
+# or rely on fallback execution:
+# pr-reviewer falls back to `npx gitnexus` if the binary is not installed
 ```
+
+### Multiple repositories indexed and GitNexus query fails
+
+If you run GitNexus manually and see an error like "Multiple repositories indexed", pass an explicit repo:
+
+```bash
+gitnexus query -r your-repo-name "your query"
+```
+
+pr-reviewer now passes `-r` automatically for GitNexus queries to avoid this ambiguity.
 
 ### GitNexus output is empty or stale
 
