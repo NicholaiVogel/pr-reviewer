@@ -467,7 +467,8 @@ impl GitHubClient {
             let batch_empty = batch.is_empty();
             all_comments.extend(batch);
 
-            if !has_next || batch_empty || page >= 3 {
+            // Cap at 10 pages (consistent with other paginated endpoints)
+            if !has_next || batch_empty || page >= 10 {
                 break;
             }
             page += 1;

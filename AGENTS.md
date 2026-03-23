@@ -72,13 +72,9 @@ When `local_path` is omitted from a repo config, the repo is auto-cloned to `~/.
 
 GitNexus outputs to **stderr** because KuzuDB captures stdout at OS level. The code checks both streams (preferring stderr) so it won't silently break if this behavior changes. Falls back to `None` if gitnexus CLI isn't installed or the repo isn't indexed.
 
-### Confidence Ratings (parser.rs)
+### Confidence (parser.rs)
 
-13 dimensions rated 1-10, averaged to a global score. Low confidence (avg < 5) downgrades APPROVE → COMMENT. Security-focused dimensions:
-- `security_vulnerability_detection`
-- `injection_risk_detection`
-- `attack_surface_risk_assessment`
-- `future_hardening_guidance`
+Simple `Confidence { level: ConfidenceLevel, justification: String }` where level is High/Medium/Low. Displayed as a single line in the review body: `**Confidence:** {level} - {justification}`. No numeric scoring or dimensional breakdown.
 
 ### Idempotency
 

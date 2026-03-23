@@ -990,7 +990,20 @@ const DISMISSAL_SIGNALS: &[&str] = &[
 
 fn has_dismissal_signal(text: &str) -> bool {
     let lower = text.to_lowercase();
-    DISMISSAL_SIGNALS.iter().any(|s| lower.contains(s))
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let joined = words.join(" ");
+    DISMISSAL_SIGNALS.iter().any(|signal| {
+        // Multi-word signals: check substring on the joined word sequence
+        if signal.contains(' ') {
+            joined.contains(signal)
+        } else {
+            // Single-word signals: require word boundary match
+            words.iter().any(|w| *w == *signal)
+        }
+    })
 }
 
 /// Strip confidence markdown/JSON blocks from a review body to save context space.
@@ -1790,8 +1803,12 @@ fn should_skip_review(
                 || lower == "license"
                 || lower == "license.md"
                 || lower == "license.txt"
-                || lower.starts_with("changelog")
-                || lower.starts_with("changes")
+                || lower == "changelog"
+                || lower == "changelog.md"
+                || lower == "changelog.txt"
+                || lower == "changes"
+                || lower == "changes.md"
+                || lower == "changes.txt"
                 || lower == "readme"
                 || lower == "readme.md"
         });
