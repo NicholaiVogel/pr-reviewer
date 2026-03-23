@@ -197,7 +197,6 @@ impl ReviewEngine {
                         .compose_in_progress_comment(
                             harness_kind,
                             &model,
-                            &reviewer_owner,
                             &pr_data.user.login,
                             &pr_data.title,
                             &pr_data.head.sha,
@@ -264,14 +263,12 @@ impl ReviewEngine {
         &self,
         harness_kind: HarnessKind,
         model: &str,
-        owner_login: &str,
         pr_author: &str,
         pr_title: &str,
         sha: &str,
         has_prior_bot_review: bool,
     ) -> String {
         let fallback = build_in_progress_comment_fallback(
-            owner_login,
             pr_author,
             pr_title,
             sha,
@@ -279,7 +276,6 @@ impl ReviewEngine {
         );
 
         let prompt = build_in_progress_comment_prompt(
-            owner_login,
             pr_author,
             pr_title,
             sha,
@@ -1379,19 +1375,11 @@ struct InProgressCommentPayload {
 }
 
 fn build_in_progress_comment_prompt(
-    owner_login: &str,
     pr_author: &str,
     pr_title: &str,
     sha: &str,
     has_prior_bot_review: bool,
 ) -> String {
-    let clean_owner = owner_login.trim().trim_start_matches('@');
-    let owner_label = if clean_owner.is_empty() {
-        "@the-owner".to_string()
-    } else {
-        format!("@{clean_owner}")
-    };
-
     let clean_author = pr_author.trim().trim_start_matches('@');
     let author_label = if clean_author.is_empty() {
         "@teammate".to_string()
@@ -1427,9 +1415,7 @@ fn build_in_progress_comment_prompt(
     if has_prior_bot_review {
         prompt.push_str("- This is a follow-up pass on the same PR: do NOT re-introduce yourself and do NOT include a tool/repo link.\n");
     } else {
-        prompt.push_str("- This is first-touch on this PR: briefly identify as ");
-        prompt.push_str(&owner_label);
-        prompt.push_str("'s PR-reviewing agent and include [pr-reviewer](");
+        prompt.push_str("- This is first-touch on this PR: briefly identify as an automated code reviewer and include [pr-reviewer](");
         prompt.push_str(pr_reviewer_project_url());
         prompt.push_str(").\n");
     }
@@ -1438,19 +1424,11 @@ fn build_in_progress_comment_prompt(
 }
 
 fn build_in_progress_comment_fallback(
-    owner_login: &str,
     pr_author: &str,
     pr_title: &str,
     sha: &str,
     has_prior_bot_review: bool,
 ) -> String {
-    let clean_owner = owner_login.trim().trim_start_matches('@');
-    let owner_label = if clean_owner.is_empty() {
-        "the connected GitHub account".to_string()
-    } else {
-        format!("@{clean_owner}")
-    };
-
     let clean_author = pr_author.trim().trim_start_matches('@');
     let greeting = if clean_author.is_empty() {
         "Hi there".to_string()
@@ -1475,9 +1453,8 @@ fn build_in_progress_comment_fallback(
         )
     } else {
         format!(
-            "{} - I'm {}'s PR-reviewing agent powered by [pr-reviewer]({}). I'm taking a look at {} in {} (commit `{}`) now and I'll follow up shortly with feedback.",
+            "{} - I'm an automated code reviewer powered by [pr-reviewer]({}). I'm taking a look at {} in {} (commit `{}`) now and I'll follow up shortly with feedback.",
             greeting,
-            owner_label,
             pr_reviewer_project_url(),
             infer_pr_focus(pr_title),
             title_context,
@@ -1555,6 +1532,7 @@ fn normalize_in_progress_comment(raw: &str) -> Option<String> {
 fn looks_like_reintroduction(comment: &str) -> bool {
     let lower = comment.to_ascii_lowercase();
     lower.contains("pr-reviewing agent")
+        || lower.contains("automated code reviewer")
         || lower.contains("powered by [pr-reviewer]")
         || lower.contains("powered by pr-reviewer")
         || lower.contains("[pr-reviewer](")
@@ -1870,16 +1848,15 @@ mod tests {
     };
 
     #[test]
-    fn first_touch_comment_mentions_owner_and_repo_link() {
+    fn first_touch_comment_mentions_repo_link() {
         let message = build_in_progress_comment_fallback(
-            "octocat",
             "contributor",
             "fix race condition in queue",
             "527fae59abcde",
             false,
         );
 
-        assert!(message.contains("@octocat's PR-reviewing agent"));
+        assert!(message.contains("automated code reviewer"));
         assert!(message.contains("Hi @contributor"));
         assert!(message.contains(&format!("[pr-reviewer]({})", pr_reviewer_project_url())));
         assert!(message.contains("commit `527fae59`"));
@@ -1888,7 +1865,6 @@ mod tests {
     #[test]
     fn follow_up_comment_is_conversational_without_reintro() {
         let message = build_in_progress_comment_fallback(
-            "octocat",
             "contributor",
             "fix race condition in queue",
             "527fae59abcde",
@@ -1903,7 +1879,6 @@ mod tests {
     #[test]
     fn fallback_comment_sanitizes_double_quotes_in_title() {
         let message = build_in_progress_comment_fallback(
-            "octocat",
             "contributor",
             "fix \"the\" bug",
             "527fae59",
@@ -1915,7 +1890,6 @@ mod tests {
     #[test]
     fn fallback_comment_sanitizes_backticks_in_title() {
         let message = build_in_progress_comment_fallback(
-            "octocat",
             "contributor",
             "fix `foo` crash",
             "527fae59",
@@ -1927,7 +1901,6 @@ mod tests {
     #[test]
     fn fallback_comment_neutralizes_markdown_links_in_title() {
         let message = build_in_progress_comment_fallback(
-            "octocat",
             "contributor",
             "docs [click](https://example.com)",
             "527fae59",
@@ -1939,7 +1912,6 @@ mod tests {
     #[test]
     fn fallback_comment_normalizes_newlines_in_title() {
         let message = build_in_progress_comment_fallback(
-            "octocat",
             "contributor",
             "fix quote\nand link\r\nrendering",
             "527fae59",
