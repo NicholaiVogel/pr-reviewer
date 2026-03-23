@@ -608,7 +608,7 @@ impl Database {
         .await?
     }
 
-    pub async fn get_queue_depth(&self) -> Result<i64> {
+    pub async fn get_claimed_reviews(&self) -> Result<i64> {
         let path = self.path.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -827,7 +827,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_queue_depth_counts_claimed_reviews() {
+    async fn get_claimed_reviews_counts_correctly() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::new(dir.path().join("state.db"))
             .await
@@ -843,6 +843,6 @@ mod tests {
         };
 
         assert!(db.claim_review(claim).await.expect("claim"));
-        assert_eq!(db.get_queue_depth().await.expect("depth"), 1);
+        assert_eq!(db.get_claimed_reviews().await.expect("depth"), 1);
     }
 }

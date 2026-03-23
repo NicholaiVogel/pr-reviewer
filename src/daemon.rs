@@ -257,7 +257,7 @@ pub struct DaemonSnapshot {
     pub last_heartbeat_at: Option<String>,
     pub heartbeat_age_secs: Option<i64>,
     pub active_workers: i64,
-    pub queue_depth: i64,
+    pub claimed_reviews: i64,
     pub watched_repos: Vec<String>,
     pub rate_limit: RateLimitSnapshot,
 }
@@ -268,7 +268,7 @@ pub async fn collect_status(db: &Database, config: &AppConfig) -> Result<DaemonS
     let running = pid.is_some_and(|pid| is_pid_alive(pid as i32));
 
     let daemon = db.get_daemon_status().await?;
-    let queue_depth = db.get_queue_depth().await?;
+    let claimed_reviews = db.get_claimed_reviews().await?;
     let now = chrono::Utc::now();
 
     let uptime_secs = if running {
@@ -289,7 +289,7 @@ pub async fn collect_status(db: &Database, config: &AppConfig) -> Result<DaemonS
 
     let reset_at = daemon
         .rate_reset_epoch
-        .and_then(|epoch| chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0))
+        .and_then(|epoch| chrono::DateTime::from_timestamp(epoch, 0))
         .map(|dt| dt.to_rfc3339());
 
     Ok(DaemonSnapshot {
@@ -300,7 +300,7 @@ pub async fn collect_status(db: &Database, config: &AppConfig) -> Result<DaemonS
         last_heartbeat_at: daemon.last_poll_at,
         heartbeat_age_secs,
         active_workers: daemon.active_reviews,
-        queue_depth,
+        claimed_reviews,
         watched_repos: config.repos.iter().map(|repo| repo.full_name()).collect(),
         rate_limit: RateLimitSnapshot {
             limit: daemon.rate_limit_total,
@@ -322,7 +322,11 @@ pub fn format_status(snapshot: &DaemonSnapshot) -> String {
         let _ = writeln!(out, "  stopped");
     }
     if let Some(pid) = snapshot.pid {
-        let _ = writeln!(out, "  pid: {pid}");
+        if snapshot.running {
+            let _ = writeln!(out, "  pid: {pid}");
+        } else {
+            let _ = writeln!(out, "  last pid: {pid}");
+        }
     }
     if let Some(started_at) = snapshot.started_at.as_deref() {
         let _ = writeln!(out, "  started: {started_at}");
@@ -346,7 +350,7 @@ pub fn format_status(snapshot: &DaemonSnapshot) -> String {
 
     let _ = writeln!(out);
     let _ = writeln!(out, "Queue");
-    let _ = writeln!(out, "  depth: {}", snapshot.queue_depth);
+    let _ = writeln!(out, "  claimed: {}", snapshot.claimed_reviews);
     let _ = writeln!(out, "  active workers: {}", snapshot.active_workers);
 
     let _ = writeln!(out);
@@ -432,7 +436,7 @@ mod tests {
             last_heartbeat_at: Some("2026-03-23T06:14:30Z".to_string()),
             heartbeat_age_secs: Some(30),
             active_workers: 2,
-            queue_depth: 5,
+            claimed_reviews: 5,
             watched_repos: vec!["owner/repo".to_string()],
             rate_limit: RateLimitSnapshot {
                 limit: Some(5000),
@@ -448,7 +452,7 @@ mod tests {
         assert!(out.contains("pid: 1234"));
         assert!(out.contains("uptime: 1h 02m 03s"));
         assert!(out.contains("last heartbeat: 2026-03-23T06:14:30Z (30s)"));
-        assert!(out.contains("depth: 5"));
+        assert!(out.contains("claimed: 5"));
         assert!(out.contains("remaining: 4321 / 5000"));
         assert!(out.contains("owner/repo"));
     }

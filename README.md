@@ -49,8 +49,10 @@ No API keys required -- pr-reviewer uses your existing CLI subscriptions (Claude
 ## Installation
 
 ```bash
-# one-liner
-curl -sSf https://raw.githubusercontent.com/NicholaiVogel/pr-reviewer/main/install.sh | bash
+# one-liner (review the script first, or use the clone method below)
+curl -sSf https://raw.githubusercontent.com/NicholaiVogel/pr-reviewer/main/install.sh -o install.sh
+less install.sh          # inspect before running
+bash install.sh
 ```
 
 Or from a clone:
