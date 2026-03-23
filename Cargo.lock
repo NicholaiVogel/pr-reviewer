@@ -1450,6 +1450,7 @@ dependencies = [
  "httptest",
  "nix",
  "rand",
+ "regex",
  "reqwest",
  "rpassword",
  "rusqlite",

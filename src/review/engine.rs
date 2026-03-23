@@ -12,14 +12,14 @@ use crate::context::gitnexus;
 use crate::context::retriever::{assemble_context, ContextMode};
 use crate::github::comments;
 use crate::github::types::{
-    CreateReviewComment, CreateReviewRequest, PullRequest, PullRequestReview, ReviewComment,
+    CreateReviewComment, CreateReviewRequest, IssueComment, PullRequest, PullRequestReview,
+    ReviewComment,
 };
 use crate::github::{client::GitHubClient, pr};
 use crate::harness;
 use crate::harness::spawn::{run_harness, HarnessRunRequest};
 use crate::review::parser::{
-    parse_reply_output, parse_review_output, ConfidenceRatings, ParseOutcome, ReplyParseOutcome,
-    ReviewVerdict,
+    parse_reply_output, parse_review_output, ParseOutcome, ReplyParseOutcome, ReviewVerdict,
 };
 use crate::review::prompt::build_review_prompt;
 use crate::safety::{evaluate_fork_policy, ForkDecision};
@@ -190,32 +190,36 @@ impl ReviewEngine {
                     )
                 });
 
-                let in_progress = self
-                    .compose_in_progress_comment(
-                        harness_kind,
-                        &model,
-                        &reviewer_owner,
-                        &pr_data.user.login,
-                        &pr_data.title,
-                        &pr_data.head.sha,
-                        has_prior_bot_review,
+                // Only post in-progress comment on first touch. Follow-up rounds
+                // skip it to reduce noise.
+                if !has_prior_bot_review {
+                    let in_progress = self
+                        .compose_in_progress_comment(
+                            harness_kind,
+                            &model,
+                            &reviewer_owner,
+                            &pr_data.user.login,
+                            &pr_data.title,
+                            &pr_data.head.sha,
+                            false,
+                        )
+                        .await;
+                    if let Err(err) = comments::create_issue_comment(
+                        &self.github,
+                        &repo_cfg.owner,
+                        &repo_cfg.name,
+                        pr_data.number,
+                        &in_progress,
                     )
-                    .await;
-                if let Err(err) = comments::create_issue_comment(
-                    &self.github,
-                    &repo_cfg.owner,
-                    &repo_cfg.name,
-                    pr_data.number,
-                    &in_progress,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        repo = %repo_cfg.full_name(),
-                        pr = pr_data.number,
-                        error = %err,
-                        "failed to post in-progress review comment"
-                    );
+                    .await
+                    {
+                        tracing::warn!(
+                            repo = %repo_cfg.full_name(),
+                            pr = pr_data.number,
+                            error = %err,
+                            "failed to post in-progress review comment"
+                        );
+                    }
                 }
             }
         }
@@ -385,6 +389,38 @@ impl ReviewEngine {
             })
             .collect();
 
+        // Skip docs-only or trivial diffs to avoid wasting compute
+        if let Some(skip_reason) = should_skip_review(&changed_files, &self.config.defaults) {
+            tracing::info!(
+                repo = %repo_name,
+                pr = pr_data.number,
+                reason = skip_reason,
+                "skipping review: {skip_reason}",
+            );
+            self.db
+                .complete_review(
+                    &dedupe,
+                    0,
+                    Some(&format!("skipped:{skip_reason}")),
+                    0.0,
+                    0,
+                    parsed_diff.total_hunk_lines as i64,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+
+            return Ok(ReviewRunResult {
+                repo: repo_name,
+                pr_number: pr_data.number,
+                sha: pr_data.head.sha.clone(),
+                status: format!("skipped:{skip_reason}"),
+                verdict: None,
+                comments_posted: 0,
+            });
+        }
+
         let mut gitnexus_used = if repo_cfg.gitnexus { Some(false) } else { None };
         let mut gitnexus_latency_ms: Option<i64> = None;
         let mut gitnexus_hit_count: Option<i64> = None;
@@ -463,16 +499,61 @@ impl ReviewEngine {
         )
         .await?;
 
+        // Fetch inline review comments, PR issue comments, and repo conventions in parallel
+        let (review_comments, issue_comments, repo_conventions) = tokio::join!(
+            async {
+                comments::get_review_comments(
+                    &self.github,
+                    &repo_cfg.owner,
+                    &repo_cfg.name,
+                    pr_data.number,
+                    None,
+                )
+                .await
+                .unwrap_or_default()
+            },
+            async {
+                comments::get_issue_comments(
+                    &self.github,
+                    &repo_cfg.owner,
+                    &repo_cfg.name,
+                    pr_data.number,
+                )
+                .await
+                .unwrap_or_default()
+            },
+            crate::context::retriever::fetch_repo_conventions(
+                &self.github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                &pr_data.head.sha,
+            ),
+        );
+
         let mut context_with_history = assembled.text.clone();
         let prior_reviews_context = build_prior_reviews_context(
             &existing_reviews,
+            &review_comments,
+            &issue_comments,
             self.config.defaults.bot_name.as_str(),
             self.authenticated_user.as_deref(),
             pr_data.head.sha.as_str(),
         );
         if !prior_reviews_context.is_empty() {
-            context_with_history.push_str("\n## Prior Bot Reviews\n");
+            context_with_history.push_str("\n## Prior Review History\n");
             context_with_history.push_str(&prior_reviews_context);
+            context_with_history.push('\n');
+        }
+
+        let addressed_findings = build_addressed_findings(
+            &review_comments,
+            &parsed_diff,
+            self.config.defaults.bot_name.as_str(),
+            self.authenticated_user.as_deref(),
+        );
+        if !addressed_findings.is_empty() {
+            context_with_history.push_str("\n## Previously Flagged Items\n");
+            context_with_history.push_str(&addressed_findings);
             context_with_history.push('\n');
         }
 
@@ -496,11 +577,26 @@ impl ReviewEngine {
             }
         }
 
+        let has_prior_reviews = !prior_reviews_context.is_empty();
+
+        // Detect UI file changes and check for screenshots in PR body
+        let ui_files = detect_ui_files(&changed_files);
+        let ui_files_for_prompt = if !ui_files.is_empty()
+            && !has_screenshot_references(pr_data.body.as_deref())
+        {
+            Some(ui_files)
+        } else {
+            None
+        };
+
         let prompt = build_review_prompt(
             repo_cfg,
             pr_data,
             &context_with_history,
             &self.config.defaults.bot_name,
+            repo_conventions.as_deref(),
+            has_prior_reviews,
+            ui_files_for_prompt.as_deref(),
         );
 
         let temp = tempdir().context("failed to create temp working dir")?;
@@ -525,19 +621,31 @@ impl ReviewEngine {
 
         let mut body = String::new();
         let mut verdict = ReviewVerdict::Comment;
-        let mut confidence: Option<ConfidenceRatings> = None;
         let mut inline_comments: Vec<CreateReviewComment> = Vec::new();
         let mut unmapped_comments: Vec<String> = Vec::new();
+
+        // Prepend bot identity header on every review
+        body.push_str(&format!(
+            "> Automated review by [pr-reviewer]({}) | model: {} | commit: `{}`\n\n",
+            pr_reviewer_project_url(),
+            model,
+            short_sha(&pr_data.head.sha),
+        ));
 
         match parse_outcome {
             ParseOutcome::Structured(review) => {
                 body.push_str(&review.summary);
                 verdict = review.verdict;
-                confidence = Some(review.confidence.clone());
-                body.push_str("\n\n");
-                body.push_str(&format_confidence_markdown(&review.confidence));
-                body.push_str("\n\n");
-                body.push_str(&format_confidence_json_block(&review.confidence));
+                body.push_str(&format!(
+                    "\n\n**Confidence:** {} - {}\n",
+                    review.confidence.level,
+                    review.confidence.justification,
+                ));
+
+                if review.ui_screenshot_needed {
+                    body.push_str("\n> **Note:** This PR touches UI files but no screenshots were referenced in the description. Consider adding visual previews for reviewers.\n");
+                }
+
                 for comment in review.comments {
                     let path = clean_comment_path(&comment.file);
                     let right = parsed_diff.position_for(&path, comment.line, DiffSide::Right);
@@ -582,7 +690,7 @@ impl ReviewEngine {
                 .complete_review(
                     &dedupe,
                     inline_comments.len() as i64,
-                    Some(confidence_verdict_label(verdict, confidence.as_ref())),
+                    Some(verdict_label(verdict)),
                     harness_output.duration_secs,
                     assembled.files_included as i64,
                     assembled.diff_lines as i64,
@@ -614,10 +722,7 @@ impl ReviewEngine {
                 .complete_review(
                     &dedupe,
                     0,
-                    Some(confidence_verdict_label(
-                        ReviewVerdict::Comment,
-                        confidence.as_ref(),
-                    )),
+                    Some(verdict_label(ReviewVerdict::Comment)),
                     harness_output.duration_secs,
                     assembled.files_included as i64,
                     assembled.diff_lines as i64,
@@ -637,20 +742,20 @@ impl ReviewEngine {
             });
         }
 
-        // GitHub rejects APPROVE/REQUEST_CHANGES on your own PRs — downgrade to COMMENT.
-        // Use cached user from init(), fall back to live API call, fail-closed on total failure.
+        // Bot never approves. REQUEST_CHANGES still needs self-review downgrade
+        // because GitHub rejects it on your own PRs.
         let event = match verdict {
-            ReviewVerdict::Comment => verdict.as_github_event(),
-            ReviewVerdict::Approve | ReviewVerdict::RequestChanges => {
+            ReviewVerdict::NoIssues | ReviewVerdict::Approve | ReviewVerdict::Comment => "COMMENT",
+            ReviewVerdict::RequestChanges => {
                 let bot_login = match &self.authenticated_user {
                     Some(u) => Some(u.clone()),
                     None => self.github.get_authenticated_user().await.ok(),
                 };
                 match bot_login.as_deref() {
                     Some(u) if u.eq_ignore_ascii_case(&pr_data.user.login) => "COMMENT",
-                    Some(_) => verdict.as_github_event(),
+                    Some(_) => "REQUEST_CHANGES",
                     None => {
-                        tracing::warn!("could not determine authenticated user; downgrading verdict to COMMENT");
+                        tracing::warn!("could not determine authenticated user; downgrading REQUEST_CHANGES to COMMENT");
                         "COMMENT"
                     }
                 }
@@ -786,21 +891,7 @@ impl ReviewEngine {
         )
         .await
         .unwrap_or_default();
-        let existing_reviews = comments::get_existing_reviews(
-            &self.github,
-            &repo_cfg.owner,
-            &repo_cfg.name,
-            pr_data.number,
-        )
-        .await
-        .unwrap_or_default();
         let thread_history = build_thread_history(&all_comments, comment.id);
-        let baseline_confidence = extract_latest_confidence_snapshot(
-            self.config.defaults.bot_name.as_str(),
-            &existing_reviews,
-            &all_comments,
-        );
-
         let mut file_snippet = String::new();
         if let Some(line) = comment.line {
             if let Ok(Some(content)) = self
@@ -818,23 +909,15 @@ impl ReviewEngine {
         }
 
         let mut prompt = String::new();
-        prompt.push_str("You are replying as an automated code review assistant.\n");
-        prompt.push_str("Write a concise, technical response to this review thread comment.\n");
-        prompt.push_str("Use the latest diff and thread context to determine whether the issue appears fixed.\n");
+        prompt.push_str("Respond to this review thread comment. Determine whether the referenced issue has been addressed in the current code.\n");
         prompt.push_str("If fixed, say so explicitly and reference concrete evidence. If not fixed, explain what remains.\n");
         prompt.push_str("Output JSON in a fenced block tagged exactly `pr-review-reply-json` with this schema:\n");
-        prompt.push_str("{\"reply\": string, \"confidence\": {style_maintainability, repo_convention_adherence, merge_conflict_detection, security_vulnerability_detection, injection_risk_detection, attack_surface_risk_assessment, future_hardening_guidance, scope_alignment, duplication_awareness, tooling_pattern_leverage, functional_completeness, pattern_correctness, documentation_coverage}}\n");
-        prompt.push_str("All confidence values must be integers from 1 to 10.\n\n");
+        prompt.push_str("{\"reply\": string}\n\n");
         prompt.push_str(&format!("Repo: {}/{}\n", repo_cfg.owner, repo_cfg.name));
         prompt.push_str(&format!("PR: #{}\n", pr_data.number));
         prompt.push_str(&format!("Target comment id: {}\n", comment.id));
         prompt.push_str(&format!("Target comment path: {}\n", comment.path));
         prompt.push_str(&format!("Target comment line: {:?}\n", comment.line));
-        if let Some(conf) = baseline_confidence.as_ref() {
-            prompt.push_str("\nLatest known confidence ratings:\n");
-            prompt.push_str(&format_confidence_markdown(conf));
-            prompt.push('\n');
-        }
         prompt.push_str("\nThread history:\n");
         prompt.push_str(&thread_history);
         prompt.push_str("\n\nLatest diff (truncated):\n```diff\n");
@@ -861,14 +944,7 @@ impl ReviewEngine {
         .await?;
 
         let reply = match parse_reply_output(&output.stdout, &output.stderr)? {
-            ReplyParseOutcome::Structured(update) => {
-                let mut text = update.reply;
-                text.push_str("\n\n");
-                text.push_str(&format_confidence_markdown(&update.confidence));
-                text.push_str("\n\n");
-                text.push_str(&format_confidence_json_block(&update.confidence));
-                text
-            }
+            ReplyParseOutcome::Structured(update) => update.reply,
             ReplyParseOutcome::Raw(raw) => raw,
             ReplyParseOutcome::Empty => String::new(),
         };
@@ -895,12 +971,86 @@ fn clean_comment_path(path: &str) -> String {
     path.trim().trim_start_matches("./").to_string()
 }
 
+/// Dismissal signals from humans indicating a finding should not be re-flagged.
+const DISMISSAL_SIGNALS: &[&str] = &[
+    "intentional",
+    "by design",
+    "won't fix",
+    "wontfix",
+    "acknowledged",
+    "expected",
+    "not a bug",
+    "fine",
+    "this is fine",
+    "leave it",
+    "acceptable",
+    "known",
+    "on purpose",
+];
+
+fn has_dismissal_signal(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    DISMISSAL_SIGNALS.iter().any(|s| lower.contains(s))
+}
+
+/// Strip confidence markdown/JSON blocks from a review body to save context space.
+fn strip_confidence_blocks(body: &str) -> String {
+    let mut out = String::new();
+    let mut skip = false;
+    for line in body.lines() {
+        if line.starts_with("### Confidence:") || line.starts_with("```pr-review-confidence-json") {
+            skip = true;
+            continue;
+        }
+        if skip {
+            if line.starts_with("```") || (line.starts_with("### ") && !line.starts_with("### Confidence:")) {
+                skip = false;
+                // If this is a new section header, include it
+                if line.starts_with("### ") {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            continue;
+        }
+        // Also skip confidence line items and unmapped findings
+        if line.starts_with("- Style consistency")
+            || line.starts_with("- Repository conventions adherence")
+            || line.starts_with("- Merge conflict detection")
+            || line.starts_with("- Security vulnerability detection")
+            || line.starts_with("- Injection risk detection")
+            || line.starts_with("- Attack-surface risk")
+            || line.starts_with("- Future hardening")
+            || line.starts_with("- Scope alignment")
+            || line.starts_with("- Existing functionality")
+            || line.starts_with("- Existing tooling")
+            || line.starts_with("- Functional completeness")
+            || line.starts_with("- Pattern correctness")
+            || line.starts_with("- Documentation coverage")
+        {
+            continue;
+        }
+        if line.starts_with("Unmapped findings (not on changed lines):") {
+            skip = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 fn build_prior_reviews_context(
     reviews: &[PullRequestReview],
+    review_comments: &[ReviewComment],
+    issue_comments: &[IssueComment],
     bot_name: &str,
     bot_alias: Option<&str>,
     current_sha: &str,
 ) -> String {
+    let mut out = String::new();
+
+    // --- Section 1: Prior bot review summaries ---
     let mut relevant: Vec<&PullRequestReview> = reviews
         .iter()
         .filter(|r| {
@@ -908,32 +1058,221 @@ fn build_prior_reviews_context(
                 && r.commit_id.as_deref() != Some(current_sha)
         })
         .collect();
-    if relevant.is_empty() {
-        return String::new();
-    }
     relevant.sort_by(|a, b| a.submitted_at.cmp(&b.submitted_at));
-    let tail = if relevant.len() > 5 {
-        &relevant[relevant.len() - 5..]
+    let tail = if relevant.len() > 3 {
+        &relevant[relevant.len() - 3..]
     } else {
         &relevant[..]
     };
 
-    let mut out = String::new();
     for review in tail {
         let sha = review.commit_id.as_deref().unwrap_or("unknown-sha");
         let state = review.state.as_deref().unwrap_or("UNKNOWN");
         let submitted = review.submitted_at.as_deref().unwrap_or("unknown");
         out.push_str(&format!(
-            "- sha={} state={} submitted_at={}\n",
+            "### Review on sha={} state={} ({})\n",
             sha, state, submitted
         ));
         if let Some(body) = review.body.as_deref() {
-            let summary = body.lines().take(8).collect::<Vec<_>>().join("\n");
-            out.push_str(summary.trim());
+            let cleaned = strip_confidence_blocks(body);
+            let truncated: String = cleaned.chars().take(2000).collect();
+            out.push_str(truncated.trim());
+            if cleaned.len() > 2000 {
+                out.push_str("\n... [truncated]");
+            }
             out.push('\n');
         }
         out.push('\n');
     }
+
+    // --- Section 2: Inline comment threads ---
+    if !review_comments.is_empty() {
+        let parent_map: HashMap<u64, Option<u64>> = review_comments
+            .iter()
+            .map(|c| (c.id, c.in_reply_to_id))
+            .collect();
+
+        // Group comments by thread root
+        let mut threads: HashMap<u64, Vec<&ReviewComment>> = HashMap::new();
+        for comment in review_comments {
+            let root = find_thread_root_id(&parent_map, comment.id);
+            threads.entry(root).or_default().push(comment);
+        }
+
+        // Only include threads where the bot participated and a human replied
+        let mut thread_entries: Vec<(u64, &Vec<&ReviewComment>)> = threads
+            .iter()
+            .filter(|(_, comments)| {
+                let bot_posted = comments
+                    .iter()
+                    .any(|c| login_matches_bot(&c.user.login, bot_name, bot_alias));
+                let human_replied = comments
+                    .iter()
+                    .any(|c| !login_matches_bot(&c.user.login, bot_name, bot_alias));
+                bot_posted && human_replied
+            })
+            .map(|(root, comments)| (*root, comments))
+            .collect();
+
+        // Sort by most recent comment in each thread
+        thread_entries.sort_by(|a, b| {
+            let a_latest = a.1.iter().map(|c| &c.created_at).max();
+            let b_latest = b.1.iter().map(|c| &c.created_at).max();
+            a_latest.cmp(&b_latest)
+        });
+
+        // Cap at 15 threads
+        if thread_entries.len() > 15 {
+            thread_entries = thread_entries[thread_entries.len() - 15..].to_vec();
+        }
+
+        if !thread_entries.is_empty() {
+            out.push_str("### Inline Comment Threads\n");
+            for (_, comments) in &thread_entries {
+                let mut sorted: Vec<&&ReviewComment> = comments.iter().collect();
+                sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+                for c in sorted {
+                    let is_bot = login_matches_bot(&c.user.login, bot_name, bot_alias);
+                    let role = if is_bot { "bot" } else { "human" };
+                    let body_preview: String = c.body.chars().take(500).collect();
+                    let dismissed = if !is_bot && has_dismissal_signal(&c.body) {
+                        " [dismissed]"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!(
+                        "- {}:{:?} ({}): {}{}\n",
+                        c.path,
+                        c.line,
+                        role,
+                        body_preview.replace('\n', " "),
+                        dismissed,
+                    ));
+                }
+                out.push('\n');
+            }
+        }
+    }
+
+    // --- Section 3: PR issue comments (general conversation) ---
+    let human_issue_comments: Vec<&IssueComment> = issue_comments
+        .iter()
+        .filter(|c| !login_matches_bot(&c.user.login, bot_name, bot_alias))
+        .collect();
+
+    if !human_issue_comments.is_empty() {
+        let tail = if human_issue_comments.len() > 5 {
+            &human_issue_comments[human_issue_comments.len() - 5..]
+        } else {
+            &human_issue_comments[..]
+        };
+
+        out.push_str("### PR Conversation\n");
+        for comment in tail {
+            let body_preview: String = comment
+                .body
+                .lines()
+                .take(15)
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push_str(&format!(
+                "- (@{}, {}): {}\n",
+                comment.user.login,
+                comment.created_at,
+                body_preview.replace('\n', " "),
+            ));
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Build a list of previously flagged findings with their status.
+fn build_addressed_findings(
+    review_comments: &[ReviewComment],
+    parsed_diff: &crate::context::diff_parser::ParsedDiff,
+    bot_name: &str,
+    bot_alias: Option<&str>,
+) -> String {
+    if review_comments.is_empty() {
+        return String::new();
+    }
+
+    let parent_map: HashMap<u64, Option<u64>> = review_comments
+        .iter()
+        .map(|c| (c.id, c.in_reply_to_id))
+        .collect();
+
+    // Group comments by thread root
+    let mut threads: HashMap<u64, Vec<&ReviewComment>> = HashMap::new();
+    for comment in review_comments {
+        let root = find_thread_root_id(&parent_map, comment.id);
+        threads.entry(root).or_default().push(comment);
+    }
+
+    let changed_files: std::collections::HashSet<&str> = parsed_diff
+        .files
+        .iter()
+        .map(|f| {
+            if f.new_path != "/dev/null" {
+                f.new_path.as_str()
+            } else {
+                f.old_path.as_str()
+            }
+        })
+        .collect();
+
+    let mut out = String::new();
+
+    for (_, comments) in &threads {
+        // Find bot's original finding (first bot comment in thread)
+        let mut sorted: Vec<&&ReviewComment> = comments.iter().collect();
+        sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+        let bot_finding = sorted.iter().find(|c| {
+            login_matches_bot(&c.user.login, bot_name, bot_alias)
+        });
+
+        let Some(finding) = bot_finding else {
+            continue;
+        };
+
+        let human_replied = sorted.iter().any(|c| {
+            !login_matches_bot(&c.user.login, bot_name, bot_alias)
+        });
+
+        if !human_replied {
+            continue;
+        }
+
+        // Determine status
+        let human_dismissed = sorted.iter().any(|c| {
+            !login_matches_bot(&c.user.login, bot_name, bot_alias)
+                && has_dismissal_signal(&c.body)
+        });
+
+        let file_in_diff = changed_files.contains(finding.path.as_str());
+
+        let status = if human_dismissed {
+            "[dismissed by human]"
+        } else if !file_in_diff {
+            "[likely addressed]"
+        } else {
+            "[potentially addressed]"
+        };
+
+        let body_preview: String = finding.body.chars().take(200).collect();
+        out.push_str(&format!(
+            "- {}:{:?} {} {}\n",
+            finding.path,
+            finding.line,
+            status,
+            body_preview.replace('\n', " "),
+        ));
+    }
+
     out
 }
 
@@ -1430,128 +1769,76 @@ fn has_focus_keyword(tokens: &[String], keywords: &[&str]) -> bool {
         .any(|token| keywords.iter().any(|keyword| token == keyword))
 }
 
-fn confidence_verdict_label(
-    verdict: ReviewVerdict,
-    confidence: Option<&ConfidenceRatings>,
-) -> &'static str {
-    // If confidence is low (average < 5), downgrade approve to comment
-    if let Some(conf) = confidence {
-        if verdict == ReviewVerdict::Approve && conf.average() < 5.0 {
-            return "COMMENT";
-        }
-    }
-    verdict.as_github_event()
-}
-
-fn format_confidence_markdown(conf: &ConfidenceRatings) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("### Confidence: {:.1}/10\n", conf.average()));
-    out.push_str(&format!(
-        "- Style consistency & maintainability: {}\n",
-        conf.style_maintainability
-    ));
-    out.push_str(&format!(
-        "- Repository conventions adherence: {}\n",
-        conf.repo_convention_adherence
-    ));
-    out.push_str(&format!(
-        "- Merge conflict detection confidence: {}\n",
-        conf.merge_conflict_detection
-    ));
-    out.push_str(&format!(
-        "- Security vulnerability detection confidence: {}\n",
-        conf.security_vulnerability_detection
-    ));
-    out.push_str(&format!(
-        "- Injection risk detection confidence: {}\n",
-        conf.injection_risk_detection
-    ));
-    out.push_str(&format!(
-        "- Attack-surface risk assessment confidence: {}\n",
-        conf.attack_surface_risk_assessment
-    ));
-    out.push_str(&format!(
-        "- Future hardening guidance confidence: {}\n",
-        conf.future_hardening_guidance
-    ));
-    out.push_str(&format!(
-        "- Scope alignment confidence: {}\n",
-        conf.scope_alignment
-    ));
-    out.push_str(&format!(
-        "- Existing functionality awareness: {}\n",
-        conf.duplication_awareness
-    ));
-    out.push_str(&format!(
-        "- Existing tooling/pattern leverage: {}\n",
-        conf.tooling_pattern_leverage
-    ));
-    out.push_str(&format!(
-        "- Functional completeness confidence: {}\n",
-        conf.functional_completeness
-    ));
-    out.push_str(&format!(
-        "- Pattern correctness confidence: {}\n",
-        conf.pattern_correctness
-    ));
-    out.push_str(&format!(
-        "- Documentation coverage confidence: {}\n",
-        conf.documentation_coverage
-    ));
-    out
-}
-
-fn format_confidence_json_block(conf: &ConfidenceRatings) -> String {
-    let json = serde_json::to_string_pretty(conf).unwrap_or_else(|_| "{}".to_string());
-    format!("```pr-review-confidence-json\n{}\n```", json)
-}
-
-fn extract_latest_confidence_snapshot(
-    bot_name: &str,
-    reviews: &[PullRequestReview],
-    comments: &[ReviewComment],
-) -> Option<ConfidenceRatings> {
-    let mut entries: Vec<(String, String)> = Vec::new();
-
-    for review in reviews {
-        if !review.user.login.eq_ignore_ascii_case(bot_name) {
-            continue;
-        }
-        let ts = review
-            .submitted_at
-            .clone()
-            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-        if let Some(body) = review.body.as_deref() {
-            entries.push((ts, body.to_string()));
-        }
+/// Check if a diff should be skipped based on file types and config.
+fn should_skip_review(
+    changed_files: &[String],
+    defaults: &crate::config::DefaultsConfig,
+) -> Option<&'static str> {
+    if changed_files.is_empty() {
+        return Some("empty-diff");
     }
 
-    for comment in comments {
-        if !comment.user.login.eq_ignore_ascii_case(bot_name) {
-            continue;
-        }
-        entries.push((comment.created_at.clone(), comment.body.clone()));
-    }
-
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    entries.reverse();
-
-    for (_, text) in entries {
-        if let Some(conf) = extract_confidence_from_text(&text) {
-            return Some(conf);
+    if defaults.skip_docs_only {
+        let all_docs = changed_files.iter().all(|f| {
+            let lower = f.to_lowercase();
+            lower.ends_with(".md")
+                || lower.ends_with(".txt")
+                || lower.ends_with(".rst")
+                || lower.ends_with(".adoc")
+                || lower.starts_with("docs/")
+                || lower.starts_with("doc/")
+                || lower == "license"
+                || lower == "license.md"
+                || lower == "license.txt"
+                || lower.starts_with("changelog")
+                || lower.starts_with("changes")
+                || lower == "readme"
+                || lower == "readme.md"
+        });
+        if all_docs {
+            return Some("docs-only");
         }
     }
 
     None
 }
 
-fn extract_confidence_from_text(text: &str) -> Option<ConfidenceRatings> {
-    let marker = "```pr-review-confidence-json";
-    let start = text.find(marker)?;
-    let after = &text[start + marker.len()..];
-    let after = after.strip_prefix('\n').unwrap_or(after);
-    let end = after.find("```")?;
-    serde_json::from_str::<ConfidenceRatings>(after[..end].trim()).ok()
+const UI_EXTENSIONS: &[&str] = &[
+    ".css", ".scss", ".less", ".svelte", ".tsx", ".jsx", ".vue", ".html",
+];
+
+fn detect_ui_files(changed_files: &[String]) -> Vec<String> {
+    changed_files
+        .iter()
+        .filter(|f| {
+            let lower = f.to_lowercase();
+            UI_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+        })
+        .cloned()
+        .collect()
+}
+
+fn has_screenshot_references(pr_body: Option<&str>) -> bool {
+    let Some(body) = pr_body else {
+        return false;
+    };
+    let lower = body.to_lowercase();
+    lower.contains("![")
+        || lower.contains("<img")
+        || lower.contains(".png")
+        || lower.contains(".jpg")
+        || lower.contains(".jpeg")
+        || lower.contains(".gif")
+        || lower.contains(".webp")
+        || lower.contains("screenshot")
+}
+
+fn verdict_label(verdict: ReviewVerdict) -> &'static str {
+    match verdict {
+        ReviewVerdict::NoIssues | ReviewVerdict::Approve => "NO_ISSUES",
+        ReviewVerdict::Comment => "COMMENT",
+        ReviewVerdict::RequestChanges => "REQUEST_CHANGES",
+    }
 }
 
 #[cfg(test)]
@@ -1745,6 +2032,8 @@ mod tests {
 
         let context = build_prior_reviews_context(
             &reviews,
+            &[],
+            &[],
             "pr-reviewer",
             Some("NicholaiVogel"),
             "currentsha",

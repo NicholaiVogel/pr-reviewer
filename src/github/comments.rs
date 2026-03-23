@@ -1,7 +1,9 @@
 use anyhow::Result;
 
 use crate::github::client::GitHubClient;
-use crate::github::types::{CreateReviewRequest, PullRequestReview, ReviewComment};
+use crate::github::types::{
+    CreateReviewRequest, IssueComment, PullRequestReview, ReviewComment,
+};
 
 pub async fn create_review(
     client: &GitHubClient,
@@ -40,6 +42,15 @@ pub async fn get_review_comments(
     since: Option<&str>,
 ) -> Result<Vec<ReviewComment>> {
     client.get_review_comments(owner, repo, number, since).await
+}
+
+pub async fn get_issue_comments(
+    client: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<Vec<IssueComment>> {
+    client.get_issue_comments(owner, repo, number).await
 }
 
 pub async fn reply_to_review_comment(

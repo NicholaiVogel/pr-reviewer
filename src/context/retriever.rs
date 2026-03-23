@@ -139,6 +139,34 @@ fn normalize_file_path(file: &crate::context::diff_parser::FileDiff) -> String {
     }
 }
 
+const CONVENTION_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md", ".claude/instructions.md"];
+const MAX_CONVENTION_BYTES: usize = 20 * 1024;
+
+/// Try to fetch repository convention files (CLAUDE.md, AGENTS.md, .claude/instructions.md).
+/// Returns the first one found, capped at 20KB.
+pub async fn fetch_repo_conventions(
+    github: &GitHubClient,
+    owner: &str,
+    name: &str,
+    head_sha: &str,
+) -> Option<String> {
+    for path in CONVENTION_FILES {
+        match github.get_file_content(owner, name, path, head_sha).await {
+            Ok(Some(content)) if !content.trim().is_empty() => {
+                let mut content = content;
+                if content.len() > MAX_CONVENTION_BYTES {
+                    truncate_utf8_to_max_bytes(&mut content, MAX_CONVENTION_BYTES);
+                    content.push_str("\n[conventions truncated]");
+                }
+                tracing::info!(file = path, "loaded repo conventions");
+                return Some(content);
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
 fn truncate_utf8_to_max_bytes(input: &mut String, max_bytes: usize) {
     if input.len() <= max_bytes {
         return;
