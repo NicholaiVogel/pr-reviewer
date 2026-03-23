@@ -4,77 +4,77 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewVerdict {
-    Approve,
+    NoIssues,
     Comment,
     RequestChanges,
+    /// Legacy variant: if the model outputs "approve", normalize to NoIssues.
+    #[serde(alias = "approve")]
+    #[serde(skip_serializing)]
+    Approve,
 }
 
 impl ReviewVerdict {
     pub fn as_github_event(self) -> &'static str {
         match self {
-            ReviewVerdict::Approve => "APPROVE",
+            ReviewVerdict::NoIssues | ReviewVerdict::Approve => "COMMENT",
             ReviewVerdict::Comment => "COMMENT",
             ReviewVerdict::RequestChanges => "REQUEST_CHANGES",
         }
     }
+
+    /// Normalize legacy Approve into NoIssues.
+    pub fn normalized(self) -> Self {
+        match self {
+            ReviewVerdict::Approve => ReviewVerdict::NoIssues,
+            other => other,
+        }
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ConfidenceRatings {
-    pub style_maintainability: u8,
-    pub repo_convention_adherence: u8,
-    pub merge_conflict_detection: u8,
-    pub security_vulnerability_detection: u8,
-    pub injection_risk_detection: u8,
-    pub attack_surface_risk_assessment: u8,
-    pub future_hardening_guidance: u8,
-    pub scope_alignment: u8,
-    pub duplication_awareness: u8,
-    pub tooling_pattern_leverage: u8,
-    pub functional_completeness: u8,
-    pub pattern_correctness: u8,
-    pub documentation_coverage: u8,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceLevel {
+    High,
+    Medium,
+    Low,
 }
 
-impl ConfidenceRatings {
+impl std::fmt::Display for ConfidenceLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfidenceLevel::High => write!(f, "High"),
+            ConfidenceLevel::Medium => write!(f, "Medium"),
+            ConfidenceLevel::Low => write!(f, "Low"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Confidence {
+    pub level: ConfidenceLevel,
+    pub justification: String,
+}
+
+impl Confidence {
     pub fn validate(&self) -> Result<()> {
-        validate_confidence("style_maintainability", self.style_maintainability)?;
-        validate_confidence("repo_convention_adherence", self.repo_convention_adherence)?;
-        validate_confidence("merge_conflict_detection", self.merge_conflict_detection)?;
-        validate_confidence(
-            "security_vulnerability_detection",
-            self.security_vulnerability_detection,
-        )?;
-        validate_confidence("injection_risk_detection", self.injection_risk_detection)?;
-        validate_confidence(
-            "attack_surface_risk_assessment",
-            self.attack_surface_risk_assessment,
-        )?;
-        validate_confidence("future_hardening_guidance", self.future_hardening_guidance)?;
-        validate_confidence("scope_alignment", self.scope_alignment)?;
-        validate_confidence("duplication_awareness", self.duplication_awareness)?;
-        validate_confidence("tooling_pattern_leverage", self.tooling_pattern_leverage)?;
-        validate_confidence("functional_completeness", self.functional_completeness)?;
-        validate_confidence("pattern_correctness", self.pattern_correctness)?;
-        validate_confidence("documentation_coverage", self.documentation_coverage)?;
+        if self.justification.trim().is_empty() {
+            return Err(anyhow!("confidence justification cannot be empty"));
+        }
         Ok(())
     }
+}
 
-    pub fn average(&self) -> f32 {
-        let sum = self.style_maintainability as u32
-            + self.repo_convention_adherence as u32
-            + self.merge_conflict_detection as u32
-            + self.security_vulnerability_detection as u32
-            + self.injection_risk_detection as u32
-            + self.attack_surface_risk_assessment as u32
-            + self.future_hardening_guidance as u32
-            + self.scope_alignment as u32
-            + self.duplication_awareness as u32
-            + self.tooling_pattern_leverage as u32
-            + self.functional_completeness as u32
-            + self.pattern_correctness as u32
-            + self.documentation_coverage as u32;
-        sum as f32 / 13.0
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentSeverity {
+    Blocking,
+    Warning,
+    Nitpick,
+}
+
+impl Default for CommentSeverity {
+    fn default() -> Self {
+        CommentSeverity::Warning
     }
 }
 
@@ -83,15 +83,19 @@ pub struct ReviewComment {
     pub file: String,
     pub line: u32,
     pub body: String,
+    #[serde(default)]
+    pub severity: CommentSeverity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructuredReview {
     pub summary: String,
     pub verdict: ReviewVerdict,
-    pub confidence: ConfidenceRatings,
+    pub confidence: Confidence,
     #[serde(default)]
     pub comments: Vec<ReviewComment>,
+    #[serde(default)]
+    pub ui_screenshot_needed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -104,7 +108,6 @@ pub enum ParseOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructuredReplyUpdate {
     pub reply: String,
-    pub confidence: ConfidenceRatings,
 }
 
 #[derive(Debug, Clone)]
@@ -176,8 +179,11 @@ fn normalize_output(stdout: &str, stderr: &str) -> String {
 }
 
 fn parse_and_validate(json: &str) -> Result<StructuredReview> {
-    let parsed: StructuredReview =
+    let mut parsed: StructuredReview =
         serde_json::from_str(json).map_err(|e| anyhow!("review JSON parse failed: {e}"))?;
+
+    // Normalize legacy "approve" verdict to NoIssues
+    parsed.verdict = parsed.verdict.normalized();
 
     if parsed.summary.trim().is_empty() {
         return Err(anyhow!("summary cannot be empty"));
@@ -206,16 +212,7 @@ fn parse_reply_and_validate(json: &str) -> Result<StructuredReplyUpdate> {
     if parsed.reply.trim().is_empty() {
         return Err(anyhow!("reply cannot be empty"));
     }
-    parsed.confidence.validate()?;
     Ok(parsed)
-}
-
-fn validate_confidence(name: &str, value: u8) -> Result<()> {
-    if (1..=10).contains(&value) {
-        Ok(())
-    } else {
-        Err(anyhow!("{name} confidence must be within 1..=10"))
-    }
 }
 
 fn extract_marked_json(text: &str, marker_name: &str) -> Option<String> {
@@ -281,7 +278,7 @@ mod tests {
     use super::*;
 
     fn confidence_json() -> &'static str {
-        r#""confidence":{"style_maintainability":8,"repo_convention_adherence":8,"merge_conflict_detection":7,"security_vulnerability_detection":8,"injection_risk_detection":8,"attack_surface_risk_assessment":7,"future_hardening_guidance":7,"scope_alignment":9,"duplication_awareness":8,"tooling_pattern_leverage":8,"functional_completeness":7,"pattern_correctness":8,"documentation_coverage":6}"#
+        r#""confidence":{"level":"medium","justification":"Changes are straightforward but touch error paths."}"#
     }
 
     #[test]
@@ -295,14 +292,15 @@ mod tests {
             ParseOutcome::Structured(review) => {
                 assert_eq!(review.summary, "ok");
                 assert_eq!(review.verdict, ReviewVerdict::Comment);
-                assert_eq!(review.confidence.scope_alignment, 9);
+                assert_eq!(review.confidence.level, ConfidenceLevel::Medium);
+                assert!(review.confidence.justification.contains("error paths"));
             }
             _ => panic!("expected structured review"),
         }
     }
 
     #[test]
-    fn picks_last_json_object() {
+    fn picks_last_json_object_and_normalizes_approve() {
         let input = format!(
             "{{\"summary\":\"old\",\"verdict\":\"comment\",{},\"comments\":[]}} {{\"summary\":\"new\",\"verdict\":\"approve\",{},\"comments\":[]}}",
             confidence_json(),
@@ -312,32 +310,75 @@ mod tests {
         match parsed {
             ParseOutcome::Structured(review) => {
                 assert_eq!(review.summary, "new");
-                assert_eq!(review.verdict, ReviewVerdict::Approve);
+                // "approve" should be normalized to NoIssues
+                assert_eq!(review.verdict, ReviewVerdict::NoIssues);
             }
             _ => panic!("expected structured review"),
         }
     }
 
     #[test]
-    fn confidence_out_of_range_falls_back_to_raw() {
+    fn no_issues_verdict_parses() {
+        let input = format!(
+            "```pr-review-json\n{{\"summary\":\"All good.\",\"verdict\":\"no_issues\",{},\"comments\":[]}}\n```",
+            confidence_json()
+        );
+        let parsed = parse_review_output(&input, "").expect("parse output");
+        match parsed {
+            ParseOutcome::Structured(review) => {
+                assert_eq!(review.verdict, ReviewVerdict::NoIssues);
+            }
+            _ => panic!("expected structured review"),
+        }
+    }
+
+    #[test]
+    fn empty_confidence_justification_falls_back_to_raw() {
         let input = r#"```pr-review-json
-{"summary":"bad","verdict":"comment","confidence":{"style_maintainability":0,"repo_convention_adherence":8,"merge_conflict_detection":7,"security_vulnerability_detection":8,"injection_risk_detection":8,"attack_surface_risk_assessment":7,"future_hardening_guidance":7,"scope_alignment":9,"duplication_awareness":8,"tooling_pattern_leverage":8,"functional_completeness":7,"pattern_correctness":8,"documentation_coverage":6},"comments":[]}
+{"summary":"bad","verdict":"comment","confidence":{"level":"high","justification":""},"comments":[]}
 ```"#;
         let parsed = parse_review_output(input, "").expect("parse output");
         assert!(matches!(parsed, ParseOutcome::RawSummary(_)));
     }
 
     #[test]
-    fn parses_reply_json_block() {
+    fn parses_comment_severity() {
         let input = format!(
-            "```pr-review-reply-json\n{{\"reply\":\"Thanks, verified fix.\",{}}}\n```",
+            "```pr-review-json\n{{\"summary\":\"found stuff\",\"verdict\":\"request_changes\",{},\"comments\":[{{\"file\":\"src/main.rs\",\"line\":10,\"body\":\"bug\",\"severity\":\"blocking\"}}]}}\n```",
             confidence_json()
         );
-        let parsed = parse_reply_output(&input, "").expect("parse output");
+        let parsed = parse_review_output(&input, "").expect("parse output");
+        match parsed {
+            ParseOutcome::Structured(review) => {
+                assert_eq!(review.comments[0].severity, CommentSeverity::Blocking);
+            }
+            _ => panic!("expected structured review"),
+        }
+    }
+
+    #[test]
+    fn missing_severity_defaults_to_warning() {
+        let input = format!(
+            "```pr-review-json\n{{\"summary\":\"found stuff\",\"verdict\":\"comment\",{},\"comments\":[{{\"file\":\"src/main.rs\",\"line\":10,\"body\":\"note\"}}]}}\n```",
+            confidence_json()
+        );
+        let parsed = parse_review_output(&input, "").expect("parse output");
+        match parsed {
+            ParseOutcome::Structured(review) => {
+                assert_eq!(review.comments[0].severity, CommentSeverity::Warning);
+            }
+            _ => panic!("expected structured review"),
+        }
+    }
+
+    #[test]
+    fn parses_reply_json_block() {
+        let input =
+            "```pr-review-reply-json\n{\"reply\":\"Thanks, verified fix.\"}\n```";
+        let parsed = parse_reply_output(input, "").expect("parse output");
         match parsed {
             ReplyParseOutcome::Structured(reply) => {
                 assert!(reply.reply.contains("verified"));
-                assert_eq!(reply.confidence.pattern_correctness, 8);
             }
             _ => panic!("expected structured reply"),
         }
@@ -357,5 +398,20 @@ mod tests {
     fn empty_output_returns_empty_outcome() {
         let parsed = parse_review_output("", "").expect("parse output");
         assert!(matches!(parsed, ParseOutcome::Empty));
+    }
+
+    #[test]
+    fn ui_screenshot_needed_defaults_false() {
+        let input = format!(
+            "```pr-review-json\n{{\"summary\":\"ok\",\"verdict\":\"no_issues\",{},\"comments\":[]}}\n```",
+            confidence_json()
+        );
+        let parsed = parse_review_output(&input, "").expect("parse output");
+        match parsed {
+            ParseOutcome::Structured(review) => {
+                assert!(!review.ui_screenshot_needed);
+            }
+            _ => panic!("expected structured review"),
+        }
     }
 }

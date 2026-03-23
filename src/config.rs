@@ -125,6 +125,8 @@ pub struct DefaultsConfig {
     pub dry_run: bool,
     #[serde(default = "default_prompt_limit")]
     pub max_prompt_bytes: usize,
+    #[serde(default = "default_true")]
+    pub skip_docs_only: bool,
 }
 
 /// Conditions that must be met for a workflow step to run.
@@ -277,6 +279,10 @@ fn default_gitnexus() -> bool {
     true
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
@@ -310,6 +316,7 @@ impl Default for DefaultsConfig {
             bot_name: default_bot_name(),
             dry_run: false,
             max_prompt_bytes: default_prompt_limit(),
+            skip_docs_only: true,
         }
     }
 }

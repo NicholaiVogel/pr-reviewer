@@ -6,88 +6,120 @@ pub fn build_review_prompt(
     pr: &PullRequest,
     context: &str,
     bot_name: &str,
+    repo_conventions: Option<&str>,
+    has_prior_reviews: bool,
+    ui_files_changed: Option<&[String]>,
 ) -> String {
     let mut prompt = String::new();
 
-    prompt.push_str("You are an expert code reviewer. Focus only on high-signal issues: bugs, security flaws, data corruption, race conditions, logic mistakes, and breaking changes. Ignore style-only suggestions unless they hide a correctness issue.\n\n");
     prompt.push_str(
-        "Output MUST be a JSON object in a fenced block tagged exactly as `pr-review-json`.\n",
+        "Review this pull request. Be discerning. Use good judgment.\n\n",
     );
+    prompt.push_str(
+        "Focus on: bugs, security flaws, data corruption, race conditions, logic mistakes, breaking changes, and patterns that diverge from codebase conventions. Do not flag style-only issues unless they conceal a correctness problem.\n\n",
+    );
+    prompt.push_str(&format!(
+        "You are an automated review tool (identity: {}). State this in the first line of your summary.\n\n",
+        bot_name,
+    ));
+    prompt.push_str("Instructions:\n");
+    prompt.push_str(
+        "1. Read the PR description. Validate whether the implementation achieves what the description claims. If the PR says it does X, verify the code does X. If the implementation diverges from stated goals, flag this.\n",
+    );
+    prompt.push_str(
+        "2. Check for introduced security vulnerabilities, injection risks, and attack-surface expansion.\n",
+    );
+
+    let mut instruction_num = 3;
+
+    if repo_conventions.is_some() {
+        prompt.push_str(&format!(
+            "{}. Check adherence to repository conventions provided below. Flag deviations only when they affect correctness, consistency, or maintainability.\n",
+            instruction_num,
+        ));
+        instruction_num += 1;
+    }
+
+    if has_prior_reviews {
+        prompt.push_str(&format!(
+            "{}. Prior review history and inline discussion are in the context. Items marked [dismissed by human] or [likely addressed] MUST NOT be re-flagged. Focus on areas not previously examined. If a human replied to a prior finding saying it is intentional, expected, or acceptable, respect that judgment and do not re-flag it.\n",
+            instruction_num,
+        ));
+        instruction_num += 1;
+    }
+
+    if let Some(ui_files) = ui_files_changed {
+        let file_list: String = ui_files.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
+        prompt.push_str(&format!(
+            "{}. This PR modifies UI files: {}. If the PR description does not reference screenshots or visual previews, set ui_screenshot_needed to true and note this in your summary.\n",
+            instruction_num, file_list,
+        ));
+        let _ = instruction_num; // suppress unused warning
+    }
+
+    prompt.push_str(
+        "\nYou MUST NOT approve this PR or state it is safe to merge. You are not authorized to make that call. Your role is to flag issues or signal readiness for human review.\n\n",
+    );
+
+    prompt.push_str("Output a JSON object in a fenced block tagged exactly `pr-review-json`.\n");
     prompt.push_str("Schema:\n");
-    prompt.push_str("- summary: string\n");
-    prompt.push_str("- verdict: one of [\"approve\", \"comment\", \"request_changes\"]\n");
-    prompt.push_str("- confidence: object with integer ratings from 1 to 10 for:\n");
-    prompt.push_str("  - style_maintainability\n");
-    prompt.push_str("  - repo_convention_adherence\n");
-    prompt.push_str("  - merge_conflict_detection\n");
-    prompt.push_str("  - security_vulnerability_detection\n");
-    prompt.push_str("  - injection_risk_detection\n");
-    prompt.push_str("  - attack_surface_risk_assessment\n");
-    prompt.push_str("  - future_hardening_guidance\n");
-    prompt.push_str("  - scope_alignment\n");
-    prompt.push_str("  - duplication_awareness\n");
-    prompt.push_str("  - tooling_pattern_leverage\n");
-    prompt.push_str("  - functional_completeness\n");
-    prompt.push_str("  - pattern_correctness\n");
-    prompt.push_str("  - documentation_coverage\n");
+    prompt.push_str("- summary: string (first line must identify this as an automated bot review)\n");
+    prompt.push_str("- verdict: one of [\"no_issues\", \"comment\", \"request_changes\"]\n");
+    prompt.push_str("  - \"no_issues\": nothing worth flagging, ready for human review\n");
+    prompt.push_str("  - \"comment\": found issues worth discussing but not blocking\n");
+    prompt.push_str("  - \"request_changes\": found issues that should be fixed before merge\n");
+    prompt.push_str("- confidence: object with:\n");
+    prompt.push_str("  - level: one of [\"high\", \"medium\", \"low\"]\n");
+    prompt.push_str("  - justification: string explaining your confidence (e.g. \"low: the diff touches crypto code I cannot fully verify without runtime context\")\n");
+    prompt.push_str("- ui_screenshot_needed: boolean (true if UI files changed and no screenshots referenced in PR description)\n");
+    prompt.push_str("- comments: array of objects with:\n");
+    prompt.push_str("  - file: string (file path)\n");
+    prompt.push_str("  - line: integer (line number in the changed file)\n");
+    prompt.push_str("  - body: string (the finding)\n");
+    prompt.push_str("  - severity: one of [\"blocking\", \"warning\", \"nitpick\"]\n");
     prompt.push_str(
-        "- comments: array of objects with fields { file: string, line: integer, body: string }\n",
-    );
-    prompt.push_str(
-        "Line numbers must refer to changed lines in the current diff whenever possible.\n\n",
-    );
-    prompt.push_str(
-        "If prior review history is provided, explicitly mention what was fixed and what remains unresolved.\n\n",
-    );
-    prompt.push_str(
-        "Always check for introduced security vulnerabilities, injection risks, and attack-surface expansion.\n",
-    );
-    prompt.push_str(
-        "If risk increases, include future hardening adjustments in your summary or comments.\n\n",
+        "\nLine numbers must refer to changed lines in the current diff whenever possible.\n\n",
     );
 
     prompt.push_str("Example output:\n");
     prompt.push_str("```pr-review-json\n");
     prompt.push_str("{\n");
-    prompt.push_str("  \"summary\": \"Found one security issue and one null handling bug.\",\n");
+    prompt.push_str("  \"summary\": \"[Automated Review] Found one security issue and one null handling bug.\",\n");
     prompt.push_str("  \"verdict\": \"request_changes\",\n");
     prompt.push_str("  \"confidence\": {\n");
-    prompt.push_str("    \"style_maintainability\": 8,\n");
-    prompt.push_str("    \"repo_convention_adherence\": 9,\n");
-    prompt.push_str("    \"merge_conflict_detection\": 7,\n");
-    prompt.push_str("    \"security_vulnerability_detection\": 8,\n");
-    prompt.push_str("    \"injection_risk_detection\": 8,\n");
-    prompt.push_str("    \"attack_surface_risk_assessment\": 7,\n");
-    prompt.push_str("    \"future_hardening_guidance\": 7,\n");
-    prompt.push_str("    \"scope_alignment\": 8,\n");
-    prompt.push_str("    \"duplication_awareness\": 8,\n");
-    prompt.push_str("    \"tooling_pattern_leverage\": 7,\n");
-    prompt.push_str("    \"functional_completeness\": 8,\n");
-    prompt.push_str("    \"pattern_correctness\": 7,\n");
-    prompt.push_str("    \"documentation_coverage\": 6\n");
+    prompt.push_str("    \"level\": \"high\",\n");
+    prompt.push_str("    \"justification\": \"The changes are contained to two files with clear control flow. The SQL injection is unambiguous.\"\n");
     prompt.push_str("  },\n");
+    prompt.push_str("  \"ui_screenshot_needed\": false,\n");
     prompt.push_str("  \"comments\": [\n");
-    prompt.push_str("    {\"file\": \"src/auth.rs\", \"line\": 41, \"body\": \"Potential SQL injection when interpolating user input into query string.\"}\n");
+    prompt.push_str("    {\"file\": \"src/auth.rs\", \"line\": 41, \"body\": \"Potential SQL injection when interpolating user input into query string.\", \"severity\": \"blocking\"}\n");
     prompt.push_str("  ]\n");
     prompt.push_str("}\n");
     prompt.push_str("```\n\n");
 
     prompt.push_str(&format!(
         "Repository: {}/{}\n",
-        repo_cfg.owner, repo_cfg.name
+        repo_cfg.owner, repo_cfg.name,
     ));
     prompt.push_str(&format!("Pull Request: #{}\n", pr.number));
-    prompt.push_str(&format!("Bot identity: {}\n", bot_name));
+
+    if let Some(conventions) = repo_conventions {
+        if !conventions.trim().is_empty() {
+            prompt.push_str("\n## Repository Conventions\n");
+            prompt.push_str(conventions);
+            prompt.push('\n');
+        }
+    }
 
     if let Some(custom) = repo_cfg.custom_instructions.as_deref() {
         if !custom.trim().is_empty() {
-            prompt.push_str("\nCustom repository instructions:\n");
+            prompt.push_str("\n## Custom Repository Instructions\n");
             prompt.push_str(custom);
             prompt.push('\n');
         }
     }
 
-    prompt.push_str("\nContext:\n");
+    prompt.push_str("\n## Context\n");
     prompt.push_str(context);
 
     prompt

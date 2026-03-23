@@ -72,13 +72,9 @@ When `local_path` is omitted from a repo config, the repo is auto-cloned to `~/.
 
 GitNexus outputs to **stderr** because KuzuDB captures stdout at OS level. The code checks both streams (preferring stderr) so it won't silently break if this behavior changes. Falls back to `None` if gitnexus CLI isn't installed or the repo isn't indexed.
 
-### Confidence Ratings (parser.rs)
+### Confidence (parser.rs)
 
-13 dimensions rated 1-10, averaged to a global score. Low confidence (avg < 5) downgrades APPROVE → COMMENT. Security-focused dimensions:
-- `security_vulnerability_detection`
-- `injection_risk_detection`
-- `attack_surface_risk_assessment`
-- `future_hardening_guidance`
+Simple `Confidence { level: ConfidenceLevel, justification: String }` where level is High/Medium/Low. Displayed as a single line in the review body: `**Confidence:** {level} - {justification}`. No numeric scoring or dimensional breakdown.
 
 ### Idempotency
 
@@ -154,38 +150,80 @@ pr-reviewer index owner/repo
 ```
 
 <!-- gitnexus:start -->
-## GitNexus Code Intelligence
+# GitNexus — Code Intelligence
 
-This project is indexed by GitNexus. Use GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **pr-reviewer** (2479 symbols, 6625 relationships, 191 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
-### Before Editing
+## Always Do
 
-- Run `gitnexus_impact({target: "symbolName", direction: "upstream"})` to check blast radius
-- Run `gitnexus_context({name: "symbolName"})` for full caller/callee view
-- Warn on HIGH or CRITICAL risk before proceeding
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
 
-### Before Committing
+## When Debugging
 
-- Run `gitnexus_detect_changes({scope: "staged"})` to verify changes match expected scope
+1. `gitnexus_query({query: "<error or symptom>"})` — find execution flows related to the issue
+2. `gitnexus_context({name: "<suspect function>"})` — see all callers, callees, and process participation
+3. `READ gitnexus://repo/pr-reviewer/process/{processName}` — trace the full execution flow step by step
+4. For regressions: `gitnexus_detect_changes({scope: "compare", base_ref: "main"})` — see what your branch changed
 
-### Renaming
+## When Refactoring
 
-- Use `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` — never find-and-replace
+- **Renaming**: MUST use `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` first. Review the preview — graph edits are safe, text_search edits need manual review. Then run with `dry_run: false`.
+- **Extracting/Splitting**: MUST run `gitnexus_context({name: "target"})` to see all incoming/outgoing refs, then `gitnexus_impact({target: "target", direction: "upstream"})` to find all external callers before moving code.
+- After any refactor: run `gitnexus_detect_changes({scope: "all"})` to verify only expected files changed.
 
-### Tools
+## Never Do
 
-| Tool | Use |
-|------|-----|
-| `gitnexus_query` | Find code by concept |
-| `gitnexus_context` | 360-degree view of one symbol |
-| `gitnexus_impact` | Blast radius before editing |
-| `gitnexus_detect_changes` | Pre-commit scope check |
-| `gitnexus_rename` | Safe multi-file rename |
+- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
+- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
 
-### CLI
+## Tools Quick Reference
+
+| Tool | When to use | Command |
+|------|-------------|---------|
+| `query` | Find code by concept | `gitnexus_query({query: "auth validation"})` |
+| `context` | 360-degree view of one symbol | `gitnexus_context({name: "validateUser"})` |
+| `impact` | Blast radius before editing | `gitnexus_impact({target: "X", direction: "upstream"})` |
+| `detect_changes` | Pre-commit scope check | `gitnexus_detect_changes({scope: "staged"})` |
+| `rename` | Safe multi-file rename | `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` |
+| `cypher` | Custom graph queries | `gitnexus_cypher({query: "MATCH ..."})` |
+
+## Impact Risk Levels
+
+| Depth | Meaning | Action |
+|-------|---------|--------|
+| d=1 | WILL BREAK — direct callers/importers | MUST update these |
+| d=2 | LIKELY AFFECTED — indirect deps | Should test |
+| d=3 | MAY NEED TESTING — transitive | Test if critical path |
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/pr-reviewer/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/pr-reviewer/clusters` | All functional areas |
+| `gitnexus://repo/pr-reviewer/processes` | All execution flows |
+| `gitnexus://repo/pr-reviewer/process/{name}` | Step-by-step execution trace |
+
+## Self-Check Before Finishing
+
+Before completing any code modification task, verify:
+1. `gitnexus_impact` was run for all modified symbols
+2. No HIGH/CRITICAL risk warnings were ignored
+3. `gitnexus_detect_changes()` confirms changes match expected scope
+4. All d=1 (WILL BREAK) dependents were updated
+
+## CLI
 
 - Re-index: `npx gitnexus analyze`
 - Check freshness: `npx gitnexus status`
+- Generate docs: `npx gitnexus wiki`
+
 <!-- gitnexus:end -->

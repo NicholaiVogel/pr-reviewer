@@ -63,6 +63,14 @@ pub struct ReviewComment {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueComment {
+    pub id: u64,
+    pub body: String,
+    pub user: User,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateReviewComment {
     pub path: String,
