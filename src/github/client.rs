@@ -12,6 +12,7 @@ use crate::github::types::{
 
 #[derive(Debug, Clone, Default)]
 pub struct RateState {
+    pub limit: Option<u32>,
     pub remaining: Option<u32>,
     pub reset_epoch: Option<u64>,
 }
@@ -155,18 +156,12 @@ impl GitHubClient {
         Ok(resp.text().await.context("failed to read diff response")?)
     }
 
-    pub async fn get_pr_files(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u64,
-    ) -> Result<Vec<PrFile>> {
+    pub async fn get_pr_files(&self, owner: &str, repo: &str, number: u64) -> Result<Vec<PrFile>> {
         let mut all_files = Vec::new();
         let mut page = 1u32;
         loop {
-            let path = format!(
-                "/repos/{owner}/{repo}/pulls/{number}/files?per_page=100&page={page}"
-            );
+            let path =
+                format!("/repos/{owner}/{repo}/pulls/{number}/files?per_page=100&page={page}");
             let resp = self
                 .request(Method::GET, &path)
                 .send()
@@ -504,6 +499,10 @@ impl GitHubClient {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        state.limit = headers
+            .get("x-ratelimit-limit")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u32>().ok());
         state.remaining = headers
             .get("x-ratelimit-remaining")
             .and_then(|v| v.to_str().ok())

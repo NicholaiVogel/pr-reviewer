@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use rand::Rng;
+use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -40,6 +42,8 @@ pub async fn start(
 
     let pid_file = AppConfig::pid_file()?;
     write_pid(&pid_file)?;
+    let started_at = chrono::Utc::now().to_rfc3339();
+    db.set_daemon_started(&started_at).await?;
 
     let mut engine = ReviewEngine::new(Arc::new(config.clone()), github.clone(), db.clone());
     engine.init().await;
@@ -180,10 +184,15 @@ pub async fn start(
 
         while workers.try_join_next().is_some() {}
 
-        let rate_remaining = github.rate_state().remaining.map(i64::from);
+        let rate_state = github.rate_state();
+        let rate_limit_total = rate_state.limit.map(i64::from);
+        let rate_remaining = rate_state.remaining.map(i64::from);
+        let rate_reset_epoch = rate_state.reset_epoch.map(|epoch| epoch as i64);
         db.set_daemon_status(
             &chrono::Utc::now().to_rfc3339(),
+            rate_limit_total,
             rate_remaining,
+            rate_reset_epoch,
             workers.len() as i64,
         )
         .await?;
@@ -231,24 +240,142 @@ pub fn stop() -> Result<()> {
     Ok(())
 }
 
-pub async fn status(db: &Database) -> Result<String> {
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RateLimitSnapshot {
+    pub limit: Option<i64>,
+    pub remaining: Option<i64>,
+    pub reset_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DaemonSnapshot {
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub started_at: Option<String>,
+    pub uptime_secs: Option<i64>,
+    pub last_heartbeat_at: Option<String>,
+    pub heartbeat_age_secs: Option<i64>,
+    pub active_workers: i64,
+    pub queue_depth: i64,
+    pub watched_repos: Vec<String>,
+    pub rate_limit: RateLimitSnapshot,
+}
+
+pub async fn collect_status(db: &Database, config: &AppConfig) -> Result<DaemonSnapshot> {
     let pid_file = AppConfig::pid_file()?;
-    let running = match read_pid(&pid_file) {
-        Ok(pid) => is_pid_alive(pid as i32),
-        Err(_) => false,
-    };
+    let pid = read_pid(&pid_file).ok();
+    let running = pid.is_some_and(|pid| is_pid_alive(pid as i32));
 
     let daemon = db.get_daemon_status().await?;
+    let queue_depth = db.get_queue_depth().await?;
+    let now = chrono::Utc::now();
 
+    let uptime_secs = if running {
+        daemon
+            .started_at
+            .as_deref()
+            .and_then(|started| parse_rfc3339_to_utc(started))
+            .map(|started| (now - started).num_seconds().max(0))
+    } else {
+        None
+    };
+
+    let heartbeat_age_secs = daemon
+        .last_poll_at
+        .as_deref()
+        .and_then(parse_rfc3339_to_utc)
+        .map(|last| (now - last).num_seconds().max(0));
+
+    let reset_at = daemon
+        .rate_reset_epoch
+        .and_then(|epoch| chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0))
+        .map(|dt| dt.to_rfc3339());
+
+    Ok(DaemonSnapshot {
+        running,
+        pid,
+        started_at: daemon.started_at,
+        uptime_secs,
+        last_heartbeat_at: daemon.last_poll_at,
+        heartbeat_age_secs,
+        active_workers: daemon.active_reviews,
+        queue_depth,
+        watched_repos: config.repos.iter().map(|repo| repo.full_name()).collect(),
+        rate_limit: RateLimitSnapshot {
+            limit: daemon.rate_limit_total,
+            remaining: daemon.rate_remaining,
+            reset_at,
+        },
+    })
+}
+
+pub fn format_status(snapshot: &DaemonSnapshot) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "Daemon running: {}\n",
-        if running { "yes" } else { "no" }
-    ));
-    out.push_str(&format!("Last poll: {:?}\n", daemon.last_poll_at));
-    out.push_str(&format!("Rate remaining: {:?}\n", daemon.rate_remaining));
-    out.push_str(&format!("Active reviews: {}\n", daemon.active_reviews));
-    Ok(out)
+    let _ = writeln!(out, "pr-reviewer {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(out, "self-hosted PR review daemon");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Status");
+    if snapshot.running {
+        let _ = writeln!(out, "  running");
+    } else {
+        let _ = writeln!(out, "  stopped");
+    }
+    if let Some(pid) = snapshot.pid {
+        let _ = writeln!(out, "  pid: {pid}");
+    }
+    if let Some(started_at) = snapshot.started_at.as_deref() {
+        let _ = writeln!(out, "  started: {started_at}");
+    }
+    if let Some(uptime_secs) = snapshot.uptime_secs {
+        let _ = writeln!(out, "  uptime: {}", format_duration(uptime_secs));
+    }
+    if let Some(last_heartbeat_at) = snapshot.last_heartbeat_at.as_deref() {
+        if let Some(age) = snapshot.heartbeat_age_secs {
+            let _ = writeln!(
+                out,
+                "  last heartbeat: {last_heartbeat_at} ({})",
+                format_duration(age)
+            );
+        } else {
+            let _ = writeln!(out, "  last heartbeat: {last_heartbeat_at}");
+        }
+    } else {
+        let _ = writeln!(out, "  last heartbeat: never");
+    }
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Queue");
+    let _ = writeln!(out, "  depth: {}", snapshot.queue_depth);
+    let _ = writeln!(out, "  active workers: {}", snapshot.active_workers);
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Rate limit");
+    match (snapshot.rate_limit.remaining, snapshot.rate_limit.limit) {
+        (Some(remaining), Some(limit)) => {
+            let _ = writeln!(out, "  remaining: {remaining} / {limit}");
+        }
+        (Some(remaining), None) => {
+            let _ = writeln!(out, "  remaining: {remaining}");
+        }
+        _ => {
+            let _ = writeln!(out, "  remaining: unknown");
+        }
+    }
+    if let Some(reset_at) = snapshot.rate_limit.reset_at.as_deref() {
+        let _ = writeln!(out, "  resets at: {reset_at}");
+    }
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Watched repos ({})", snapshot.watched_repos.len());
+    if snapshot.watched_repos.is_empty() {
+        let _ = writeln!(out, "  (none)");
+    } else {
+        for repo in &snapshot.watched_repos {
+            let _ = writeln!(out, "  - {repo}");
+        }
+    }
+
+    out
 }
 
 fn write_pid(path: &PathBuf) -> Result<()> {
@@ -267,6 +394,63 @@ fn read_pid(path: &PathBuf) -> Result<u32> {
     data.trim()
         .parse::<u32>()
         .map_err(|e| anyhow!("invalid pid file {}: {e}", path.display()))
+}
+
+fn parse_rfc3339_to_utc(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn format_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_status_includes_key_fields() {
+        let snapshot = DaemonSnapshot {
+            running: true,
+            pid: Some(1234),
+            started_at: Some("2026-03-23T06:00:00Z".to_string()),
+            uptime_secs: Some(3723),
+            last_heartbeat_at: Some("2026-03-23T06:14:30Z".to_string()),
+            heartbeat_age_secs: Some(30),
+            active_workers: 2,
+            queue_depth: 5,
+            watched_repos: vec!["owner/repo".to_string()],
+            rate_limit: RateLimitSnapshot {
+                limit: Some(5000),
+                remaining: Some(4321),
+                reset_at: Some("2026-03-23T07:00:00Z".to_string()),
+            },
+        };
+
+        let out = format_status(&snapshot);
+
+        assert!(out.contains("pr-reviewer"));
+        assert!(out.contains("running"));
+        assert!(out.contains("pid: 1234"));
+        assert!(out.contains("uptime: 1h 02m 03s"));
+        assert!(out.contains("last heartbeat: 2026-03-23T06:14:30Z (30s)"));
+        assert!(out.contains("depth: 5"));
+        assert!(out.contains("remaining: 4321 / 5000"));
+        assert!(out.contains("owner/repo"));
+    }
 }
 
 fn remove_pid(path: &PathBuf) -> Result<()> {

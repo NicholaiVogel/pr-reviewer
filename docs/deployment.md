@@ -164,10 +164,13 @@ pr-reviewer stats --since 2026-03-01
 
 `pr-reviewer status` shows:
 
-- Whether the daemon process is running (PID file presence + process check)
-- Last poll timestamp and next scheduled poll
-- GitHub API rate limit remaining and reset time
-- Current backoff interval
+- Whether the daemon process is running
+- Uptime, start time, and last heartbeat
+- The current review queue depth and active worker count
+- Watched repos from config
+- The last known GitHub rate limit snapshot
+
+Add `--json` when you want the same snapshot in a machine-readable form.
 
 Things to watch for in logs:
 
