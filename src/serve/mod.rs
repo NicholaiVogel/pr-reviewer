@@ -45,10 +45,10 @@ enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
-            ApiError::NotFound(m)  => (StatusCode::NOT_FOUND, m),
+            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::BadRequest(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
-            ApiError::Internal(e)  => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            ApiError::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
         (status, Json(serde_json::json!({ "error": msg }))).into_response()
     }
@@ -102,9 +102,7 @@ async fn list_repos(State(state): State<SharedConfig>) -> ApiResult<impl IntoRes
 
 fn validate_path_segment(seg: &str) -> Result<(), ApiError> {
     if seg.contains('/') || seg.contains('\\') || seg.contains("..") {
-        return Err(ApiError::BadRequest(format!(
-            "invalid path segment: {seg}"
-        )));
+        return Err(ApiError::BadRequest(format!("invalid path segment: {seg}")));
     }
     Ok(())
 }
@@ -138,9 +136,16 @@ async fn put_workflow(
     validate_path_segment(&name)?;
 
     // CSRF: require custom header on mutating requests.
-    match headers.get("x-requested-with").and_then(|v| v.to_str().ok()) {
+    match headers
+        .get("x-requested-with")
+        .and_then(|v| v.to_str().ok())
+    {
         Some("pr-reviewer") => {}
-        _ => return Err(ApiError::Forbidden("missing or invalid X-Requested-With header".into())),
+        _ => {
+            return Err(ApiError::Forbidden(
+                "missing or invalid X-Requested-With header".into(),
+            ))
+        }
     }
 
     validate_workflow(&steps)?;
@@ -184,7 +189,10 @@ fn validate_workflow(steps: &[WorkflowStep]) -> Result<(), ApiError> {
             )));
         }
         if !seen_ids.insert(step.id.clone()) {
-            return Err(ApiError::BadRequest(format!("duplicate step id: {}", step.id)));
+            return Err(ApiError::BadRequest(format!(
+                "duplicate step id: {}",
+                step.id
+            )));
         }
 
         if step.name.is_empty() {

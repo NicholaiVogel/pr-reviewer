@@ -1,9 +1,7 @@
 use anyhow::Result;
 
 use crate::github::client::GitHubClient;
-use crate::github::types::{
-    CreateReviewRequest, IssueComment, PullRequestReview, ReviewComment,
-};
+use crate::github::types::{CreateReviewRequest, IssueComment, PullRequestReview, ReviewComment};
 
 pub async fn create_review(
     client: &GitHubClient,

@@ -57,7 +57,10 @@ enum Commands {
         #[arg(long)]
         model: Option<String>,
     },
-    Status,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
     Logs {
         #[arg(long)]
         repo: Option<String>,
@@ -346,18 +349,15 @@ async fn main() -> Result<()> {
                 result.comments_posted
             );
         }
-        Commands::Status => {
+        Commands::Status { json } => {
             let cfg = AppConfig::load_or_default()?;
             let db = Database::new(AppConfig::db_file()?).await?;
-            let gh = github_client_from_config(&cfg).await?;
-            let status = daemon::status(&db).await?;
-            let rate = gh.rate_state();
-            println!("{status}");
-            println!(
-                "Current rate: remaining={:?}, reset_epoch={:?}",
-                rate.remaining, rate.reset_epoch
-            );
-            println!("Configured repos: {}", cfg.repos.len());
+            let status = daemon::collect_status(&db, &cfg).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!("{}", daemon::format_status(&status));
+            }
         }
         Commands::Logs {
             repo,

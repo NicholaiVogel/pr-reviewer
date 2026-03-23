@@ -101,10 +101,7 @@ pub async fn token_status(config: &AppConfig) -> Option<(TokenSource, String)> {
         } else {
             "machine-bound"
         };
-        return Some((
-            TokenSource::Encrypted,
-            format!("[{pp_status}]"),
-        ));
+        return Some((TokenSource::Encrypted, format!("[{pp_status}]")));
     }
 
     // Plain text

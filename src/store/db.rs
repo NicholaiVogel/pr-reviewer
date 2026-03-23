@@ -71,8 +71,11 @@ pub struct UsageStats {
 
 #[derive(Debug, Clone, Default)]
 pub struct DaemonStatus {
+    pub started_at: Option<String>,
     pub last_poll_at: Option<String>,
+    pub rate_limit_total: Option<i64>,
     pub rate_remaining: Option<i64>,
+    pub rate_reset_epoch: Option<i64>,
     pub active_reviews: i64,
 }
 
@@ -141,13 +144,13 @@ impl Database {
 
                 CREATE TABLE IF NOT EXISTS daemon_state (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                    started_at TEXT,
                     last_poll_at TEXT,
+                    rate_limit_total INTEGER,
                     rate_remaining INTEGER,
+                    rate_reset_epoch INTEGER,
                     active_reviews INTEGER DEFAULT 0
                 );
-
-                INSERT OR IGNORE INTO daemon_state (id, last_poll_at, rate_remaining, active_reviews)
-                VALUES (1, NULL, NULL, 0);
                 "#,
             )?;
 
@@ -156,9 +159,20 @@ impl Database {
                 conn.execute("INSERT INTO schema_version(version) VALUES (1)", [])?;
             }
 
+            // Column migrations must run BEFORE the seed INSERT below,
+            // because existing databases have daemon_state without the new columns.
+            // SQLite's OR IGNORE only suppresses constraint violations, not schema errors.
             ensure_column_exists(&conn, "review_log", "gitnexus_used", "INTEGER")?;
             ensure_column_exists(&conn, "review_log", "gitnexus_latency_ms", "INTEGER")?;
             ensure_column_exists(&conn, "review_log", "gitnexus_hit_count", "INTEGER")?;
+            ensure_column_exists(&conn, "daemon_state", "started_at", "TEXT")?;
+            ensure_column_exists(&conn, "daemon_state", "rate_limit_total", "INTEGER")?;
+            ensure_column_exists(&conn, "daemon_state", "rate_reset_epoch", "INTEGER")?;
+
+            conn.execute(
+                "INSERT OR IGNORE INTO daemon_state (id, started_at, last_poll_at, rate_limit_total, rate_remaining, rate_reset_epoch, active_reviews) VALUES (1, NULL, NULL, NULL, NULL, NULL, 0)",
+                [],
+            )?;
 
             Ok::<(), anyhow::Error>(())
         })
@@ -529,10 +543,29 @@ impl Database {
         .await?
     }
 
+    pub async fn set_daemon_started(&self, started_at: &str) -> Result<()> {
+        let path = self.path.clone();
+        let started_at = started_at.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(&path)?;
+            conn.execute(
+                "UPDATE daemon_state SET started_at=?1, last_poll_at=NULL, rate_limit_total=NULL, rate_remaining=NULL, rate_reset_epoch=NULL, active_reviews=0 WHERE id=1",
+                params![started_at],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+
+        Ok(())
+    }
+
     pub async fn set_daemon_status(
         &self,
         last_poll_at: &str,
+        rate_limit_total: Option<i64>,
         rate_remaining: Option<i64>,
+        rate_reset_epoch: Option<i64>,
         active_reviews: i64,
     ) -> Result<()> {
         let path = self.path.clone();
@@ -541,8 +574,8 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_conn(&path)?;
             conn.execute(
-                "UPDATE daemon_state SET last_poll_at=?1, rate_remaining=?2, active_reviews=?3 WHERE id=1",
-                params![last_poll_at, rate_remaining, active_reviews],
+                "UPDATE daemon_state SET last_poll_at=?1, rate_limit_total=?2, rate_remaining=?3, rate_reset_epoch=?4, active_reviews=?5 WHERE id=1",
+                params![last_poll_at, rate_limit_total, rate_remaining, rate_reset_epoch, active_reviews],
             )?;
             Ok::<(), anyhow::Error>(())
         })
@@ -557,17 +590,35 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_conn(&path)?;
             let row = conn.query_row(
-                "SELECT last_poll_at, rate_remaining, active_reviews FROM daemon_state WHERE id=1",
+                "SELECT started_at, last_poll_at, rate_limit_total, rate_remaining, rate_reset_epoch, active_reviews FROM daemon_state WHERE id=1",
                 [],
                 |r| {
                     Ok(DaemonStatus {
-                        last_poll_at: r.get(0)?,
-                        rate_remaining: r.get(1)?,
-                        active_reviews: r.get(2)?,
+                        started_at: r.get(0)?,
+                        last_poll_at: r.get(1)?,
+                        rate_limit_total: r.get(2)?,
+                        rate_remaining: r.get(3)?,
+                        rate_reset_epoch: r.get(4)?,
+                        active_reviews: r.get(5)?,
                     })
                 },
             )?;
             Ok::<DaemonStatus, anyhow::Error>(row)
+        })
+        .await?
+    }
+
+    pub async fn get_claimed_reviews(&self) -> Result<i64> {
+        let path = self.path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(&path)?;
+            let depth = conn.query_row(
+                "SELECT COUNT(*) FROM review_log WHERE status='claimed'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok::<i64, anyhow::Error>(depth)
         })
         .await?
     }
@@ -761,5 +812,37 @@ mod tests {
         assert!(columns.contains(&"gitnexus_used".to_string()));
         assert!(columns.contains(&"gitnexus_latency_ms".to_string()));
         assert!(columns.contains(&"gitnexus_hit_count".to_string()));
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(daemon_state)")
+            .expect("prepare daemon pragma");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("query daemon table_info");
+        let daemon_columns: Vec<String> = rows.map(|r| r.expect("col")).collect();
+
+        assert!(daemon_columns.contains(&"started_at".to_string()));
+        assert!(daemon_columns.contains(&"rate_limit_total".to_string()));
+        assert!(daemon_columns.contains(&"rate_reset_epoch".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_claimed_reviews_counts_correctly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let claim = ReviewClaim {
+            dedupe_key: "depth".to_string(),
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            sha: "abc".to_string(),
+            harness: "codex".to_string(),
+            model: None,
+        };
+
+        assert!(db.claim_review(claim).await.expect("claim"));
+        assert_eq!(db.get_claimed_reviews().await.expect("depth"), 1);
     }
 }

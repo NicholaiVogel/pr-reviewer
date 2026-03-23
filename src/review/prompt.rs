@@ -12,9 +12,7 @@ pub fn build_review_prompt(
 ) -> String {
     let mut prompt = String::new();
 
-    prompt.push_str(
-        "Review this pull request. Be discerning. Use good judgment.\n\n",
-    );
+    prompt.push_str("Review this pull request. Be discerning. Use good judgment.\n\n");
     prompt.push_str(
         "Focus on: bugs, security flaws, data corruption, race conditions, logic mistakes, breaking changes, and patterns that diverge from codebase conventions. Do not flag style-only issues unless they conceal a correctness problem.\n\n",
     );
@@ -49,7 +47,11 @@ pub fn build_review_prompt(
     }
 
     if let Some(ui_files) = ui_files_changed {
-        let file_list: String = ui_files.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ");
+        let file_list: String = ui_files
+            .iter()
+            .map(|f| format!("`{f}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
         prompt.push_str(&format!(
             "{}. This PR modifies UI files: {}. If the PR description does not reference screenshots or visual previews, set ui_screenshot_needed to true and note this in your summary.\n",
             instruction_num, file_list,
@@ -63,7 +65,8 @@ pub fn build_review_prompt(
 
     prompt.push_str("Output a JSON object in a fenced block tagged exactly `pr-review-json`.\n");
     prompt.push_str("Schema:\n");
-    prompt.push_str("- summary: string (first line must identify this as an automated bot review)\n");
+    prompt
+        .push_str("- summary: string (first line must identify this as an automated bot review)\n");
     prompt.push_str("- verdict: one of [\"no_issues\", \"comment\", \"request_changes\"]\n");
     prompt.push_str("  - \"no_issues\": nothing worth flagging, ready for human review\n");
     prompt.push_str("  - \"comment\": found issues worth discussing but not blocking\n");

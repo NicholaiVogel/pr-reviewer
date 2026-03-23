@@ -268,19 +268,11 @@ impl ReviewEngine {
         sha: &str,
         has_prior_bot_review: bool,
     ) -> String {
-        let fallback = build_in_progress_comment_fallback(
-            pr_author,
-            pr_title,
-            sha,
-            has_prior_bot_review,
-        );
+        let fallback =
+            build_in_progress_comment_fallback(pr_author, pr_title, sha, has_prior_bot_review);
 
-        let prompt = build_in_progress_comment_prompt(
-            pr_author,
-            pr_title,
-            sha,
-            has_prior_bot_review,
-        );
+        let prompt =
+            build_in_progress_comment_prompt(pr_author, pr_title, sha, has_prior_bot_review);
 
         let temp = match tempdir() {
             Ok(dir) => dir,
@@ -577,13 +569,12 @@ impl ReviewEngine {
 
         // Detect UI file changes and check for screenshots in PR body
         let ui_files = detect_ui_files(&changed_files);
-        let ui_files_for_prompt = if !ui_files.is_empty()
-            && !has_screenshot_references(pr_data.body.as_deref())
-        {
-            Some(ui_files)
-        } else {
-            None
-        };
+        let ui_files_for_prompt =
+            if !ui_files.is_empty() && !has_screenshot_references(pr_data.body.as_deref()) {
+                Some(ui_files)
+            } else {
+                None
+            };
 
         let prompt = build_review_prompt(
             repo_cfg,
@@ -634,8 +625,7 @@ impl ReviewEngine {
                 verdict = review.verdict;
                 body.push_str(&format!(
                     "\n\n**Confidence:** {} - {}\n",
-                    review.confidence.level,
-                    review.confidence.justification,
+                    review.confidence.level, review.confidence.justification,
                 ));
 
                 if review.ui_screenshot_needed {
@@ -1015,7 +1005,9 @@ fn strip_confidence_blocks(body: &str) -> String {
         }
         // Exit confidence block
         if in_confidence_block {
-            if line.starts_with("```") || (line.starts_with("### ") && !line.starts_with("### Confidence:")) {
+            if line.starts_with("```")
+                || (line.starts_with("### ") && !line.starts_with("### Confidence:"))
+            {
                 in_confidence_block = false;
                 if line.starts_with("### ") {
                     out.push_str(line);
@@ -1124,12 +1116,7 @@ fn build_prior_reviews_context(
 
         out.push_str("### PR Conversation\n");
         for comment in tail {
-            let body_preview: String = comment
-                .body
-                .lines()
-                .take(15)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let body_preview: String = comment.body.lines().take(15).collect::<Vec<_>>().join("\n");
             out.push_str(&format!(
                 "- (@{}, {}): {}\n",
                 comment.user.login,
@@ -1185,17 +1172,17 @@ fn build_addressed_findings(
         let mut sorted: Vec<&&ReviewComment> = comments.iter().collect();
         sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
-        let bot_finding = sorted.iter().find(|c| {
-            login_matches_bot(&c.user.login, bot_name, bot_alias)
-        });
+        let bot_finding = sorted
+            .iter()
+            .find(|c| login_matches_bot(&c.user.login, bot_name, bot_alias));
 
         let Some(finding) = bot_finding else {
             continue;
         };
 
-        let human_replied = sorted.iter().any(|c| {
-            !login_matches_bot(&c.user.login, bot_name, bot_alias)
-        });
+        let human_replied = sorted
+            .iter()
+            .any(|c| !login_matches_bot(&c.user.login, bot_name, bot_alias));
 
         if !human_replied {
             continue;
@@ -1203,8 +1190,7 @@ fn build_addressed_findings(
 
         // Determine status
         let human_dismissed = sorted.iter().any(|c| {
-            !login_matches_bot(&c.user.login, bot_name, bot_alias)
-                && has_dismissal_signal(&c.body)
+            !login_matches_bot(&c.user.login, bot_name, bot_alias) && has_dismissal_signal(&c.body)
         });
 
         let file_in_diff = changed_files.contains(finding.path.as_str());
@@ -1823,23 +1809,15 @@ mod tests {
 
     #[test]
     fn fallback_comment_sanitizes_double_quotes_in_title() {
-        let message = build_in_progress_comment_fallback(
-            "contributor",
-            "fix \"the\" bug",
-            "527fae59",
-            false,
-        );
+        let message =
+            build_in_progress_comment_fallback("contributor", "fix \"the\" bug", "527fae59", false);
         assert!(message.contains("`fix 'the' bug`"));
     }
 
     #[test]
     fn fallback_comment_sanitizes_backticks_in_title() {
-        let message = build_in_progress_comment_fallback(
-            "contributor",
-            "fix `foo` crash",
-            "527fae59",
-            false,
-        );
+        let message =
+            build_in_progress_comment_fallback("contributor", "fix `foo` crash", "527fae59", false);
         assert!(message.contains("`fix 'foo' crash`"));
     }
 
