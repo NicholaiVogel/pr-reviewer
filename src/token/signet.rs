@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
-use tokio::process::Command;
 use std::process::Stdio;
+use tokio::process::Command;
 
 const SECRET_NAME: &str = "pr-reviewer/github-token";
 

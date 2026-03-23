@@ -269,11 +269,7 @@ pub fn mask_token(token: &str) -> String {
     if token.len() <= 8 {
         return "*".repeat(token.len());
     }
-    format!(
-        "{}...{}",
-        &token[..4],
-        &token[token.len() - 4..]
-    )
+    format!("{}...{}", &token[..4], &token[token.len() - 4..])
 }
 
 #[cfg(test)]

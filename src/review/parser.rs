@@ -373,8 +373,7 @@ mod tests {
 
     #[test]
     fn parses_reply_json_block() {
-        let input =
-            "```pr-review-reply-json\n{\"reply\":\"Thanks, verified fix.\"}\n```";
+        let input = "```pr-review-reply-json\n{\"reply\":\"Thanks, verified fix.\"}\n```";
         let parsed = parse_reply_output(input, "").expect("parse output");
         match parsed {
             ReplyParseOutcome::Structured(reply) => {

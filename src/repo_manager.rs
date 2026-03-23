@@ -76,7 +76,10 @@ pub async fn ensure_cloned(owner: &str, name: &str, token: &str) -> Result<PathB
         // Pass auth via env vars instead of -c args to avoid leaking token in /proc/pid/cmdline
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "http.extraHeader")
-        .env("GIT_CONFIG_VALUE_0", format!("Authorization: Bearer {token}"))
+        .env(
+            "GIT_CONFIG_VALUE_0",
+            format!("Authorization: Bearer {token}"),
+        )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -90,7 +93,12 @@ pub async fn ensure_cloned(owner: &str, name: &str, token: &str) -> Result<PathB
 
     // Strip the auth header from the stored remote URL to avoid token leakage
     let _ = Command::new("git")
-        .args(["remote", "set-url", "origin", &format!("https://github.com/{owner}/{name}.git")])
+        .args([
+            "remote",
+            "set-url",
+            "origin",
+            &format!("https://github.com/{owner}/{name}.git"),
+        ])
         .current_dir(&path)
         .output()
         .await;
@@ -103,23 +111,18 @@ pub async fn ensure_cloned(owner: &str, name: &str, token: &str) -> Result<PathB
 /// Safe to call on managed clones (never user-edited).
 pub async fn fetch_latest(repo_path: &Path, token: &str) -> Result<()> {
     if !repo_path.join(".git").exists() {
-        return Err(anyhow!(
-            "not a git repository: {}",
-            repo_path.display()
-        ));
+        return Err(anyhow!("not a git repository: {}", repo_path.display()));
     }
 
     let fetch = Command::new("git")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "fetch",
-            "origin",
-        ])
+        .args(["-c", "core.hooksPath=/dev/null", "fetch", "origin"])
         .current_dir(repo_path)
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "http.extraHeader")
-        .env("GIT_CONFIG_VALUE_0", format!("Authorization: Bearer {token}"))
+        .env(
+            "GIT_CONFIG_VALUE_0",
+            format!("Authorization: Bearer {token}"),
+        )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()

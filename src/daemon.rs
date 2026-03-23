@@ -64,11 +64,12 @@ pub async fn start(
 
         let mut changes_detected = false;
         let rate_state = github.rate_state();
+        let rate_limit_budget = rate_state.limit.unwrap_or(RATE_LIMIT_TOTAL);
         let remaining = rate_state.remaining;
         let reset_epoch = rate_state.reset_epoch;
 
         if let Some(rem) = remaining {
-            if rem <= (RATE_LIMIT_TOTAL as f32 * 0.05) as u32 {
+            if rem <= (rate_limit_budget as f32 * 0.05) as u32 {
                 if let Some(reset) = reset_epoch {
                     let now = now_epoch();
                     if reset > now {
@@ -208,7 +209,7 @@ pub async fn start(
         }
 
         if let Some(rem) = remaining {
-            if rem <= (RATE_LIMIT_TOTAL as f32 * 0.20) as u32 {
+            if rem <= (rate_limit_budget as f32 * 0.20) as u32 {
                 current_interval = (current_interval * 2).min(max_interval);
             }
         }
