@@ -138,8 +138,25 @@ impl ReviewEngine {
         };
 
         if options.force {
-            self.db.delete_review_claim(&dedupe).await?;
-            tracing::info!(dedupe_key = %dedupe, "force flag set, cleared existing dedupe entry");
+            match self.db.delete_review_claim(&dedupe).await? {
+                Some(ref status) if status == "claimed" => {
+                    tracing::warn!(
+                        dedupe_key = %dedupe,
+                        "force flag deleted an in-flight 'claimed' entry — if the daemon is \
+                         mid-pipeline for this PR, its complete_review/fail_review will silently \
+                         no-op, leaving the new claim stuck until the next stale sweep"
+                    );
+                }
+                Some(_) => {
+                    tracing::info!(dedupe_key = %dedupe, "force flag cleared existing failed claim");
+                }
+                None => {
+                    tracing::info!(
+                        dedupe_key = %dedupe,
+                        "force flag set but no deletable claim found (completed entries are preserved)"
+                    );
+                }
+            }
         }
 
         if !self.db.claim_review(claim).await? {

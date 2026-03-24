@@ -234,14 +234,21 @@ impl Database {
         .await
     }
 
-    pub async fn delete_review_claim(&self, dedupe_key: &str) -> Result<bool> {
+    /// Deletes a non-completed review claim to allow re-review.
+    /// Only removes rows with status 'claimed' or 'failed' — completed entries are left intact
+    /// so audit history is preserved and the GitHub-side duplicate guard still fires.
+    /// Returns the status of the deleted row, or None if nothing was deleted.
+    pub async fn delete_review_claim(&self, dedupe_key: &str) -> Result<Option<String>> {
         let key = dedupe_key.to_string();
         self.run(move |conn| {
-            let changed = conn.execute(
-                "DELETE FROM review_log WHERE dedupe_key = ?1",
-                params![key],
-            )?;
-            Ok(changed > 0)
+            let status = conn
+                .query_row(
+                    "DELETE FROM review_log WHERE dedupe_key = ?1 AND status IN ('claimed', 'failed') RETURNING status",
+                    params![key],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(status)
         })
         .await
     }
