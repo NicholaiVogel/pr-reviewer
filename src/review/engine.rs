@@ -151,9 +151,11 @@ impl ReviewEngine {
                     tracing::info!(dedupe_key = %dedupe, "force flag cleared existing failed claim");
                 }
                 None => {
-                    tracing::info!(
+                    tracing::warn!(
                         dedupe_key = %dedupe,
-                        "force flag set but no deletable claim found (completed entries are preserved)"
+                        "--force had no effect: no stale or failed claim found; \
+                         if this PR+SHA was already successfully reviewed the completed \
+                         entry is preserved and cannot be overridden with --force"
                     );
                 }
             }

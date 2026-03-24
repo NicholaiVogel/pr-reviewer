@@ -241,14 +241,27 @@ impl Database {
     pub async fn delete_review_claim(&self, dedupe_key: &str) -> Result<Option<String>> {
         let key = dedupe_key.to_string();
         self.run(move |conn| {
-            let status = conn
+            // SELECT before DELETE so we can inspect the status without relying on
+            // RETURNING (requires SQLite >= 3.35.0). The dedicated DB thread serializes
+            // all operations so nothing can race between the two statements.
+            let status: Option<String> = conn
                 .query_row(
-                    "DELETE FROM review_log WHERE dedupe_key = ?1 AND status IN ('claimed', 'failed') RETURNING status",
+                    "SELECT status FROM review_log WHERE dedupe_key = ?1",
                     params![key],
-                    |r| r.get::<_, String>(0),
+                    |r| r.get(0),
                 )
                 .optional()?;
-            Ok(status)
+
+            let deletable = matches!(status.as_deref(), Some("claimed") | Some("failed"));
+            if deletable {
+                conn.execute(
+                    "DELETE FROM review_log WHERE dedupe_key = ?1",
+                    params![key],
+                )?;
+                Ok(status)
+            } else {
+                Ok(None)
+            }
         })
         .await
     }
@@ -854,6 +867,82 @@ mod tests {
         assert!(daemon_columns.contains(&"started_at".to_string()));
         assert!(daemon_columns.contains(&"rate_limit_total".to_string()));
         assert!(daemon_columns.contains(&"rate_reset_epoch".to_string()));
+    }
+
+    #[tokio::test]
+    async fn delete_review_claim_clears_claimed_and_allows_reclaim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let claim = ReviewClaim {
+            dedupe_key: "force-claimed".to_string(),
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            sha: "abc".to_string(),
+            harness: "codex".to_string(),
+            model: None,
+        };
+
+        assert!(db.claim_review(claim.clone()).await.expect("first claim"));
+        // second claim is blocked
+        assert!(!db.claim_review(claim.clone()).await.expect("blocked"));
+
+        let deleted = db
+            .delete_review_claim("force-claimed")
+            .await
+            .expect("delete");
+        assert_eq!(deleted.as_deref(), Some("claimed"));
+
+        // after deletion, claiming again succeeds
+        assert!(db.claim_review(claim).await.expect("reclaim"));
+    }
+
+    #[tokio::test]
+    async fn delete_review_claim_preserves_completed_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let claim = ReviewClaim {
+            dedupe_key: "force-completed".to_string(),
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            sha: "abc".to_string(),
+            harness: "codex".to_string(),
+            model: None,
+        };
+
+        assert!(db.claim_review(claim.clone()).await.expect("claim"));
+        db.complete_review("force-completed", 3, Some("COMMENT"), 5.0, 2, 100, None, None, None)
+            .await
+            .expect("complete");
+
+        // --force cannot delete a completed entry
+        let deleted = db
+            .delete_review_claim("force-completed")
+            .await
+            .expect("delete attempt");
+        assert!(deleted.is_none());
+
+        // completed entry still blocks a new claim
+        assert!(!db.claim_review(claim).await.expect("still blocked"));
+    }
+
+    #[tokio::test]
+    async fn delete_review_claim_returns_none_for_missing_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let result = db
+            .delete_review_claim("nonexistent-key")
+            .await
+            .expect("delete");
+        assert!(result.is_none());
     }
 
     #[tokio::test]

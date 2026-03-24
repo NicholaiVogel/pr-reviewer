@@ -56,7 +56,8 @@ enum Commands {
         harness: Option<HarnessKind>,
         #[arg(long)]
         model: Option<String>,
-        /// Bypass dedupe check and force a new review even if one exists for this SHA
+        /// Bypass the dedupe check by clearing any stale or failed claim for this SHA.
+        /// Has no effect on completed reviews — those entries are preserved.
         #[arg(long)]
         force: bool,
     },
