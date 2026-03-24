@@ -56,6 +56,9 @@ enum Commands {
         harness: Option<HarnessKind>,
         #[arg(long)]
         model: Option<String>,
+        /// Bypass dedupe check and force a new review even if one exists for this SHA
+        #[arg(long)]
+        force: bool,
     },
     Status {
         #[arg(long)]
@@ -315,6 +318,7 @@ async fn main() -> Result<()> {
             dry_run,
             harness,
             model,
+            force,
         } => {
             let cfg = Arc::new(AppConfig::load_or_default()?);
             let db = Database::new(AppConfig::db_file()?).await?;
@@ -336,6 +340,7 @@ async fn main() -> Result<()> {
                         dry_run,
                         harness,
                         model,
+                        force,
                     },
                 )
                 .await?;

@@ -33,6 +33,7 @@ pub struct ReviewOptions {
     pub dry_run: bool,
     pub harness: Option<HarnessKind>,
     pub model: Option<String>,
+    pub force: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +136,11 @@ impl ReviewEngine {
             harness: harness_kind.as_str().to_string(),
             model: Some(model.clone()),
         };
+
+        if options.force {
+            self.db.delete_review_claim(&dedupe).await?;
+            tracing::info!(dedupe_key = %dedupe, "force flag set, cleared existing dedupe entry");
+        }
 
         if !self.db.claim_review(claim).await? {
             return Ok(ReviewRunResult {

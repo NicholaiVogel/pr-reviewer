@@ -1,12 +1,24 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-#[derive(Debug, Clone)]
+type DbOp = Box<dyn FnOnce(&Connection) + Send + 'static>;
+
+#[derive(Clone)]
 pub struct Database {
     path: PathBuf,
+    tx: std::sync::mpsc::Sender<DbOp>,
+}
+
+impl fmt::Debug for Database {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Database")
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +99,34 @@ impl Database {
                 .with_context(|| format!("failed to create db dir {}", parent.display()))?;
         }
 
-        let db = Self { path };
+        let (tx, rx) = std::sync::mpsc::channel::<DbOp>();
+        let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<()>>();
+
+        let db_path = path.clone();
+        std::thread::Builder::new()
+            .name("pr-reviewer-db".into())
+            .spawn(move || {
+                let conn = match open_conn(&db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let _ = init_tx.send(Ok(()));
+
+                while let Ok(op) = rx.recv() {
+                    op(&conn);
+                }
+                // All senders dropped, connection drops here (WAL checkpoint runs).
+            })
+            .context("failed to spawn database thread")?;
+
+        init_rx
+            .await
+            .context("database thread exited before init completed")??;
+
+        let db = Self { path, tx };
         db.migrate().await?;
         Ok(db)
     }
@@ -96,10 +135,25 @@ impl Database {
         &self.path
     }
 
+    async fn run<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let op: DbOp = Box::new(move |conn| {
+            let _ = resp_tx.send(f(conn));
+        });
+        self.tx
+            .send(op)
+            .map_err(|_| anyhow::anyhow!("database thread has exited"))?;
+        resp_rx
+            .await
+            .context("database thread dropped response channel")?
+    }
+
     pub async fn migrate(&self) -> Result<()> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             conn.execute_batch(
                 r#"
                 CREATE TABLE IF NOT EXISTS schema_version (
@@ -154,7 +208,8 @@ impl Database {
                 "#,
             )?;
 
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?;
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?;
             if count == 0 {
                 conn.execute("INSERT INTO schema_version(version) VALUES (1)", [])?;
             }
@@ -162,28 +217,37 @@ impl Database {
             // Column migrations must run BEFORE the seed INSERT below,
             // because existing databases have daemon_state without the new columns.
             // SQLite's OR IGNORE only suppresses constraint violations, not schema errors.
-            ensure_column_exists(&conn, "review_log", "gitnexus_used", "INTEGER")?;
-            ensure_column_exists(&conn, "review_log", "gitnexus_latency_ms", "INTEGER")?;
-            ensure_column_exists(&conn, "review_log", "gitnexus_hit_count", "INTEGER")?;
-            ensure_column_exists(&conn, "daemon_state", "started_at", "TEXT")?;
-            ensure_column_exists(&conn, "daemon_state", "rate_limit_total", "INTEGER")?;
-            ensure_column_exists(&conn, "daemon_state", "rate_reset_epoch", "INTEGER")?;
+            ensure_column_exists(conn, "review_log", "gitnexus_used", "INTEGER")?;
+            ensure_column_exists(conn, "review_log", "gitnexus_latency_ms", "INTEGER")?;
+            ensure_column_exists(conn, "review_log", "gitnexus_hit_count", "INTEGER")?;
+            ensure_column_exists(conn, "daemon_state", "started_at", "TEXT")?;
+            ensure_column_exists(conn, "daemon_state", "rate_limit_total", "INTEGER")?;
+            ensure_column_exists(conn, "daemon_state", "rate_reset_epoch", "INTEGER")?;
 
             conn.execute(
                 "INSERT OR IGNORE INTO daemon_state (id, started_at, last_poll_at, rate_limit_total, rate_remaining, rate_reset_epoch, active_reviews) VALUES (1, NULL, NULL, NULL, NULL, NULL, 0)",
                 [],
             )?;
 
-            Ok::<(), anyhow::Error>(())
+            Ok(())
         })
-        .await??;
-        Ok(())
+        .await
+    }
+
+    pub async fn delete_review_claim(&self, dedupe_key: &str) -> Result<bool> {
+        let key = dedupe_key.to_string();
+        self.run(move |conn| {
+            let changed = conn.execute(
+                "DELETE FROM review_log WHERE dedupe_key = ?1",
+                params![key],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
     }
 
     pub async fn claim_review(&self, claim: ReviewClaim) -> Result<bool> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             let result = conn.execute(
                 "INSERT INTO review_log (dedupe_key, repo, pr_number, sha, harness, model, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'claimed')",
                 params![
@@ -198,11 +262,13 @@ impl Database {
 
             match result {
                 Ok(_) => Ok(true),
-                Err(rusqlite::Error::SqliteFailure(err, _)) if err.extended_code == 2067 => Ok(false),
+                Err(rusqlite::Error::SqliteFailure(err, _)) if err.extended_code == 2067 => {
+                    Ok(false)
+                }
                 Err(e) => Err(anyhow::Error::new(e)),
             }
         })
-        .await?
+        .await
     }
 
     pub async fn complete_review(
@@ -217,13 +283,11 @@ impl Database {
         gitnexus_latency_ms: Option<i64>,
         gitnexus_hit_count: Option<i64>,
     ) -> Result<()> {
-        let path = self.path.clone();
         let dedupe_key = dedupe_key.to_string();
         let verdict = verdict.map(ToString::to_string);
         let gitnexus_used = gitnexus_used.map(|v| if v { 1_i64 } else { 0_i64 });
 
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             conn.execute(
                 "UPDATE review_log SET status='completed', comments_posted=?2, verdict=?3, duration_secs=?4, files_reviewed=?5, diff_lines=?6, gitnexus_used=?7, gitnexus_latency_ms=?8, gitnexus_hit_count=?9, completed_at=datetime('now') WHERE dedupe_key=?1",
                 params![
@@ -238,11 +302,9 @@ impl Database {
                     gitnexus_hit_count
                 ],
             )?;
-            Ok::<(), anyhow::Error>(())
+            Ok(())
         })
-        .await??;
-
-        Ok(())
+        .await
     }
 
     pub async fn fail_review(
@@ -251,29 +313,23 @@ impl Database {
         message: &str,
         duration_secs: f64,
     ) -> Result<()> {
-        let path = self.path.clone();
         let dedupe_key = dedupe_key.to_string();
         let message = message.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             conn.execute(
                 "UPDATE review_log SET status='failed', error_message=?2, duration_secs=?3, completed_at=datetime('now') WHERE dedupe_key=?1",
                 params![dedupe_key, message, duration_secs],
             )?;
-            Ok::<(), anyhow::Error>(())
+            Ok(())
         })
-        .await??;
-
-        Ok(())
+        .await
     }
 
     pub async fn get_pr_state(&self, repo: &str, pr_number: i64) -> Result<Option<PrState>> {
-        let path = self.path.clone();
         let repo = repo.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             let row = conn
                 .query_row(
                     "SELECT last_reviewed_sha, last_comment_check, review_count FROM pr_state WHERE repo=?1 AND pr_number=?2",
@@ -287,9 +343,9 @@ impl Database {
                     },
                 )
                 .optional()?;
-            Ok::<Option<PrState>, anyhow::Error>(row)
+            Ok(row)
         })
-        .await?
+        .await
     }
 
     pub async fn upsert_pr_state(
@@ -299,13 +355,11 @@ impl Database {
         last_reviewed_sha: Option<&str>,
         last_comment_check: Option<&str>,
     ) -> Result<()> {
-        let path = self.path.clone();
         let repo = repo.to_string();
         let last_reviewed_sha = last_reviewed_sha.map(ToString::to_string);
         let last_comment_check = last_comment_check.map(ToString::to_string);
 
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             conn.execute(
                 r#"
                 INSERT INTO pr_state (repo, pr_number, last_reviewed_sha, last_comment_check, review_count)
@@ -322,10 +376,9 @@ impl Database {
                 "#,
                 params![repo, pr_number, last_reviewed_sha, last_comment_check],
             )?;
-            Ok::<(), anyhow::Error>(())
+            Ok(())
         })
-        .await??;
-        Ok(())
+        .await
     }
 
     pub async fn update_comment_check(
@@ -334,12 +387,10 @@ impl Database {
         pr_number: i64,
         last_comment_check: &str,
     ) -> Result<()> {
-        let path = self.path.clone();
         let repo = repo.to_string();
         let last_comment_check = last_comment_check.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             conn.execute(
                 r#"
                 INSERT INTO pr_state (repo, pr_number, last_comment_check, review_count)
@@ -349,36 +400,29 @@ impl Database {
                 "#,
                 params![repo, pr_number, last_comment_check],
             )?;
-            Ok::<(), anyhow::Error>(())
+            Ok(())
         })
-        .await??;
-        Ok(())
+        .await
     }
 
     pub async fn set_repo_etag(&self, repo: &str, etag: Option<&str>) -> Result<()> {
-        let path = self.path.clone();
         let repo = repo.to_string();
         let etag = etag.map(ToString::to_string);
 
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             conn.execute(
                 "INSERT INTO repo_state(repo, etag) VALUES (?1, ?2) ON CONFLICT(repo) DO UPDATE SET etag=excluded.etag",
                 params![repo, etag],
             )?;
-            Ok::<(), anyhow::Error>(())
+            Ok(())
         })
-        .await??;
-
-        Ok(())
+        .await
     }
 
     pub async fn get_repo_etag(&self, repo: &str) -> Result<Option<String>> {
-        let path = self.path.clone();
         let repo = repo.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             let etag = conn
                 .query_row(
                     "SELECT etag FROM repo_state WHERE repo=?1",
@@ -386,29 +430,24 @@ impl Database {
                     |r| r.get(0),
                 )
                 .optional()?;
-            Ok::<Option<String>, anyhow::Error>(etag)
+            Ok(etag)
         })
-        .await?
+        .await
     }
 
     pub async fn sweep_stale_claims(&self, max_age_secs: u64) -> Result<u64> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             let changed = conn.execute(
                 "UPDATE review_log SET status='failed', error_message='stale claim swept', completed_at=datetime('now') WHERE status='claimed' AND created_at < datetime('now', ?1)",
                 params![format!("-{} seconds", max_age_secs)],
             )?;
-            Ok::<u64, anyhow::Error>(changed as u64)
+            Ok(changed as u64)
         })
-        .await?
+        .await
     }
 
     pub async fn list_logs(&self, filter: LogsFilter) -> Result<Vec<ReviewLogEntry>> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
-
+        self.run(move |conn| {
             let mut sql = String::from(
                 "SELECT id, repo, pr_number, sha, harness, model, status, comments_posted, verdict, duration_secs, gitnexus_used, gitnexus_latency_ms, gitnexus_hit_count, error_message, created_at, completed_at FROM review_log WHERE 1=1",
             );
@@ -462,18 +501,16 @@ impl Database {
             for row in rows {
                 out.push(row?);
             }
-            Ok::<Vec<ReviewLogEntry>, anyhow::Error>(out)
+            Ok(out)
         })
-        .await?
+        .await
     }
 
     pub async fn usage_stats(&self, since: Option<&str>, repo: Option<&str>) -> Result<UsageStats> {
-        let path = self.path.clone();
         let since = since.map(ToString::to_string);
         let repo = repo.map(ToString::to_string);
 
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             let (where_clause, values) = build_where_clause(since.as_deref(), repo.as_deref());
 
             let mut stats = UsageStats::default();
@@ -538,26 +575,22 @@ impl Database {
                 stats.verdicts.push(row?);
             }
 
-            Ok::<UsageStats, anyhow::Error>(stats)
+            Ok(stats)
         })
-        .await?
+        .await
     }
 
     pub async fn set_daemon_started(&self, started_at: &str) -> Result<()> {
-        let path = self.path.clone();
         let started_at = started_at.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             conn.execute(
                 "UPDATE daemon_state SET started_at=?1, last_poll_at=NULL, rate_limit_total=NULL, rate_remaining=NULL, rate_reset_epoch=NULL, active_reviews=0 WHERE id=1",
                 params![started_at],
             )?;
-            Ok::<(), anyhow::Error>(())
+            Ok(())
         })
-        .await??;
-
-        Ok(())
+        .await
     }
 
     pub async fn set_daemon_status(
@@ -568,27 +601,20 @@ impl Database {
         rate_reset_epoch: Option<i64>,
         active_reviews: i64,
     ) -> Result<()> {
-        let path = self.path.clone();
         let last_poll_at = last_poll_at.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             conn.execute(
                 "UPDATE daemon_state SET last_poll_at=?1, rate_limit_total=?2, rate_remaining=?3, rate_reset_epoch=?4, active_reviews=?5 WHERE id=1",
                 params![last_poll_at, rate_limit_total, rate_remaining, rate_reset_epoch, active_reviews],
             )?;
-            Ok::<(), anyhow::Error>(())
+            Ok(())
         })
-        .await??;
-
-        Ok(())
+        .await
     }
 
     pub async fn get_daemon_status(&self) -> Result<DaemonStatus> {
-        let path = self.path.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             let row = conn.query_row(
                 "SELECT started_at, last_poll_at, rate_limit_total, rate_remaining, rate_reset_epoch, active_reviews FROM daemon_state WHERE id=1",
                 [],
@@ -603,24 +629,21 @@ impl Database {
                     })
                 },
             )?;
-            Ok::<DaemonStatus, anyhow::Error>(row)
+            Ok(row)
         })
-        .await?
+        .await
     }
 
     pub async fn get_claimed_reviews(&self) -> Result<i64> {
-        let path = self.path.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
+        self.run(move |conn| {
             let depth = conn.query_row(
                 "SELECT COUNT(*) FROM review_log WHERE status='claimed'",
                 [],
                 |r| r.get(0),
             )?;
-            Ok::<i64, anyhow::Error>(depth)
+            Ok(depth)
         })
-        .await?
+        .await
     }
 }
 
