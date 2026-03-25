@@ -33,6 +33,7 @@ pub struct ReviewOptions {
     pub dry_run: bool,
     pub harness: Option<HarnessKind>,
     pub model: Option<String>,
+    pub force: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +136,30 @@ impl ReviewEngine {
             harness: harness_kind.as_str().to_string(),
             model: Some(model.clone()),
         };
+
+        if options.force {
+            match self.db.delete_review_claim(&dedupe).await? {
+                Some(ref status) if status == "claimed" => {
+                    tracing::warn!(
+                        dedupe_key = %dedupe,
+                        "force flag deleted an in-flight 'claimed' entry — if the daemon is \
+                         mid-pipeline for this PR, its complete_review/fail_review will silently \
+                         no-op, leaving the new claim stuck until the next stale sweep"
+                    );
+                }
+                Some(_) => {
+                    tracing::info!(dedupe_key = %dedupe, "force flag cleared existing failed claim");
+                }
+                None => {
+                    tracing::warn!(
+                        dedupe_key = %dedupe,
+                        "--force had no effect: no stale or failed claim found; \
+                         if this PR+SHA was already successfully reviewed the completed \
+                         entry is preserved and cannot be overridden with --force"
+                    );
+                }
+            }
+        }
 
         if !self.db.claim_review(claim).await? {
             return Ok(ReviewRunResult {

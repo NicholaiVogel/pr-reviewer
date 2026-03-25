@@ -56,6 +56,10 @@ enum Commands {
         harness: Option<HarnessKind>,
         #[arg(long)]
         model: Option<String>,
+        /// Bypass the dedupe check by clearing any stale or failed claim for this SHA.
+        /// Has no effect on completed reviews — those entries are preserved.
+        #[arg(long)]
+        force: bool,
     },
     Status {
         #[arg(long)]
@@ -315,6 +319,7 @@ async fn main() -> Result<()> {
             dry_run,
             harness,
             model,
+            force,
         } => {
             let cfg = Arc::new(AppConfig::load_or_default()?);
             let db = Database::new(AppConfig::db_file()?).await?;
@@ -336,6 +341,7 @@ async fn main() -> Result<()> {
                         dry_run,
                         harness,
                         model,
+                        force,
                     },
                 )
                 .await?;
