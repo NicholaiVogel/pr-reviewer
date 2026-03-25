@@ -254,10 +254,7 @@ impl Database {
 
             let deletable = matches!(status.as_deref(), Some("claimed") | Some("failed"));
             if deletable {
-                conn.execute(
-                    "DELETE FROM review_log WHERE dedupe_key = ?1",
-                    params![key],
-                )?;
+                conn.execute("DELETE FROM review_log WHERE dedupe_key = ?1", params![key])?;
                 Ok(status)
             } else {
                 Ok(None)
@@ -716,7 +713,7 @@ fn open_conn(path: &PathBuf) -> Result<Connection> {
     Ok(conn)
 }
 
-pub fn dedupe_key(repo: &str, pr_number: u64, sha: &str, harness: &str) -> String {
+pub fn dedupe_key(repo: &str, pr_number: u64, sha: &str, harness: &str, dry_run: bool) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -727,6 +724,12 @@ pub fn dedupe_key(repo: &str, pr_number: u64, sha: &str, harness: &str) -> Strin
     hasher.update(sha.as_bytes());
     hasher.update(b":");
     hasher.update(harness.as_bytes());
+    hasher.update(b":");
+    hasher.update(if dry_run {
+        &b"dry-run"[..]
+    } else {
+        &b"live"[..]
+    });
     format!("{:x}", hasher.finalize())
 }
 
@@ -805,6 +808,42 @@ mod tests {
 
         assert!(db.claim_review(claim.clone()).await.expect("first claim"));
         assert!(!db.claim_review(claim).await.expect("second claim"));
+    }
+
+    #[test]
+    fn dedupe_key_distinguishes_dry_run_from_live() {
+        let live = dedupe_key("o/r", 42, "abc123", "codex", false);
+        let dry_run = dedupe_key("o/r", 42, "abc123", "codex", true);
+
+        assert_ne!(live, dry_run);
+    }
+
+    #[tokio::test]
+    async fn dry_run_and_live_claims_do_not_block_each_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let dry_run_claim = ReviewClaim {
+            dedupe_key: dedupe_key("o/r", 1, "abc", "codex", true),
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            sha: "abc".to_string(),
+            harness: "codex".to_string(),
+            model: None,
+        };
+        let live_claim = ReviewClaim {
+            dedupe_key: dedupe_key("o/r", 1, "abc", "codex", false),
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            sha: "abc".to_string(),
+            harness: "codex".to_string(),
+            model: None,
+        };
+
+        assert!(db.claim_review(dry_run_claim).await.expect("dry-run claim"));
+        assert!(db.claim_review(live_claim).await.expect("live claim"));
     }
 
     #[tokio::test]
@@ -916,9 +955,19 @@ mod tests {
         };
 
         assert!(db.claim_review(claim.clone()).await.expect("claim"));
-        db.complete_review("force-completed", 3, Some("COMMENT"), 5.0, 2, 100, None, None, None)
-            .await
-            .expect("complete");
+        db.complete_review(
+            "force-completed",
+            3,
+            Some("COMMENT"),
+            5.0,
+            2,
+            100,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("complete");
 
         // --force cannot delete a completed entry
         let deleted = db

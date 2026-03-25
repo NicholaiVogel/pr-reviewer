@@ -122,6 +122,7 @@ impl ReviewEngine {
             .clone()
             .or_else(|| repo_cfg.model.clone())
             .unwrap_or_else(|| self.config.harness.model.clone());
+        let dry_run = options.dry_run || self.config.defaults.dry_run;
         let reasoning_effort = options
             .reasoning_effort
             .or(repo_cfg.reasoning_effort)
@@ -131,6 +132,7 @@ impl ReviewEngine {
             pr_data.number,
             &pr_data.head.sha,
             harness_kind.as_str(),
+            dry_run,
         );
 
         let claim = ReviewClaim {
@@ -176,8 +178,6 @@ impl ReviewEngine {
                 comments_posted: 0,
             });
         }
-
-        let dry_run = options.dry_run || self.config.defaults.dry_run;
 
         // Fetch existing reviews once — used for both in-progress guard and duplicate check
         // inside run_review_pipeline, avoiding a redundant API call.
@@ -259,10 +259,10 @@ impl ReviewEngine {
             .run_review_pipeline(
                 repo_cfg,
                 pr_data,
-                options,
                 harness_kind,
                 &model,
                 reasoning_effort,
+                dry_run,
                 existing_reviews,
             )
             .await;
@@ -369,10 +369,10 @@ impl ReviewEngine {
         &self,
         repo_cfg: &RepoConfig,
         pr_data: &PullRequest,
-        options: ReviewOptions,
         harness_kind: HarnessKind,
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
+        dry_run: bool,
         existing_reviews: Vec<PullRequestReview>,
     ) -> Result<ReviewRunResult> {
         let repo_name = repo_cfg.full_name();
@@ -381,6 +381,7 @@ impl ReviewEngine {
             pr_data.number,
             &pr_data.head.sha,
             harness_kind.as_str(),
+            dry_run,
         );
 
         let prior_state = self
@@ -706,7 +707,6 @@ impl ReviewEngine {
             }
         }
 
-        let dry_run = options.dry_run || self.config.defaults.dry_run;
         if dry_run {
             self.db
                 .complete_review(
