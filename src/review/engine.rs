@@ -27,6 +27,9 @@ use crate::store::db::{dedupe_key, Database, ReviewClaim};
 
 const IN_PROGRESS_COMMENT_TIMEOUT_SECS: u64 = 4;
 const IN_PROGRESS_COMMENT_MAX_CHARS: usize = 220;
+const GITHUB_COMMENT_MAX_CHARS: usize = 65_536;
+const GITHUB_COMMENT_TRUNCATION_NOTE: &str =
+    "\n\n[truncated by pr-reviewer to fit GitHub's comment length limit]";
 
 #[derive(Debug, Clone, Default)]
 pub struct ReviewOptions {
@@ -707,6 +710,8 @@ impl ReviewEngine {
             }
         }
 
+        let body = truncate_github_comment_body(&body);
+
         if dry_run {
             self.db
                 .complete_review(
@@ -811,16 +816,8 @@ impl ReviewEngine {
                     error = %first_err,
                     "review post failed with 422; retrying as COMMENT with inline comments folded into body"
                 );
-                let mut retry_body = body.clone();
-                if !inline_comments.is_empty() {
-                    retry_body
-                        .push_str("\n\n**Inline comments (could not post as line comments):**\n");
-                    for c in &inline_comments {
-                        retry_body.push_str(&format!("- `{}:{}` — {}\n", c.path, c.line, c.body));
-                    }
-                }
                 let retry_request = CreateReviewRequest {
-                    body: retry_body,
+                    body: build_retry_review_body(&body, &inline_comments),
                     event: "COMMENT".to_string(),
                     comments: vec![],
                 };
@@ -841,8 +838,9 @@ impl ReviewEngine {
         };
 
         if let Err(err) = post_result {
-            let fallback =
-                format!("Review post failed; fallback summary posted.\n\nError: {err}\n\n{body}");
+            let fallback = truncate_github_comment_body(&format!(
+                "Review post failed; fallback summary posted.\n\nError: {err}\n\n{body}"
+            ));
             comments::create_issue_comment(
                 &self.github,
                 &repo_cfg.owner,
@@ -1498,6 +1496,73 @@ fn normalize_in_progress_comment(raw: &str) -> Option<String> {
     Some(collapsed)
 }
 
+fn truncate_github_comment_body(body: &str) -> String {
+    if body.chars().count() <= GITHUB_COMMENT_MAX_CHARS {
+        return body.to_string();
+    }
+
+    let keep = GITHUB_COMMENT_MAX_CHARS.saturating_sub(GITHUB_COMMENT_TRUNCATION_NOTE.len());
+    let mut truncated: String = body.chars().take(keep).collect();
+    while truncated.ends_with('\n') {
+        truncated.pop();
+    }
+    truncated.push_str(GITHUB_COMMENT_TRUNCATION_NOTE);
+    truncated
+}
+
+fn build_retry_review_body(body: &str, inline_comments: &[CreateReviewComment]) -> String {
+    if inline_comments.is_empty() {
+        return truncate_github_comment_body(body);
+    }
+
+    let mut retry_body = truncate_github_comment_body(body);
+    let header = "\n\n**Inline comments (could not post as line comments):**\n";
+    if retry_body.chars().count() + header.chars().count() > GITHUB_COMMENT_MAX_CHARS {
+        return retry_body;
+    }
+    retry_body.push_str(header);
+
+    let total = inline_comments.len();
+    let mut appended = 0usize;
+
+    for (idx, comment) in inline_comments.iter().enumerate() {
+        let normalized_comment = comment.body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let line = format!(
+            "- `{}:{}` - {}\n",
+            comment.path, comment.line, normalized_comment
+        );
+        let remaining = total.saturating_sub(idx + 1);
+        let omission_note = if remaining > 0 {
+            format!(
+                "\n_Omitted {remaining} additional inline comments to stay within GitHub's body limit._"
+            )
+        } else {
+            String::new()
+        };
+
+        if retry_body.chars().count() + line.chars().count() + omission_note.chars().count()
+            > GITHUB_COMMENT_MAX_CHARS
+        {
+            break;
+        }
+
+        retry_body.push_str(&line);
+        appended += 1;
+    }
+
+    let omitted = total.saturating_sub(appended);
+    if omitted > 0 {
+        let omission_note =
+            format!("\n_Omitted {omitted} additional inline comments to stay within GitHub's body limit._");
+        if retry_body.chars().count() + omission_note.chars().count() <= GITHUB_COMMENT_MAX_CHARS
+        {
+            retry_body.push_str(&omission_note);
+        }
+    }
+
+    retry_body
+}
+
 fn looks_like_reintroduction(comment: &str) -> bool {
     let lower = comment.to_ascii_lowercase();
     lower.contains("pr-reviewing agent")
@@ -1807,13 +1872,14 @@ fn verdict_label(verdict: ReviewVerdict) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::github::types::{PullRequestReview, User};
+    use crate::github::types::{CreateReviewComment, PullRequestReview, User};
 
     use super::{
         build_in_progress_comment_fallback, build_prior_reviews_context,
-        extract_in_progress_comment, infer_pr_focus, login_matches_bot,
+        build_retry_review_body, extract_in_progress_comment, infer_pr_focus, login_matches_bot,
         looks_like_harness_error_output, looks_like_reintroduction, normalize_in_progress_comment,
-        pr_reviewer_project_url, resolve_project_url,
+        pr_reviewer_project_url, resolve_project_url, truncate_github_comment_body,
+        GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
     };
 
     #[test]
@@ -1899,6 +1965,46 @@ mod tests {
     fn normalizes_generated_comment_whitespace() {
         let normalized = normalize_in_progress_comment("  hi there \n  doing a pass  ").unwrap();
         assert_eq!(normalized, "hi there doing a pass");
+    }
+
+    #[test]
+    fn truncates_github_comment_body_to_limit() {
+        let body = "a".repeat(GITHUB_COMMENT_MAX_CHARS + 100);
+        let truncated = truncate_github_comment_body(&body);
+
+        assert_eq!(truncated.chars().count(), GITHUB_COMMENT_MAX_CHARS);
+        assert!(truncated.ends_with(GITHUB_COMMENT_TRUNCATION_NOTE));
+    }
+
+    #[test]
+    fn retry_review_body_omits_extra_inline_comments_to_fit_limit() {
+        let base = "intro\n".repeat(5000);
+        let inline_comments = vec![
+            CreateReviewComment {
+                path: "src/lib.rs".to_string(),
+                line: 10,
+                side: "RIGHT".to_string(),
+                body: "x".repeat(20_000),
+            },
+            CreateReviewComment {
+                path: "src/lib.rs".to_string(),
+                line: 20,
+                side: "RIGHT".to_string(),
+                body: "y".repeat(20_000),
+            },
+            CreateReviewComment {
+                path: "src/lib.rs".to_string(),
+                line: 30,
+                side: "RIGHT".to_string(),
+                body: "z".repeat(20_000),
+            },
+        ];
+
+        let retry_body = build_retry_review_body(&base, &inline_comments);
+
+        assert!(retry_body.chars().count() <= GITHUB_COMMENT_MAX_CHARS);
+        assert!(retry_body.contains("Inline comments (could not post as line comments):"));
+        assert!(retry_body.contains("Omitted"));
     }
 
     #[test]
