@@ -266,6 +266,7 @@ impl ReviewEngine {
                 &model,
                 reasoning_effort,
                 dry_run,
+                options.force,
                 existing_reviews,
             )
             .await;
@@ -376,6 +377,7 @@ impl ReviewEngine {
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
         dry_run: bool,
+        force: bool,
         existing_reviews: Vec<PullRequestReview>,
     ) -> Result<ReviewRunResult> {
         let repo_name = repo_cfg.full_name();
@@ -694,6 +696,11 @@ impl ReviewEngine {
                 }
             }
             ParseOutcome::RawSummary(raw) => {
+                if looks_like_harness_transport_output(&raw) {
+                    return Err(anyhow!(
+                        "harness returned machine transport output instead of a review body"
+                    ));
+                }
                 body.push_str("Harness output could not be parsed as structured JSON.\n\n");
                 body.push_str(&raw);
             }
@@ -737,14 +744,16 @@ impl ReviewEngine {
             });
         }
 
-        if existing_reviews.iter().any(|r| {
+        if !force
+            && existing_reviews.iter().any(|r| {
             r.commit_id.as_deref() == Some(pr_data.head.sha.as_str())
                 && login_matches_bot(
                     &r.user.login,
                     self.config.defaults.bot_name.as_str(),
                     self.authenticated_user.as_deref(),
                 )
-        }) {
+            })
+        {
             self.db
                 .complete_review(
                     &dedupe,
@@ -1583,6 +1592,16 @@ fn looks_like_harness_error_output(text: &str) -> bool {
         || lower.contains("command not found")
 }
 
+fn looks_like_harness_transport_output(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.contains("{\"type\":\"thread.started\"")
+        || trimmed.contains("{\"type\":\"turn.started\"")
+        || (trimmed.contains("\"type\":\"command_execution\"")
+            && trimmed.contains("\"item.started\""))
+        || trimmed.contains("Unable to open session log file")
+        || (trimmed.contains("codex: line") && trimmed.contains("unbound variable"))
+}
+
 fn login_matches_bot(
     login: &str,
     configured_bot_name: &str,
@@ -1877,9 +1896,10 @@ mod tests {
     use super::{
         build_in_progress_comment_fallback, build_prior_reviews_context,
         build_retry_review_body, extract_in_progress_comment, infer_pr_focus, login_matches_bot,
-        looks_like_harness_error_output, looks_like_reintroduction, normalize_in_progress_comment,
-        pr_reviewer_project_url, resolve_project_url, truncate_github_comment_body,
-        GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
+        looks_like_harness_error_output, looks_like_harness_transport_output,
+        looks_like_reintroduction, normalize_in_progress_comment, pr_reviewer_project_url,
+        resolve_project_url, truncate_github_comment_body, GITHUB_COMMENT_MAX_CHARS,
+        GITHUB_COMMENT_TRUNCATION_NOTE,
     };
 
     #[test]
@@ -2018,6 +2038,16 @@ mod tests {
     fn harness_error_output_is_rejected() {
         assert!(looks_like_harness_error_output(
             "Error: command returned exit status 1"
+        ));
+    }
+
+    #[test]
+    fn harness_transport_output_is_rejected() {
+        assert!(looks_like_harness_transport_output(
+            "{\"type\":\"thread.started\",\"thread_id\":\"abc\"}\n{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\"}}"
+        ));
+        assert!(looks_like_harness_transport_output(
+            "/home/nicholai/.config/signet/bin/codex: line 6: HOME: unbound variable"
         ));
     }
 

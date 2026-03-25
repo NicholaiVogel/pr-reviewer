@@ -9,6 +9,7 @@ use tokio::time::timeout;
 
 use crate::config::ReasoningEffort;
 use crate::harness::Harness;
+use crate::harness::codex;
 
 const MAX_STDOUT_BYTES: usize = 1_048_576;
 const MAX_STDERR_BYTES: usize = 262_144;
@@ -82,6 +83,12 @@ pub async fn run_harness(
 
     let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if let Ok(last_message) = tokio::fs::read_to_string(codex::last_message_path(&req.working_dir)).await {
+        if !last_message.trim().is_empty() {
+            stdout = last_message;
+        }
+    }
 
     if stdout.len() > MAX_STDOUT_BYTES {
         truncate_utf8_to_max_bytes(&mut stdout, MAX_STDOUT_BYTES);
