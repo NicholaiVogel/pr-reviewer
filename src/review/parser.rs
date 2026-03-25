@@ -64,25 +64,6 @@ impl Confidence {
         if self.justification.trim().is_empty() {
             return Err(anyhow!("confidence justification cannot be empty"));
         }
-        if looks_like_generic_context_disclaimer(&self.justification) {
-            let has_context_reason = self.reasons.iter().any(|reason| {
-                matches!(
-                    reason,
-                    ConfidenceReason::MissingRuntimeRepro
-                        | ConfidenceReason::MissingCrossModuleContext
-                )
-            });
-            if !has_context_reason {
-                return Err(anyhow!(
-                    "generic context disclaimer requires missing_runtime_repro or missing_cross_module_context reason"
-                ));
-            }
-            if !mentions_concrete_missing_artifact(&self.justification) {
-                return Err(anyhow!(
-                    "generic context disclaimer must name a concrete missing artifact"
-                ));
-            }
-        }
         Ok(())
     }
 }
@@ -324,26 +305,6 @@ fn extract_json_objects(text: &str) -> Vec<String> {
     results
 }
 
-fn looks_like_generic_context_disclaimer(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("full repository contents")
-        || lower.contains("runtime behavior")
-        || lower.contains("review context")
-        || lower.contains("without runtime context")
-}
-
-fn mentions_concrete_missing_artifact(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains('`')
-        || lower.contains('/')
-        || lower.contains("trace")
-        || lower.contains("stack")
-        || lower.contains("test case")
-        || lower.contains("repro")
-        || lower.contains("log")
-        || lower.contains("module")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,18 +383,18 @@ mod tests {
     }
 
     #[test]
-    fn boilerplate_context_disclaimer_requires_concrete_artifact() {
+    fn boilerplate_context_disclaimer_does_not_drop_structured_output() {
         let input = r#"```pr-review-json
 {"summary":"bad","verdict":"comment","confidence":{"level":"low","reasons":["missing_runtime_repro"],"justification":"Confidence is low because full repository contents and runtime behavior are not available in this review context."},"comments":[]}
 ```"#;
         let parsed = parse_review_output(input, "").expect("parse output");
-        assert!(matches!(parsed, ParseOutcome::RawSummary(_)));
+        assert!(matches!(parsed, ParseOutcome::Structured(_)));
     }
 
     #[test]
-    fn boilerplate_context_disclaimer_with_artifact_is_allowed() {
+    fn boilerplate_context_disclaimer_without_context_reason_is_still_structured() {
         let input = r#"```pr-review-json
-{"summary":"ok","verdict":"comment","confidence":{"level":"low","reasons":["missing_runtime_repro"],"justification":"Low confidence: runtime behavior is not available in this review context, specifically missing failing test case `auth_replay_guard_blocks_reuse` and its trace log."},"comments":[]}
+{"summary":"ok","verdict":"comment","confidence":{"level":"low","reasons":["sufficient_diff_evidence"],"justification":"Runtime behavior is hard to verify in this review context."},"comments":[]}
 ```"#;
         let parsed = parse_review_output(input, "").expect("parse output");
         assert!(matches!(parsed, ParseOutcome::Structured(_)));

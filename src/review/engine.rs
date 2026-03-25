@@ -608,12 +608,14 @@ impl ReviewEngine {
 
         let context_original_bytes = context_with_history.len();
         if context_with_history.len() > self.config.defaults.max_prompt_bytes {
-            truncate_utf8_to_max_bytes(
-                &mut context_with_history,
-                self.config.defaults.max_prompt_bytes,
-            );
-            context_with_history
-                .push_str("\n\n[context truncated before prompt build due size budget]\n");
+            let max_bytes = self.config.defaults.max_prompt_bytes;
+            let note = "\n\n[context truncated before prompt build due size budget]\n";
+            if max_bytes > note.len() {
+                truncate_utf8_to_max_bytes(&mut context_with_history, max_bytes - note.len());
+                context_with_history.push_str(note);
+            } else {
+                truncate_utf8_to_max_bytes(&mut context_with_history, max_bytes);
+            }
         }
 
         let has_prior_reviews = !prior_reviews_context.is_empty();
