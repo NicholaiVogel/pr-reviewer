@@ -52,15 +52,47 @@ impl std::fmt::Display for ConfidenceLevel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Confidence {
     pub level: ConfidenceLevel,
+    pub reasons: Vec<ConfidenceReason>,
     pub justification: String,
 }
 
 impl Confidence {
     pub fn validate(&self) -> Result<()> {
+        if self.reasons.is_empty() {
+            return Err(anyhow!("confidence reasons cannot be empty"));
+        }
         if self.justification.trim().is_empty() {
             return Err(anyhow!("confidence justification cannot be empty"));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceReason {
+    SufficientDiffEvidence,
+    TargetedContextIncluded,
+    MissingRuntimeRepro,
+    MissingCrossModuleContext,
+    AmbiguousRequirements,
+}
+
+impl ConfidenceReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConfidenceReason::SufficientDiffEvidence => "sufficient_diff_evidence",
+            ConfidenceReason::TargetedContextIncluded => "targeted_context_included",
+            ConfidenceReason::MissingRuntimeRepro => "missing_runtime_repro",
+            ConfidenceReason::MissingCrossModuleContext => "missing_cross_module_context",
+            ConfidenceReason::AmbiguousRequirements => "ambiguous_requirements",
+        }
+    }
+}
+
+impl std::fmt::Display for ConfidenceReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -278,7 +310,7 @@ mod tests {
     use super::*;
 
     fn confidence_json() -> &'static str {
-        r#""confidence":{"level":"medium","justification":"Changes are straightforward but touch error paths."}"#
+        r#""confidence":{"level":"medium","reasons":["sufficient_diff_evidence"],"justification":"Changes are straightforward but touch error paths."}"#
     }
 
     #[test]
@@ -335,10 +367,37 @@ mod tests {
     #[test]
     fn empty_confidence_justification_falls_back_to_raw() {
         let input = r#"```pr-review-json
-{"summary":"bad","verdict":"comment","confidence":{"level":"high","justification":""},"comments":[]}
+{"summary":"bad","verdict":"comment","confidence":{"level":"high","reasons":["sufficient_diff_evidence"],"justification":""},"comments":[]}
 ```"#;
         let parsed = parse_review_output(input, "").expect("parse output");
         assert!(matches!(parsed, ParseOutcome::RawSummary(_)));
+    }
+
+    #[test]
+    fn missing_confidence_reasons_falls_back_to_raw() {
+        let input = r#"```pr-review-json
+{"summary":"bad","verdict":"comment","confidence":{"level":"high","justification":"clear bug in diff"},"comments":[]}
+```"#;
+        let parsed = parse_review_output(input, "").expect("parse output");
+        assert!(matches!(parsed, ParseOutcome::RawSummary(_)));
+    }
+
+    #[test]
+    fn boilerplate_context_disclaimer_does_not_drop_structured_output() {
+        let input = r#"```pr-review-json
+{"summary":"bad","verdict":"comment","confidence":{"level":"low","reasons":["missing_runtime_repro"],"justification":"Confidence is low because full repository contents and runtime behavior are not available in this review context."},"comments":[]}
+```"#;
+        let parsed = parse_review_output(input, "").expect("parse output");
+        assert!(matches!(parsed, ParseOutcome::Structured(_)));
+    }
+
+    #[test]
+    fn boilerplate_context_disclaimer_without_context_reason_is_still_structured() {
+        let input = r#"```pr-review-json
+{"summary":"ok","verdict":"comment","confidence":{"level":"low","reasons":["sufficient_diff_evidence"],"justification":"Runtime behavior is hard to verify in this review context."},"comments":[]}
+```"#;
+        let parsed = parse_review_output(input, "").expect("parse output");
+        assert!(matches!(parsed, ParseOutcome::Structured(_)));
     }
 
     #[test]

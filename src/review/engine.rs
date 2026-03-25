@@ -606,6 +606,18 @@ impl ReviewEngine {
             }
         }
 
+        let context_original_bytes = context_with_history.len();
+        if context_with_history.len() > self.config.defaults.max_prompt_bytes {
+            let max_bytes = self.config.defaults.max_prompt_bytes;
+            let note = "\n\n[context truncated before prompt build due size budget]\n";
+            if max_bytes > note.len() {
+                truncate_utf8_to_max_bytes(&mut context_with_history, max_bytes - note.len());
+                context_with_history.push_str(note);
+            } else {
+                truncate_utf8_to_max_bytes(&mut context_with_history, max_bytes);
+            }
+        }
+
         let has_prior_reviews = !prior_reviews_context.is_empty();
 
         // Detect UI file changes and check for screenshots in PR body
@@ -625,6 +637,19 @@ impl ReviewEngine {
             repo_conventions.as_deref(),
             has_prior_reviews,
             ui_files_for_prompt.as_deref(),
+        );
+
+        tracing::info!(
+            repo = %repo_cfg.full_name(),
+            pr = pr_data.number,
+            context_bytes_before = context_original_bytes,
+            context_bytes_after = context_with_history.len(),
+            prompt_bytes = prompt.len(),
+            changed_files_included = assembled.files_included,
+            related_files_included = assembled.related_files_included,
+            assembled_context_bytes = assembled.bytes_total,
+            assembled_context_truncated = assembled.truncated,
+            "built review prompt"
         );
 
         let temp = tempdir().context("failed to create temp working dir")?;
@@ -665,9 +690,16 @@ impl ReviewEngine {
             ParseOutcome::Structured(review) => {
                 body.push_str(&review.summary);
                 verdict = review.verdict;
+                let confidence_reasons = review
+                    .confidence
+                    .reasons
+                    .iter()
+                    .map(|reason| reason.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 body.push_str(&format!(
-                    "\n\n**Confidence:** {} - {}\n",
-                    review.confidence.level, review.confidence.justification,
+                    "\n\n**Confidence:** {} [{}] - {}\n",
+                    review.confidence.level, confidence_reasons, review.confidence.justification,
                 ));
 
                 if review.ui_screenshot_needed {
@@ -746,12 +778,12 @@ impl ReviewEngine {
 
         if !force
             && existing_reviews.iter().any(|r| {
-            r.commit_id.as_deref() == Some(pr_data.head.sha.as_str())
-                && login_matches_bot(
-                    &r.user.login,
-                    self.config.defaults.bot_name.as_str(),
-                    self.authenticated_user.as_deref(),
-                )
+                r.commit_id.as_deref() == Some(pr_data.head.sha.as_str())
+                    && login_matches_bot(
+                        &r.user.login,
+                        self.config.defaults.bot_name.as_str(),
+                        self.authenticated_user.as_deref(),
+                    )
             })
         {
             self.db
@@ -1535,7 +1567,11 @@ fn build_retry_review_body(body: &str, inline_comments: &[CreateReviewComment]) 
     let mut appended = 0usize;
 
     for (idx, comment) in inline_comments.iter().enumerate() {
-        let normalized_comment = comment.body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized_comment = comment
+            .body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         let line = format!(
             "- `{}:{}` - {}\n",
             comment.path, comment.line, normalized_comment
@@ -1561,10 +1597,10 @@ fn build_retry_review_body(body: &str, inline_comments: &[CreateReviewComment]) 
 
     let omitted = total.saturating_sub(appended);
     if omitted > 0 {
-        let omission_note =
-            format!("\n_Omitted {omitted} additional inline comments to stay within GitHub's body limit._");
-        if retry_body.chars().count() + omission_note.chars().count() <= GITHUB_COMMENT_MAX_CHARS
-        {
+        let omission_note = format!(
+            "\n_Omitted {omitted} additional inline comments to stay within GitHub's body limit._"
+        );
+        if retry_body.chars().count() + omission_note.chars().count() <= GITHUB_COMMENT_MAX_CHARS {
             retry_body.push_str(&omission_note);
         }
     }
@@ -1600,6 +1636,17 @@ fn looks_like_harness_transport_output(text: &str) -> bool {
             && trimmed.contains("\"item.started\""))
         || trimmed.contains("Unable to open session log file")
         || (trimmed.contains("codex: line") && trimmed.contains("unbound variable"))
+}
+
+fn truncate_utf8_to_max_bytes(input: &mut String, max_bytes: usize) {
+    if input.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes.min(input.len());
+    while boundary > 0 && !input.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    input.truncate(boundary);
 }
 
 fn login_matches_bot(
@@ -1894,8 +1941,8 @@ mod tests {
     use crate::github::types::{CreateReviewComment, PullRequestReview, User};
 
     use super::{
-        build_in_progress_comment_fallback, build_prior_reviews_context,
-        build_retry_review_body, extract_in_progress_comment, infer_pr_focus, login_matches_bot,
+        build_in_progress_comment_fallback, build_prior_reviews_context, build_retry_review_body,
+        extract_in_progress_comment, infer_pr_focus, login_matches_bot,
         looks_like_harness_error_output, looks_like_harness_transport_output,
         looks_like_reintroduction, normalize_in_progress_comment, pr_reviewer_project_url,
         resolve_project_url, truncate_github_comment_body, GITHUB_COMMENT_MAX_CHARS,

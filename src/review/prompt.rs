@@ -73,7 +73,8 @@ pub fn build_review_prompt(
     prompt.push_str("  - \"request_changes\": found issues that should be fixed before merge\n");
     prompt.push_str("- confidence: object with:\n");
     prompt.push_str("  - level: one of [\"high\", \"medium\", \"low\"]\n");
-    prompt.push_str("  - justification: string explaining your confidence (e.g. \"low: the diff touches crypto code I cannot fully verify without runtime context\")\n");
+    prompt.push_str("  - reasons: array of one or more reason codes from [\"sufficient_diff_evidence\", \"targeted_context_included\", \"missing_runtime_repro\", \"missing_cross_module_context\", \"ambiguous_requirements\"]\n");
+    prompt.push_str("  - justification: string explaining your confidence with concrete evidence. Do NOT use boilerplate like \"full repository context is unavailable\" unless you name a specific missing artifact (example: failing test case name, runtime trace, or exact file/module that is missing).\n");
     prompt.push_str("- ui_screenshot_needed: boolean (true if UI files changed and no screenshots referenced in PR description)\n");
     prompt.push_str("- comments: array of objects with:\n");
     prompt.push_str("  - file: string (file path)\n");
@@ -91,7 +92,10 @@ pub fn build_review_prompt(
     prompt.push_str("  \"verdict\": \"request_changes\",\n");
     prompt.push_str("  \"confidence\": {\n");
     prompt.push_str("    \"level\": \"high\",\n");
-    prompt.push_str("    \"justification\": \"The changes are contained to two files with clear control flow. The SQL injection is unambiguous.\"\n");
+    prompt.push_str(
+        "    \"reasons\": [\"sufficient_diff_evidence\", \"targeted_context_included\"],\n",
+    );
+    prompt.push_str("    \"justification\": \"The SQL interpolation is explicit in src/auth.rs and is reachable from the login handler. The issue is directly provable from this diff.\"\n");
     prompt.push_str("  },\n");
     prompt.push_str("  \"ui_screenshot_needed\": false,\n");
     prompt.push_str("  \"comments\": [\n");
