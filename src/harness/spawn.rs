@@ -7,6 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
+use crate::config::ReasoningEffort;
 use crate::harness::Harness;
 
 const MAX_STDOUT_BYTES: usize = 1_048_576;
@@ -16,6 +17,7 @@ const MAX_STDERR_BYTES: usize = 262_144;
 pub struct HarnessRunRequest {
     pub prompt: String,
     pub model: String,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub working_dir: PathBuf,
     pub timeout_secs: u64,
 }
@@ -32,7 +34,12 @@ pub async fn run_harness(
     harness: &dyn Harness,
     req: HarnessRunRequest,
 ) -> Result<HarnessRunOutput> {
-    let mut command = harness.build_command(&req.prompt, &req.model, &req.working_dir);
+    let mut command = harness.build_command(
+        &req.prompt,
+        &req.model,
+        req.reasoning_effort,
+        &req.working_dir,
+    );
     command.current_dir(&req.working_dir);
 
     scrub_environment(&mut command);

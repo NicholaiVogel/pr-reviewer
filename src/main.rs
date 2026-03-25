@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use config::{parse_repo_full_name, AppConfig, ForkPolicy, HarnessKind, RepoConfig};
+use config::{
+    parse_repo_full_name, AppConfig, ForkPolicy, HarnessKind, ReasoningEffort, RepoConfig,
+};
 use github::client::GitHubClient;
 use review::engine::{ReviewEngine, ReviewOptions};
 use store::db::{format_stats, Database, LogsFilter};
@@ -56,6 +58,8 @@ enum Commands {
         harness: Option<HarnessKind>,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long)]
+        reasoning_effort: Option<ReasoningEffort>,
         /// Bypass the dedupe check by clearing any stale or failed claim for this SHA.
         /// Has no effect on completed reviews — those entries are preserved.
         #[arg(long)]
@@ -104,6 +108,8 @@ struct AddArgs {
     harness: Option<HarnessKind>,
     #[arg(long)]
     model: Option<String>,
+    #[arg(long)]
+    reasoning_effort: Option<ReasoningEffort>,
     #[arg(long, default_value = "ignore")]
     fork_policy: String,
     #[arg(long)]
@@ -201,6 +207,7 @@ async fn main() -> Result<()> {
                 local_path,
                 harness: args.harness,
                 model: args.model,
+                reasoning_effort: args.reasoning_effort,
                 fork_policy,
                 trusted_authors: vec![],
                 ignore_paths: vec![
@@ -266,17 +273,22 @@ async fn main() -> Result<()> {
                 for repo in &cfg.repos {
                     let harness = repo.resolved_harness(&cfg);
                     let model = repo.resolved_model(&cfg);
+                    let reasoning_effort = repo
+                        .resolved_reasoning_effort(&cfg)
+                        .map(|effort| effort.to_string())
+                        .unwrap_or_else(|| "-".to_string());
                     let path = repo
                         .effective_local_path()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| "(unresolved)".to_string());
                     let managed = if repo.is_managed() { " [managed]" } else { "" };
                     println!(
-                        "{}  path={}{managed}  harness={}  model={}  fork_policy={:?}",
+                        "{}  path={}{managed}  harness={}  model={}  reasoning={}  fork_policy={:?}",
                         repo.full_name(),
                         path,
                         harness,
                         model,
+                        reasoning_effort,
                         repo.fork_policy
                     );
                 }
@@ -319,6 +331,7 @@ async fn main() -> Result<()> {
             dry_run,
             harness,
             model,
+            reasoning_effort,
             force,
         } => {
             let cfg = Arc::new(AppConfig::load_or_default()?);
@@ -341,6 +354,7 @@ async fn main() -> Result<()> {
                         dry_run,
                         harness,
                         model,
+                        reasoning_effort,
                         force,
                     },
                 )
@@ -600,6 +614,7 @@ fn add_scanned_repos(cfg: &mut AppConfig, scan_dir: &Path) -> Result<()> {
             local_path: Some(path),
             harness: None,
             model: None,
+            reasoning_effort: None,
             fork_policy: ForkPolicy::Ignore,
             trusted_authors: vec![],
             ignore_paths: vec![],

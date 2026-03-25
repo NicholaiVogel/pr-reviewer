@@ -90,6 +90,17 @@ If the binary is only accessible via a version manager:
 1. Install the tool globally via `npm install -g` or `cargo install` to a system path
 2. Or create a wrapper script at `/usr/local/bin/claude` that calls the version-manager-managed binary
 
+### `pr-reviewer` itself was just installed, but your shell still says `No such file or directory`
+
+This is usually Bash caching an old command path.
+
+```bash
+hash -r
+pr-reviewer --version
+```
+
+The installer now refreshes a `~/.local/bin/pr-reviewer` shim for Cargo installs, which fixes most stale-path cases on the next invocation.
+
 ### The harness runs but authentication fails
 
 AI CLIs need to be authenticated separately. pr-reviewer strips `ANTHROPIC_API_KEY` and similar variables from the harness environment intentionally — the expectation is that Claude Code, OpenCode, or Codex are authenticated via their own login mechanisms (browser auth, CLI login), not environment variables.

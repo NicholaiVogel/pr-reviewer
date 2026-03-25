@@ -3,6 +3,7 @@ repos = []
 [harness]
 default = "claude-code"
 model = "claude-sonnet-4-6"
+# reasoning_effort = "low"
 timeout_secs = 1800
 
 [github]

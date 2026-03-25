@@ -44,6 +44,49 @@ impl FromStr for HarnessKind {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::None => "none",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
+        }
+    }
+}
+
+impl Display for ReasoningEffort {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for ReasoningEffort {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" | "x-high" => Ok(Self::Xhigh),
+            _ => Err(anyhow!("unsupported reasoning effort: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ForkPolicy {
     Ignore,
@@ -76,6 +119,8 @@ pub struct HarnessConfig {
     pub default: HarnessKind,
     #[serde(default = "default_model")]
     pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -186,6 +231,8 @@ pub struct RepoConfig {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
     pub fork_policy: ForkPolicy,
     #[serde(default)]
     pub trusted_authors: Vec<String>,
@@ -288,6 +335,7 @@ impl Default for HarnessConfig {
         Self {
             default: default_harness(),
             model: default_model(),
+            reasoning_effort: None,
             timeout_secs: default_timeout_secs(),
         }
     }
@@ -358,6 +406,10 @@ impl RepoConfig {
         self.model
             .as_deref()
             .unwrap_or(config.harness.model.as_str())
+    }
+
+    pub fn resolved_reasoning_effort(&self, config: &AppConfig) -> Option<ReasoningEffort> {
+        self.reasoning_effort.or(config.harness.reasoning_effort)
     }
 }
 

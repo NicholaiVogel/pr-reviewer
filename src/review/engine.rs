@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use tempfile::tempdir;
 
-use crate::config::{AppConfig, HarnessKind, RepoConfig};
+use crate::config::{AppConfig, HarnessKind, ReasoningEffort, RepoConfig};
 use crate::context::diff_parser::{parse_unified_diff, DiffSide};
 use crate::context::gitnexus;
 use crate::context::retriever::{assemble_context, ContextMode};
@@ -33,6 +33,7 @@ pub struct ReviewOptions {
     pub dry_run: bool,
     pub harness: Option<HarnessKind>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub force: bool,
 }
 
@@ -121,6 +122,10 @@ impl ReviewEngine {
             .clone()
             .or_else(|| repo_cfg.model.clone())
             .unwrap_or_else(|| self.config.harness.model.clone());
+        let reasoning_effort = options
+            .reasoning_effort
+            .or(repo_cfg.reasoning_effort)
+            .or(self.config.harness.reasoning_effort);
         let dedupe = dedupe_key(
             &repo_name,
             pr_data.number,
@@ -222,6 +227,7 @@ impl ReviewEngine {
                         .compose_in_progress_comment(
                             harness_kind,
                             &model,
+                            reasoning_effort,
                             &pr_data.user.login,
                             &pr_data.title,
                             &pr_data.head.sha,
@@ -256,6 +262,7 @@ impl ReviewEngine {
                 options,
                 harness_kind,
                 &model,
+                reasoning_effort,
                 existing_reviews,
             )
             .await;
@@ -288,6 +295,7 @@ impl ReviewEngine {
         &self,
         harness_kind: HarnessKind,
         model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
         pr_author: &str,
         pr_title: &str,
         sha: &str,
@@ -313,6 +321,7 @@ impl ReviewEngine {
             HarnessRunRequest {
                 prompt,
                 model: model.to_string(),
+                reasoning_effort,
                 working_dir: temp.path().to_path_buf(),
                 timeout_secs: IN_PROGRESS_COMMENT_TIMEOUT_SECS,
             },
@@ -363,6 +372,7 @@ impl ReviewEngine {
         options: ReviewOptions,
         harness_kind: HarnessKind,
         model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
         existing_reviews: Vec<PullRequestReview>,
     ) -> Result<ReviewRunResult> {
         let repo_name = repo_cfg.full_name();
@@ -623,6 +633,7 @@ impl ReviewEngine {
             HarnessRunRequest {
                 prompt,
                 model: model.to_string(),
+                reasoning_effort,
                 working_dir: temp.path().to_path_buf(),
                 timeout_secs: self.config.harness.timeout_secs,
             },
@@ -883,6 +894,7 @@ impl ReviewEngine {
     ) -> Result<()> {
         let harness_kind = repo_cfg.resolved_harness(&self.config);
         let model = repo_cfg.resolved_model(&self.config).to_string();
+        let reasoning_effort = repo_cfg.resolved_reasoning_effort(&self.config);
 
         let latest_diff = pr::get_diff(
             &self.github,
@@ -948,6 +960,7 @@ impl ReviewEngine {
             HarnessRunRequest {
                 prompt,
                 model,
+                reasoning_effort,
                 working_dir: temp.path().to_path_buf(),
                 timeout_secs: self.config.harness.timeout_secs,
             },

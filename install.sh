@@ -75,6 +75,86 @@ confirm() {
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+get_cargo_bin_dir() {
+    printf '%s\n' "${CARGO_HOME:-$HOME/.cargo}/bin"
+}
+
+get_user_bin_dir() {
+    printf '%s\n' "${PR_REVIEWER_INSTALL_BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
+}
+
+path_contains_dir() {
+    local dir="$1"
+    case ":$PATH:" in
+        *":$dir:"*) return 0 ;;
+        *)          return 1 ;;
+    esac
+}
+
+resolve_installed_binary() {
+    local candidate
+    local cargo_binary
+    local user_binary
+
+    cargo_binary="$(get_cargo_bin_dir)/pr-reviewer"
+    user_binary="$(get_user_bin_dir)/pr-reviewer"
+
+    for candidate in \
+        "$user_binary" \
+        "$cargo_binary" \
+        "$(type -P pr-reviewer 2>/dev/null || true)" \
+        "$(command -v pr-reviewer 2>/dev/null || true)"
+    do
+        [ -n "$candidate" ] || continue
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+ensure_user_bin_shim() {
+    local cargo_binary
+    local user_bin_dir
+    local shim_path
+    local existing_target
+
+    cargo_binary="$(get_cargo_bin_dir)/pr-reviewer"
+    user_bin_dir="$(get_user_bin_dir)"
+    shim_path="$user_bin_dir/pr-reviewer"
+
+    if [ ! -x "$cargo_binary" ]; then
+        return 0
+    fi
+
+    if [ "$user_bin_dir" = "$(dirname "$cargo_binary")" ]; then
+        return 0
+    fi
+
+    mkdir -p "$user_bin_dir"
+
+    if [ -L "$shim_path" ]; then
+        existing_target="$(readlink "$shim_path" 2>/dev/null || true)"
+        if [ "$existing_target" = "$cargo_binary" ]; then
+            return 0
+        fi
+    elif [ -e "$shim_path" ]; then
+        warn "Existing $shim_path is not managed by the installer, leaving it alone."
+        return 0
+    fi
+
+    ln -sfn "$cargo_binary" "$shim_path"
+    success "Shell shim refreshed: $shim_path -> $cargo_binary"
+
+    if ! path_contains_dir "$user_bin_dir"; then
+        warn "$user_bin_dir is not on your PATH."
+        warn "Add this to your shell profile:"
+        printf "\n    export PATH=\"%s:\$PATH\"\n\n" "$user_bin_dir"
+    fi
+}
+
 # version_ge "1.80.0" "1.75.0" => true (0)
 # compares two dotted version strings
 version_ge() {
@@ -94,7 +174,12 @@ get_rust_version() {
 }
 
 get_pr_reviewer_version() {
-    pr-reviewer --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || true
+    local binary_path
+    binary_path="$(resolve_installed_binary 2>/dev/null || true)"
+    if [ -z "$binary_path" ]; then
+        return 0
+    fi
+    "$binary_path" --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || true
 }
 
 # -- cleanup ------------------------------------------------------------------
@@ -291,9 +376,12 @@ build_and_install() {
     fi
 
     cargo install --path "$source_dir"
+    ensure_user_bin_shim
 
     # verify
-    if command_exists pr-reviewer; then
+    local binary_path
+    binary_path="$(resolve_installed_binary || true)"
+    if [ -n "$binary_path" ]; then
         local new_ver
         new_ver="$(get_pr_reviewer_version)"
         if [ -n "$existing_ver" ]; then
@@ -301,10 +389,12 @@ build_and_install() {
         else
             success "pr-reviewer installed: v$new_ver"
         fi
-        info "Binary: $(command -v pr-reviewer)"
+        info "Binary: $binary_path"
+        info "If your current shell cached an older pr-reviewer path, run: hash -r"
     else
         # cargo install puts it in ~/.cargo/bin, which might not be on PATH
-        local cargo_bin="$HOME/.cargo/bin"
+        local cargo_bin
+        cargo_bin="$(get_cargo_bin_dir)"
         if [ -x "$cargo_bin/pr-reviewer" ]; then
             warn "pr-reviewer was installed to $cargo_bin but it's not on your PATH."
             warn "Add this to your shell profile:"
@@ -335,7 +425,14 @@ initialize_pr_reviewer() {
         return 0
     fi
 
-    pr-reviewer init
+    local binary_path
+    binary_path="$(resolve_installed_binary || true)"
+    if [ -z "$binary_path" ]; then
+        error "pr-reviewer binary not found after install."
+        exit 1
+    fi
+
+    "$binary_path" init
     success "Initialized at $config_dir"
 }
 
@@ -419,7 +516,10 @@ setup_systemd() {
     fi
 
     local binary_path
-    binary_path="$(command -v pr-reviewer || echo "$HOME/.cargo/bin/pr-reviewer")"
+    binary_path="$(resolve_installed_binary || true)"
+    if [ -z "$binary_path" ]; then
+        binary_path="$(get_cargo_bin_dir)/pr-reviewer"
+    fi
     local run_user
     run_user="$(whoami)"
 
@@ -493,10 +593,15 @@ EOF
 
 print_next_steps() {
     local config_dir="${PR_REVIEWER_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/pr-reviewer}"
+    local binary_path
+    binary_path="$(resolve_installed_binary || true)"
+    if [ -z "$binary_path" ]; then
+        binary_path="$(get_cargo_bin_dir)/pr-reviewer"
+    fi
 
     step "Installation complete"
 
-    info "Binary:   $(command -v pr-reviewer 2>/dev/null || echo "$HOME/.cargo/bin/pr-reviewer")"
+    info "Binary:   $binary_path"
     info "Config:   $config_dir/config.toml"
     info "Database: $config_dir/state.db"
 

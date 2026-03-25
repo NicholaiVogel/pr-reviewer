@@ -65,6 +65,8 @@ cd pr-reviewer
 
 The install script checks prerequisites, builds from source, runs `pr-reviewer init`, and audits your runtime dependencies. Run `./install.sh --help` for options.
 
+If you upgraded from an older install location and your current shell still says `pr-reviewer` is missing, run `hash -r` once to clear Bash's cached command path.
+
 ## Getting started
 
 ### 1. Initialize
@@ -109,6 +111,7 @@ If GitNexus is installed, this automatically runs `gitnexus analyze` to index th
 
 ```bash
 pr-reviewer review owner/repo#42 --dry-run
+pr-reviewer review owner/repo#42 --dry-run --harness codex --model gpt-5.4 --reasoning-effort low
 ```
 
 This runs the full review pipeline but logs the output instead of posting to GitHub.
@@ -141,7 +144,8 @@ Config lives at `~/.config/pr-reviewer/config.toml`. All settings can be managed
 ```bash
 pr-reviewer config list                        # show all config
 pr-reviewer config set harness.default codex   # change default harness
-pr-reviewer config set harness.model gpt-5.3-codex
+pr-reviewer config set harness.model gpt-5.4
+pr-reviewer config set harness.reasoning_effort low
 pr-reviewer config get daemon.poll_interval_secs
 ```
 
@@ -158,7 +162,8 @@ name = "openmarketui"
 # local_path is optional — omit to use auto-managed clone at ~/.config/pr-reviewer/repos/
 # local_path = "/mnt/work/dev/openmarketui"
 harness = "codex"
-model = "gpt-5.3-codex"
+model = "gpt-5.4"
+reasoning_effort = "low"
 fork_policy = "ignore"
 ignore_paths = ["*.lock", "dist/**"]
 custom_instructions = "This project uses a custom ORM. Watch for SQL injection."
@@ -232,7 +237,8 @@ Runs `gitnexus analyze` for the target repo(s).
 pr-reviewer review <owner/repo>#<pr_number> \
   [--dry-run] \
   [--harness claude-code|opencode|codex] \
-  [--model <model>]
+  [--model <model>] \
+  [--reasoning-effort none|low|medium|high|xhigh]
 ```
 
 ### `start`

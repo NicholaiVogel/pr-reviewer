@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tokio::process::Command;
 
-use crate::config::HarnessKind;
+use crate::config::{HarnessKind, ReasoningEffort};
 use crate::harness::Harness;
 
 pub struct OpencodeHarness;
@@ -16,7 +16,13 @@ impl Harness for OpencodeHarness {
         "opencode"
     }
 
-    fn build_command(&self, prompt: &str, model: &str, _working_dir: &Path) -> Command {
+    fn build_command(
+        &self,
+        prompt: &str,
+        model: &str,
+        _reasoning_effort: Option<ReasoningEffort>,
+        _working_dir: &Path,
+    ) -> Command {
         let mut cmd = Command::new("opencode");
         cmd.arg("run")
             .arg("--model")

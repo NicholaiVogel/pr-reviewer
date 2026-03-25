@@ -32,6 +32,7 @@ Controls which AI CLI tool runs reviews and how long to wait for a response.
 [harness]
 default = "claude-code"   # claude-code | opencode | codex
 model = "claude-sonnet-4-6"
+reasoning_effort = "low"  # optional, currently used by codex
 timeout_secs = 600
 ```
 
@@ -39,6 +40,7 @@ timeout_secs = 600
 |-------|---------|-------------|
 | `default` | `claude-code` | Harness to use when no per-repo override is set |
 | `model` | `claude-sonnet-4-6` | Model identifier passed to the harness CLI |
+| `reasoning_effort` | unset | Optional reasoning effort override. When using Codex, pr-reviewer passes this through as `-c model_reasoning_effort="..."` |
 | `timeout_secs` | `600` | Seconds to wait for a harness response before treating the review as failed |
 
 ### Harness selection guide
@@ -50,6 +52,8 @@ timeout_secs = 600
 | `codex` | `codex` | OpenAI Codex; fastest option for high-volume repos |
 
 Model names are passed directly to the harness CLI. Use whatever model identifier that CLI accepts — pr-reviewer does no validation.
+
+For Codex, `reasoning_effort` can be `none`, `low`, `medium`, `high`, or `xhigh`. Leave it unset to use your normal Codex defaults.
 
 ---
 

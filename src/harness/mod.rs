@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tokio::process::Command;
 
-use crate::config::HarnessKind;
+use crate::config::{HarnessKind, ReasoningEffort};
 
 pub mod claude_code;
 pub mod codex;
@@ -12,7 +12,13 @@ pub mod spawn;
 pub trait Harness: Send + Sync {
     fn kind(&self) -> HarnessKind;
     fn name(&self) -> &'static str;
-    fn build_command(&self, prompt: &str, model: &str, working_dir: &Path) -> Command;
+    fn build_command(
+        &self,
+        prompt: &str,
+        model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
+        working_dir: &Path,
+    ) -> Command;
     /// Whether this harness accepts the prompt via stdin instead of CLI arg.
     fn uses_stdin(&self) -> bool {
         false
