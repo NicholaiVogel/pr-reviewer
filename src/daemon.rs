@@ -186,6 +186,29 @@ pub async fn start(
             }
 
             if repo_cfg.issue_triage_enabled() {
+                if repo_cfg.is_managed() {
+                    match crate::repo_manager::resolve_local_path(&repo_cfg) {
+                        Ok(local) => {
+                            if let Err(err) =
+                                crate::repo_manager::fetch_latest(&local, github.token()).await
+                            {
+                                tracing::warn!(
+                                    repo = %repo_name,
+                                    error = %err,
+                                    "failed to refresh managed clone before issue triage poll"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                repo = %repo_name,
+                                error = %err,
+                                "failed to resolve managed clone path before issue triage poll"
+                            );
+                        }
+                    }
+                }
+
                 let issue_etag = db.get_issue_repo_etag(&repo_name).await?;
                 let issues = github
                     .list_open_issues(&repo_cfg.owner, &repo_cfg.name, issue_etag.as_deref())
@@ -202,6 +225,51 @@ pub async fn start(
                 match issues {
                     ListIssuesResult::NotModified { etag } => {
                         db.set_issue_repo_etag(&repo_name, etag.as_deref()).await?;
+                        let known_states = db.list_issue_triage_states(&repo_name).await?;
+                        for (issue_number, state) in known_states {
+                            if !should_triage_issue(Some(&state), stale_age as i64) {
+                                continue;
+                            }
+                            if !db
+                                .claim_issue_triage(&repo_name, issue_number, Some(&state))
+                                .await?
+                            {
+                                continue;
+                            }
+
+                            let issue = match github
+                                .get_issue(&repo_cfg.owner, &repo_cfg.name, issue_number as u64)
+                                .await
+                            {
+                                Ok(issue) => issue,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        repo = %repo_cfg.full_name(),
+                                        issue = issue_number,
+                                        error = %err,
+                                        "failed to fetch issue for retry; leaving claim for stale sweep"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            changes_detected = true;
+                            let permit = semaphore.clone().acquire_owned().await?;
+                            let triage_engine = issue_triage.clone();
+                            let repo_cfg = repo_cfg.clone();
+                            workers.spawn(async move {
+                                let _permit = permit;
+                                let res = triage_engine.triage_issue(&repo_cfg, &issue).await;
+                                if let Err(err) = res {
+                                    tracing::error!(
+                                        repo = %repo_cfg.full_name(),
+                                        issue = issue.number,
+                                        error = %err,
+                                        "issue triage retry failed"
+                                    );
+                                }
+                            });
+                        }
                     }
                     ListIssuesResult::Updated { issues, etag } => {
                         db.set_issue_repo_etag(&repo_name, etag.as_deref()).await?;

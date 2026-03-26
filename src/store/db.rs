@@ -587,6 +587,39 @@ impl Database {
         .await
     }
 
+    pub async fn list_issue_triage_states(
+        &self,
+        repo: &str,
+    ) -> Result<Vec<(i64, IssueTriageState)>> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT issue_number, status, claim_version, triage_count, last_attempt_at, last_error, triaged_at FROM issue_triage_state WHERE repo=?1",
+            )?;
+            let rows = stmt.query_map(params![repo], |r| {
+                Ok((
+                    r.get(0)?,
+                    IssueTriageState {
+                        status: r.get(1)?,
+                        claim_version: r.get(2)?,
+                        triage_count: r.get(3)?,
+                        last_attempt_at: r.get(4)?,
+                        last_error: r.get(5)?,
+                        triaged_at: r.get(6)?,
+                    },
+                ))
+            })?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     pub async fn claim_issue_triage(
         &self,
         repo: &str,
@@ -1369,6 +1402,32 @@ mod tests {
             .expect("row");
         assert_eq!(state.status, "claimed");
         assert_eq!(state.claim_version, 1);
+    }
+
+    #[tokio::test]
+    async fn list_issue_triage_states_returns_repo_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        db.begin_issue_triage_attempt("o/r", 9)
+            .await
+            .expect("begin");
+        db.fail_issue_triage("o/r", 9, "boom").await.expect("fail");
+        db.begin_issue_triage_attempt("o/r", 10)
+            .await
+            .expect("begin second");
+        db.complete_issue_triage("o/r", 10).await.expect("complete");
+
+        let rows = db
+            .list_issue_triage_states("o/r")
+            .await
+            .expect("list states");
+        assert!(rows.iter().any(|(n, s)| *n == 9 && s.status == "failed"));
+        assert!(rows
+            .iter()
+            .any(|(n, s)| *n == 10 && s.status == "completed"));
     }
 
     #[tokio::test]

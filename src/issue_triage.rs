@@ -278,16 +278,6 @@ impl IssueTriageEngine {
             }
         };
 
-        if repo_cfg.is_managed() {
-            if let Err(err) = crate::repo_manager::fetch_latest(&local, self.github.token()).await {
-                tracing::warn!(
-                    repo = %repo_cfg.full_name(),
-                    error = %err,
-                    "failed to fetch latest managed clone before issue triage"
-                );
-            }
-        }
-
         Some(local)
     }
 }
