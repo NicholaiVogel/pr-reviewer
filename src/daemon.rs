@@ -13,11 +13,13 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::config::AppConfig;
-use crate::github::client::{GitHubClient, ListPullsResult};
+use crate::github::client::{GitHubClient, ListIssuesResult, ListPullsResult};
+use crate::issue_triage::IssueTriageEngine;
 use crate::review::engine::{ReviewEngine, ReviewOptions};
 use crate::store::db::Database;
 
 const RATE_LIMIT_TOTAL: u32 = 5000;
+const ISSUE_TRIAGE_RETRY_SECS: i64 = 15 * 60;
 
 pub async fn start(
     config: AppConfig,
@@ -47,6 +49,7 @@ pub async fn start(
 
     let mut engine = ReviewEngine::new(Arc::new(config.clone()), github.clone(), db.clone());
     engine.init().await;
+    let issue_triage = IssueTriageEngine::new(Arc::new(config.clone()), github.clone(), db.clone());
     let semaphore = Arc::new(Semaphore::new(config.daemon.max_concurrent_reviews));
     let mut workers: JoinSet<()> = JoinSet::new();
     let bot_mention = format!("@{}", config.defaults.bot_name);
@@ -178,6 +181,161 @@ pub async fn start(
                             &chrono::Utc::now().to_rfc3339(),
                         )
                         .await?;
+                    }
+                }
+            }
+
+            if repo_cfg.issue_triage_enabled() {
+                if repo_cfg.is_managed() {
+                    match crate::repo_manager::resolve_local_path(&repo_cfg) {
+                        Ok(local) => {
+                            if let Err(err) =
+                                crate::repo_manager::fetch_latest(&local, github.token()).await
+                            {
+                                tracing::warn!(
+                                    repo = %repo_name,
+                                    error = %err,
+                                    "failed to refresh managed clone before issue triage poll"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                repo = %repo_name,
+                                error = %err,
+                                "failed to resolve managed clone path before issue triage poll"
+                            );
+                        }
+                    }
+                }
+
+                let issue_etag = db.get_issue_repo_etag(&repo_name).await?;
+                let issues = github
+                    .list_open_issues(&repo_cfg.owner, &repo_cfg.name, issue_etag.as_deref())
+                    .await;
+
+                let issues = match issues {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(repo = %repo_name, error = %err, "failed to poll issues");
+                        continue;
+                    }
+                };
+
+                match issues {
+                    ListIssuesResult::NotModified { etag } => {
+                        db.set_issue_repo_etag(&repo_name, etag.as_deref()).await?;
+                        let known_states = db.list_issue_triage_states(&repo_name).await?;
+                        for (issue_number, state) in known_states {
+                            if !should_triage_issue(Some(&state), stale_age as i64) {
+                                continue;
+                            }
+                            if !db
+                                .claim_issue_triage(&repo_name, issue_number, Some(&state))
+                                .await?
+                            {
+                                continue;
+                            }
+
+                            let issue = match github
+                                .get_issue(&repo_cfg.owner, &repo_cfg.name, issue_number as u64)
+                                .await
+                            {
+                                Ok(issue) => issue,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        repo = %repo_cfg.full_name(),
+                                        issue = issue_number,
+                                        error = %err,
+                                        "failed to fetch issue for retry; leaving claim for stale sweep"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            changes_detected = true;
+                            let permit = semaphore.clone().acquire_owned().await?;
+                            let triage_engine = issue_triage.clone();
+                            let repo_cfg = repo_cfg.clone();
+                            workers.spawn(async move {
+                                let _permit = permit;
+                                let res = triage_engine.triage_issue(&repo_cfg, &issue).await;
+                                if let Err(err) = res {
+                                    tracing::error!(
+                                        repo = %repo_cfg.full_name(),
+                                        issue = issue.number,
+                                        error = %err,
+                                        "issue triage retry failed"
+                                    );
+                                }
+                            });
+                        }
+                    }
+                    ListIssuesResult::Updated { issues, etag } => {
+                        db.set_issue_repo_etag(&repo_name, etag.as_deref()).await?;
+                        let last_issue_number =
+                            db.get_issue_repo_last_issue_number(&repo_name).await?;
+                        let max_issue_number = issues.iter().map(|issue| issue.number as i64).max();
+                        let max_issue_number = max_issue_number.unwrap_or(0);
+
+                        if let Some(last_issue_number) = last_issue_number {
+                            for issue in issues {
+                                let state = db
+                                    .get_issue_triage_state(&repo_name, issue.number as i64)
+                                    .await?;
+                                if !should_process_issue(
+                                    issue.number as i64,
+                                    last_issue_number,
+                                    state.as_ref(),
+                                    stale_age as i64,
+                                ) {
+                                    continue;
+                                }
+                                if !db
+                                    .claim_issue_triage(
+                                        &repo_name,
+                                        issue.number as i64,
+                                        state.as_ref(),
+                                    )
+                                    .await?
+                                {
+                                    continue;
+                                }
+
+                                changes_detected = true;
+                                let permit = semaphore.clone().acquire_owned().await?;
+                                let triage_engine = issue_triage.clone();
+                                let repo_cfg = repo_cfg.clone();
+                                let issue_for_triage = issue.clone();
+                                workers.spawn(async move {
+                                    let _permit = permit;
+                                    let res = triage_engine
+                                        .triage_issue(&repo_cfg, &issue_for_triage)
+                                        .await;
+                                    if let Err(err) = res {
+                                        tracing::error!(
+                                            repo = %repo_cfg.full_name(),
+                                            issue = issue_for_triage.number,
+                                            error = %err,
+                                            "issue triage failed"
+                                        );
+                                    }
+                                });
+                            }
+
+                            if max_issue_number > last_issue_number {
+                                db.set_issue_repo_last_issue_number(
+                                    &repo_name,
+                                    Some(max_issue_number),
+                                )
+                                .await?;
+                            }
+                        } else {
+                            // First issue-poll for this repo: seed the high-water mark and skip
+                            // triaging previously-open issues.
+                            db.set_issue_repo_last_issue_number(&repo_name, Some(max_issue_number))
+                                .await?;
+                        }
                     }
                 }
             }
@@ -405,6 +563,62 @@ fn parse_rfc3339_to_utc(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(raw)
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|dt| {
+                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc)
+                })
+        })
+}
+
+fn should_triage_issue(
+    state: Option<&crate::store::db::IssueTriageState>,
+    stale_claim_secs: i64,
+) -> bool {
+    let Some(state) = state else {
+        return true;
+    };
+
+    match state.status.as_str() {
+        "completed" => false,
+        "claimed" => {
+            let age = state
+                .last_attempt_at
+                .as_deref()
+                .and_then(parse_rfc3339_to_utc)
+                .map(|ts| (chrono::Utc::now() - ts).num_seconds())
+                .unwrap_or(i64::MAX);
+            age >= stale_claim_secs
+        }
+        "failed" => {
+            let age = state
+                .last_attempt_at
+                .as_deref()
+                .and_then(parse_rfc3339_to_utc)
+                .map(|ts| (chrono::Utc::now() - ts).num_seconds())
+                .unwrap_or(i64::MAX);
+            age >= ISSUE_TRIAGE_RETRY_SECS
+        }
+        _ => true,
+    }
+}
+
+fn should_process_issue(
+    issue_number: i64,
+    last_issue_number: i64,
+    state: Option<&crate::store::db::IssueTriageState>,
+    stale_claim_secs: i64,
+) -> bool {
+    let is_new_issue = issue_number > last_issue_number;
+    let has_prior_state = state.is_some();
+
+    if !is_new_issue && !has_prior_state {
+        // Legacy issue from before high-water mark with no prior triage state.
+        return false;
+    }
+
+    should_triage_issue(state, stale_claim_secs)
 }
 
 fn format_duration(secs: i64) -> String {
@@ -425,6 +639,7 @@ fn format_duration(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::db::IssueTriageState;
 
     #[test]
     fn format_status_includes_key_fields() {
@@ -455,6 +670,49 @@ mod tests {
         assert!(out.contains("claimed: 5"));
         assert!(out.contains("remaining: 4321 / 5000"));
         assert!(out.contains("owner/repo"));
+    }
+
+    #[test]
+    fn completed_issue_triage_is_not_requeued() {
+        let state = IssueTriageState {
+            status: "completed".to_string(),
+            claim_version: 0,
+            triage_count: 1,
+            last_attempt_at: Some(chrono::Utc::now().to_rfc3339()),
+            last_error: None,
+            triaged_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+
+        assert!(!should_triage_issue(Some(&state), 60));
+    }
+
+    #[test]
+    fn sqlite_timestamp_parses_as_utc() {
+        let parsed = parse_rfc3339_to_utc("2026-03-26 05:49:15").expect("sqlite timestamp");
+        assert_eq!(parsed.to_rfc3339(), "2026-03-26T05:49:15+00:00");
+    }
+
+    #[test]
+    fn legacy_issue_without_state_stays_skipped_after_high_water_mark() {
+        assert!(!should_process_issue(100, 100, None, 60));
+        assert!(!should_process_issue(90, 100, None, 60));
+    }
+
+    #[test]
+    fn stale_failed_issue_below_high_water_mark_can_retry() {
+        let state = IssueTriageState {
+            status: "failed".to_string(),
+            claim_version: 1,
+            triage_count: 1,
+            last_attempt_at: Some(
+                (chrono::Utc::now() - chrono::Duration::seconds(ISSUE_TRIAGE_RETRY_SECS + 5))
+                    .to_rfc3339(),
+            ),
+            last_error: Some("boom".to_string()),
+            triaged_at: None,
+        };
+
+        assert!(should_process_issue(90, 100, Some(&state), 60));
     }
 }
 

@@ -29,6 +29,16 @@ pub struct PrState {
 }
 
 #[derive(Debug, Clone)]
+pub struct IssueTriageState {
+    pub status: String,
+    pub claim_version: i64,
+    pub triage_count: i64,
+    pub last_attempt_at: Option<String>,
+    pub last_error: Option<String>,
+    pub triaged_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReviewClaim {
     pub dedupe_key: String,
     pub repo: String,
@@ -174,6 +184,24 @@ impl Database {
                     etag TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS issue_repo_state (
+                    repo TEXT PRIMARY KEY,
+                    etag TEXT,
+                    last_issue_number INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS issue_triage_state (
+                    repo TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'claimed',
+                    claim_version INTEGER NOT NULL DEFAULT 0,
+                    triage_count INTEGER DEFAULT 0,
+                    last_attempt_at TEXT DEFAULT (datetime('now')),
+                    last_error TEXT,
+                    triaged_at TEXT,
+                    PRIMARY KEY (repo, issue_number)
+                );
+
                 CREATE TABLE IF NOT EXISTS review_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     dedupe_key TEXT UNIQUE NOT NULL,
@@ -223,6 +251,13 @@ impl Database {
             ensure_column_exists(conn, "daemon_state", "started_at", "TEXT")?;
             ensure_column_exists(conn, "daemon_state", "rate_limit_total", "INTEGER")?;
             ensure_column_exists(conn, "daemon_state", "rate_reset_epoch", "INTEGER")?;
+            ensure_column_exists(
+                conn,
+                "issue_triage_state",
+                "claim_version",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column_exists(conn, "issue_repo_state", "last_issue_number", "INTEGER")?;
 
             conn.execute(
                 "INSERT OR IGNORE INTO daemon_state (id, started_at, last_poll_at, rate_limit_total, rate_remaining, rate_reset_epoch, active_reviews) VALUES (1, NULL, NULL, NULL, NULL, NULL, 0)",
@@ -448,6 +483,265 @@ impl Database {
                 )
                 .optional()?;
             Ok(etag)
+        })
+        .await
+    }
+
+    pub async fn set_issue_repo_etag(&self, repo: &str, etag: Option<&str>) -> Result<()> {
+        self.set_issue_repo_state(repo, etag, None).await
+    }
+
+    pub async fn set_issue_repo_last_issue_number(
+        &self,
+        repo: &str,
+        last_issue_number: Option<i64>,
+    ) -> Result<()> {
+        self.set_issue_repo_state(repo, None, last_issue_number)
+            .await
+    }
+
+    pub async fn set_issue_repo_state(
+        &self,
+        repo: &str,
+        etag: Option<&str>,
+        last_issue_number: Option<i64>,
+    ) -> Result<()> {
+        let repo = repo.to_string();
+        let etag = etag.map(ToString::to_string);
+        let last_issue_number = last_issue_number;
+
+        self.run(move |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO issue_repo_state(repo, etag, last_issue_number)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(repo) DO UPDATE SET
+                    etag = COALESCE(excluded.etag, issue_repo_state.etag),
+                    last_issue_number = COALESCE(excluded.last_issue_number, issue_repo_state.last_issue_number)
+                "#,
+                params![repo, etag, last_issue_number],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn get_issue_repo_etag(&self, repo: &str) -> Result<Option<String>> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            let etag = conn
+                .query_row(
+                    "SELECT etag FROM issue_repo_state WHERE repo=?1",
+                    params![repo],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(etag)
+        })
+        .await
+    }
+
+    pub async fn get_issue_repo_last_issue_number(&self, repo: &str) -> Result<Option<i64>> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            let last_issue_number = conn
+                .query_row(
+                    "SELECT last_issue_number FROM issue_repo_state WHERE repo=?1",
+                    params![repo],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(last_issue_number)
+        })
+        .await
+    }
+
+    pub async fn get_issue_triage_state(
+        &self,
+        repo: &str,
+        issue_number: i64,
+    ) -> Result<Option<IssueTriageState>> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT status, claim_version, triage_count, last_attempt_at, last_error, triaged_at FROM issue_triage_state WHERE repo=?1 AND issue_number=?2",
+                    params![repo, issue_number],
+                    |r| {
+                        Ok(IssueTriageState {
+                            status: r.get(0)?,
+                            claim_version: r.get(1)?,
+                            triage_count: r.get(2)?,
+                            last_attempt_at: r.get(3)?,
+                            last_error: r.get(4)?,
+                            triaged_at: r.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await
+    }
+
+    pub async fn list_issue_triage_states(
+        &self,
+        repo: &str,
+    ) -> Result<Vec<(i64, IssueTriageState)>> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT issue_number, status, claim_version, triage_count, last_attempt_at, last_error, triaged_at FROM issue_triage_state WHERE repo=?1",
+            )?;
+            let rows = stmt.query_map(params![repo], |r| {
+                Ok((
+                    r.get(0)?,
+                    IssueTriageState {
+                        status: r.get(1)?,
+                        claim_version: r.get(2)?,
+                        triage_count: r.get(3)?,
+                        last_attempt_at: r.get(4)?,
+                        last_error: r.get(5)?,
+                        triaged_at: r.get(6)?,
+                    },
+                ))
+            })?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub async fn claim_issue_triage(
+        &self,
+        repo: &str,
+        issue_number: i64,
+        observed: Option<&IssueTriageState>,
+    ) -> Result<bool> {
+        let repo = repo.to_string();
+        let observed_status = observed.map(|state| state.status.clone());
+        let observed_claim_version = observed.map(|state| state.claim_version);
+
+        self.run(move |conn| {
+            if observed_status.is_none() {
+                let changed = conn.execute(
+                    r#"
+                    INSERT OR IGNORE INTO issue_triage_state (
+                        repo,
+                        issue_number,
+                        status,
+                        claim_version,
+                        triage_count,
+                        last_attempt_at,
+                        last_error,
+                        triaged_at
+                    )
+                    VALUES (?1, ?2, 'claimed', 0, 0, datetime('now'), NULL, NULL)
+                    "#,
+                    params![repo, issue_number],
+                )?;
+                return Ok(changed > 0);
+            }
+
+            let changed = conn.execute(
+                r#"
+                UPDATE issue_triage_state
+                SET status='claimed',
+                    claim_version=claim_version + 1,
+                    last_attempt_at=datetime('now'),
+                    last_error=NULL
+                WHERE repo=?1
+                  AND issue_number=?2
+                  AND status != 'completed'
+                  AND status=?3
+                  AND claim_version=?4
+                "#,
+                params![repo, issue_number, observed_status, observed_claim_version],
+            )?;
+
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn begin_issue_triage_attempt(&self, repo: &str, issue_number: i64) -> Result<()> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO issue_triage_state (
+                    repo,
+                    issue_number,
+                    status,
+                    claim_version,
+                    triage_count,
+                    last_attempt_at,
+                    last_error,
+                    triaged_at
+                )
+                VALUES (?1, ?2, 'claimed', 0, 0, datetime('now'), NULL, NULL)
+                ON CONFLICT(repo, issue_number) DO UPDATE SET
+                    status='claimed',
+                    claim_version=issue_triage_state.claim_version + 1,
+                    last_attempt_at=datetime('now'),
+                    last_error=NULL
+                "#,
+                params![repo, issue_number],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn complete_issue_triage(&self, repo: &str, issue_number: i64) -> Result<()> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            conn.execute(
+                r#"
+                UPDATE issue_triage_state
+                SET status='completed',
+                    triage_count=triage_count + 1,
+                    last_error=NULL,
+                    triaged_at=datetime('now')
+                WHERE repo=?1 AND issue_number=?2
+                "#,
+                params![repo, issue_number],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn fail_issue_triage(
+        &self,
+        repo: &str,
+        issue_number: i64,
+        message: &str,
+    ) -> Result<()> {
+        let repo = repo.to_string();
+        let message = message.to_string();
+
+        self.run(move |conn| {
+            conn.execute(
+                r#"
+                UPDATE issue_triage_state
+                SET status='failed',
+                    last_error=?3
+                WHERE repo=?1 AND issue_number=?2
+                "#,
+                params![repo, issue_number, message],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -1012,5 +1306,186 @@ mod tests {
 
         assert!(db.claim_review(claim).await.expect("claim"));
         assert_eq!(db.get_claimed_reviews().await.expect("depth"), 1);
+    }
+
+    #[tokio::test]
+    async fn issue_triage_claim_complete_and_block_reclaim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        assert!(db.claim_issue_triage("o/r", 7, None).await.expect("claim"));
+        db.complete_issue_triage("o/r", 7).await.expect("complete");
+
+        let state = db
+            .get_issue_triage_state("o/r", 7)
+            .await
+            .expect("state")
+            .expect("row");
+        assert_eq!(state.status, "completed");
+        assert_eq!(state.claim_version, 0);
+        assert_eq!(state.triage_count, 1);
+
+        assert!(!db
+            .claim_issue_triage("o/r", 7, Some(&state))
+            .await
+            .expect("reclaim after complete"));
+    }
+
+    #[tokio::test]
+    async fn issue_triage_claim_compare_and_swap_blocks_races() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        assert!(db
+            .claim_issue_triage("o/r", 7, None)
+            .await
+            .expect("initial claim"));
+        db.fail_issue_triage("o/r", 7, "boom").await.expect("fail");
+
+        let observed = db
+            .get_issue_triage_state("o/r", 7)
+            .await
+            .expect("state")
+            .expect("row");
+        assert_eq!(observed.status, "failed");
+        assert_eq!(observed.claim_version, 0);
+
+        assert!(db
+            .claim_issue_triage("o/r", 7, Some(&observed))
+            .await
+            .expect("first reclaim"));
+        assert!(!db
+            .claim_issue_triage("o/r", 7, Some(&observed))
+            .await
+            .expect("stale reclaim"));
+
+        let current = db
+            .get_issue_triage_state("o/r", 7)
+            .await
+            .expect("state")
+            .expect("row");
+        assert_eq!(current.status, "claimed");
+        assert_eq!(current.claim_version, 1);
+    }
+
+    #[tokio::test]
+    async fn begin_issue_triage_attempt_persists_manual_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        db.begin_issue_triage_attempt("o/r", 9)
+            .await
+            .expect("begin");
+        db.complete_issue_triage("o/r", 9).await.expect("complete");
+
+        let state = db
+            .get_issue_triage_state("o/r", 9)
+            .await
+            .expect("state")
+            .expect("row");
+        assert_eq!(state.status, "completed");
+        assert_eq!(state.triage_count, 1);
+
+        db.begin_issue_triage_attempt("o/r", 9)
+            .await
+            .expect("begin again");
+        let state = db
+            .get_issue_triage_state("o/r", 9)
+            .await
+            .expect("state")
+            .expect("row");
+        assert_eq!(state.status, "claimed");
+        assert_eq!(state.claim_version, 1);
+    }
+
+    #[tokio::test]
+    async fn list_issue_triage_states_returns_repo_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        db.begin_issue_triage_attempt("o/r", 9)
+            .await
+            .expect("begin");
+        db.fail_issue_triage("o/r", 9, "boom").await.expect("fail");
+        db.begin_issue_triage_attempt("o/r", 10)
+            .await
+            .expect("begin second");
+        db.complete_issue_triage("o/r", 10).await.expect("complete");
+
+        let rows = db
+            .list_issue_triage_states("o/r")
+            .await
+            .expect("list states");
+        assert!(rows.iter().any(|(n, s)| *n == 9 && s.status == "failed"));
+        assert!(rows
+            .iter()
+            .any(|(n, s)| *n == 10 && s.status == "completed"));
+    }
+
+    #[tokio::test]
+    async fn issue_repo_state_tracks_etag_and_high_water_mark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        assert!(db.get_issue_repo_etag("o/r").await.expect("etag").is_none());
+        assert!(db
+            .get_issue_repo_last_issue_number("o/r")
+            .await
+            .expect("number")
+            .is_none());
+
+        db.set_issue_repo_etag("o/r", Some("W/initial"))
+            .await
+            .expect("set etag");
+        db.set_issue_repo_last_issue_number("o/r", Some(100))
+            .await
+            .expect("set issue number");
+
+        assert_eq!(
+            db.get_issue_repo_last_issue_number("o/r")
+                .await
+                .expect("number")
+                .expect("row"),
+            100
+        );
+        assert_eq!(
+            db.get_issue_repo_etag("o/r")
+                .await
+                .expect("etag")
+                .expect("row"),
+            "W/initial"
+        );
+
+        db.set_issue_repo_etag("o/r", Some("W/updated"))
+            .await
+            .expect("update etag only");
+        db.set_issue_repo_state("o/r", Some("W/stateful"), Some(150))
+            .await
+            .expect("update state");
+
+        assert_eq!(
+            db.get_issue_repo_last_issue_number("o/r")
+                .await
+                .expect("number")
+                .expect("row"),
+            150
+        );
+        assert_eq!(
+            db.get_issue_repo_etag("o/r")
+                .await
+                .expect("etag")
+                .expect("row"),
+            "W/stateful"
+        );
     }
 }

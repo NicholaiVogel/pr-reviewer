@@ -164,6 +164,16 @@ trusted_authors = ["dependabot[bot]", "renovate[bot]"]
 ignore_paths = ["*.lock", "dist/**", "vendor/**"]
 custom_instructions = "This project uses a custom ORM. Watch for N+1 queries."
 gitnexus = true
+
+  [repos.issue_triage]
+  enabled = true
+  create_missing_labels = false
+  max_context_bytes = 65536
+  max_labels_to_create = 3
+  allowed_new_label_prefixes = ["bug", "documentation", "enhancement", "question", "spec", "spec:", "priority", "priority: ", "area", "area:", "bucket", "bucket:"]
+  max_new_label_name_chars = 50
+  max_new_label_description_chars = 256
+  instructions = "Prefer existing area:* labels."
 ```
 
 | Field | Description |
@@ -178,6 +188,14 @@ gitnexus = true
 | `ignore_paths` | Glob patterns for files to exclude from context |
 | `custom_instructions` | Free-text hints appended to the review prompt |
 | `gitnexus` | Whether to include GitNexus impact analysis in context. Default: `true` (best-effort; gracefully skipped if unavailable) |
+| `issue_triage.enabled` | Enable automatic issue sorting/labeling for newly opened issues in this repo |
+| `issue_triage.create_missing_labels` | Allow pr-reviewer to create missing labels when the repo has no equivalent taxonomy. Default: `false` |
+| `issue_triage.max_labels_to_create` | Hard cap on how many new labels can be proposed per triage run. Default: `3` |
+| `issue_triage.allowed_new_label_prefixes` | Allowed prefixes for newly created labels. If empty, no new labels are allowed. |
+| `issue_triage.max_new_label_name_chars` | Max new label name length in characters. Default: `50` |
+| `issue_triage.max_new_label_description_chars` | Max new label description length in characters. Default: `256` |
+| `issue_triage.max_context_bytes` | Max repo instruction/spec context loaded for issue triage. Default: `65536` |
+| `issue_triage.instructions` | Extra issue-triage-specific guidance, separate from PR review instructions |
 
 When enabled, pr-reviewer enriches context with:
 - ranked GitNexus processes related to changed files
@@ -193,6 +211,21 @@ When `local_path` is omitted, pr-reviewer clones the repo to `~/.config/pr-revie
 - `fetch_latest` runs before each review to keep the index fresh
 
 Use `local_path` only if you already have a clone you want to reuse. Note that the review context is assembled from GitHub API responses, not the local clone — the clone is only used for GitNexus indexing.
+
+### Issue triage
+
+When `issue_triage.enabled = true`, the daemon also watches the repo's open issues feed. Newly seen issues are triaged once: pr-reviewer loads repo instructions/spec files from the local clone, fetches the repo's existing label catalog, asks the configured harness to classify the issue, then applies the proposed labels.
+
+By default, pr-reviewer only applies labels that already exist in the repository. Set `issue_triage.create_missing_labels = true` if you want it to create missing labels as part of the triage pass.
+
+On first run for a repo, pr-reviewer remembers the highest currently-open issue number and skips triaging those legacy issues. On subsequent polls, it only triages issues with a higher number than the stored high-water mark, then advances the mark forward.
+
+Manual triage command:
+
+```bash
+pr-reviewer triage owner/repo#123 --dry-run
+pr-reviewer triage owner/repo#123
+```
 
 ---
 
