@@ -28,3 +28,12 @@ max_prompt_bytes = 204800
 
 [serve]
 enabled = false
+
+[[repos]]
+# owner = "your-org"
+# name = "your-repo"
+# [repos.issue_triage]
+# enabled = true
+# create_missing_labels = false
+# max_context_bytes = 65536
+# instructions = "Prefer our existing `area:*` labels when they fit."

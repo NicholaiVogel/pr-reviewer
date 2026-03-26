@@ -3,6 +3,7 @@ mod context;
 mod daemon;
 mod github;
 mod harness;
+mod issue_triage;
 mod repo_manager;
 mod review;
 mod safety;
@@ -65,6 +66,17 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    Triage {
+        target: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        harness: Option<HarnessKind>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        reasoning_effort: Option<ReasoningEffort>,
+    },
     Status {
         #[arg(long)]
         json: bool,
@@ -110,6 +122,8 @@ struct AddArgs {
     model: Option<String>,
     #[arg(long)]
     reasoning_effort: Option<ReasoningEffort>,
+    #[arg(long)]
+    triage_issues: bool,
     #[arg(long, default_value = "ignore")]
     fork_policy: String,
     #[arg(long)]
@@ -217,6 +231,10 @@ async fn main() -> Result<()> {
                 ],
                 custom_instructions: None,
                 gitnexus: true,
+                issue_triage: config::IssueTriageConfig {
+                    enabled: args.triage_issues,
+                    ..Default::default()
+                },
                 workflow: vec![],
             };
             let repo_name = repo_cfg.full_name();
@@ -283,13 +301,14 @@ async fn main() -> Result<()> {
                         .unwrap_or_else(|_| "(unresolved)".to_string());
                     let managed = if repo.is_managed() { " [managed]" } else { "" };
                     println!(
-                        "{}  path={}{managed}  harness={}  model={}  reasoning={}  fork_policy={:?}",
+                        "{}  path={}{managed}  harness={}  model={}  reasoning={}  fork_policy={:?}  issue_triage={}",
                         repo.full_name(),
                         path,
                         harness,
                         model,
                         reasoning_effort,
-                        repo.fork_policy
+                        repo.fork_policy,
+                        if repo.issue_triage.enabled { "on" } else { "off" }
                     );
                 }
             }
@@ -367,6 +386,72 @@ async fn main() -> Result<()> {
                 result.status,
                 result.verdict,
                 result.comments_posted
+            );
+        }
+        Commands::Triage {
+            target,
+            dry_run,
+            harness,
+            model,
+            reasoning_effort,
+        } => {
+            let cfg = Arc::new(AppConfig::load_or_default()?);
+            let db = Database::new(AppConfig::db_file()?).await?;
+            let gh = github_client_from_config(&cfg).await?;
+
+            let (repo_name, issue_number) = parse_target(&target)?;
+            let mut repo_cfg = cfg
+                .get_repo(&repo_name)
+                .cloned()
+                .ok_or_else(|| anyhow!("repo not configured: {repo_name}"))?;
+
+            if let Some(harness) = harness {
+                repo_cfg.harness = Some(harness);
+            }
+            if let Some(model) = model {
+                repo_cfg.model = Some(model);
+            }
+            if let Some(reasoning_effort) = reasoning_effort {
+                repo_cfg.reasoning_effort = Some(reasoning_effort);
+            }
+
+            let issue = gh
+                .get_issue(&repo_cfg.owner, &repo_cfg.name, issue_number)
+                .await?;
+            let engine = issue_triage::IssueTriageEngine::new(cfg.clone(), gh, db);
+            let result = engine
+                .triage_issue_with_options(
+                    &repo_cfg,
+                    &issue,
+                    issue_triage::IssueTriageOptions {
+                        dry_run,
+                        ..issue_triage::IssueTriageOptions::default()
+                    },
+                )
+                .await?;
+
+            println!(
+                "{}#{} triage {}",
+                repo_cfg.full_name(),
+                issue.number,
+                if result.dry_run { "dry-run" } else { "applied" }
+            );
+            println!("summary: {}", result.summary);
+            println!(
+                "labels_to_add: {}",
+                if result.labels_added.is_empty() {
+                    "-".to_string()
+                } else {
+                    result.labels_added.join(", ")
+                }
+            );
+            println!(
+                "labels_to_create: {}",
+                if result.labels_created.is_empty() {
+                    "-".to_string()
+                } else {
+                    result.labels_created.join(", ")
+                }
             );
         }
         Commands::Status { json } => {
@@ -569,10 +654,10 @@ fn parse_target(target: &str) -> Result<(String, u64)> {
     let (repo, number) = target
         .rsplit_once('#')
         .ok_or_else(|| anyhow!("invalid target format, expected owner/repo#number"))?;
-    let pr_number = number
+    let item_number = number
         .parse::<u64>()
-        .with_context(|| format!("invalid PR number: {number}"))?;
-    Ok((repo.to_string(), pr_number))
+        .with_context(|| format!("invalid item number: {number}"))?;
+    Ok((repo.to_string(), item_number))
 }
 
 fn parse_fork_policy(raw: &str) -> Result<ForkPolicy> {
@@ -620,6 +705,7 @@ fn add_scanned_repos(cfg: &mut AppConfig, scan_dir: &Path) -> Result<()> {
             ignore_paths: vec![],
             custom_instructions: None,
             gitnexus: true,
+            issue_triage: Default::default(),
             workflow: vec![],
         };
 

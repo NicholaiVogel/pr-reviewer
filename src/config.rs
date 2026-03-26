@@ -153,6 +153,18 @@ pub struct DaemonConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueTriageConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub create_missing_labels: bool,
+    #[serde(default = "default_issue_triage_context_bytes")]
+    pub max_context_bytes: usize,
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultsConfig {
     #[serde(default = "default_auto_review")]
     pub auto_review: bool,
@@ -242,6 +254,8 @@ pub struct RepoConfig {
     pub custom_instructions: Option<String>,
     #[serde(default = "default_gitnexus")]
     pub gitnexus: bool,
+    #[serde(default)]
+    pub issue_triage: IssueTriageConfig,
     /// Optional multi-step review workflow. When non-empty the daemon runs
     /// each enabled step in order instead of the single-step legacy behaviour.
     #[serde(default)]
@@ -330,6 +344,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_issue_triage_context_bytes() -> usize {
+    64 * 1024
+}
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
@@ -365,6 +383,17 @@ impl Default for DefaultsConfig {
             dry_run: false,
             max_prompt_bytes: default_prompt_limit(),
             skip_docs_only: true,
+        }
+    }
+}
+
+impl Default for IssueTriageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            create_missing_labels: false,
+            max_context_bytes: default_issue_triage_context_bytes(),
+            instructions: None,
         }
     }
 }
@@ -410,6 +439,10 @@ impl RepoConfig {
 
     pub fn resolved_reasoning_effort(&self, config: &AppConfig) -> Option<ReasoningEffort> {
         self.reasoning_effort.or(config.harness.reasoning_effort)
+    }
+
+    pub fn issue_triage_enabled(&self) -> bool {
+        self.issue_triage.enabled
     }
 }
 

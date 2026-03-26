@@ -5,6 +5,15 @@ pub struct User {
     pub login: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Label {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepoRef {
     pub full_name: String,
@@ -71,6 +80,23 @@ pub struct IssueComment {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Issue {
+    pub number: u64,
+    pub title: String,
+    pub body: Option<String>,
+    pub user: User,
+    #[serde(default)]
+    pub labels: Vec<Label>,
+    #[serde(default)]
+    pub comments: u64,
+    pub html_url: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub pull_request: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateReviewComment {
     pub path: String,
@@ -90,6 +116,19 @@ pub struct CreateReviewRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateIssueCommentRequest {
     pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AddLabelsRequest {
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateLabelRequest {
+    pub name: String,
+    pub color: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

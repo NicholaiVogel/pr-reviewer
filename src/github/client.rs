@@ -6,8 +6,9 @@ use reqwest::header::{HeaderMap, ACCEPT, ETAG, IF_NONE_MATCH, USER_AGENT};
 use reqwest::{Client, Method};
 
 use crate::github::types::{
-    ContentResponse, CreateIssueCommentRequest, CreateReplyRequest, CreateReviewRequest,
-    IssueComment, PrFile, PullRequest, PullRequestReview, ReviewComment,
+    AddLabelsRequest, ContentResponse, CreateIssueCommentRequest, CreateLabelRequest,
+    CreateReplyRequest, CreateReviewRequest, Issue, IssueComment, Label, PrFile, PullRequest,
+    PullRequestReview, ReviewComment,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -24,6 +25,17 @@ pub enum ListPullsResult {
     },
     Updated {
         prs: Vec<PullRequest>,
+        etag: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ListIssuesResult {
+    NotModified {
+        etag: Option<String>,
+    },
+    Updated {
+        issues: Vec<Issue>,
         etag: Option<String>,
     },
 }
@@ -110,6 +122,89 @@ impl GitHubClient {
         })
     }
 
+    pub async fn list_open_issues(
+        &self,
+        owner: &str,
+        repo: &str,
+        etag: Option<&str>,
+    ) -> Result<ListIssuesResult> {
+        let mut all_issues = Vec::new();
+        let mut page = 1u32;
+        let mut new_etag = etag.map(ToString::to_string);
+
+        loop {
+            let path = format!(
+                "/repos/{owner}/{repo}/issues?state=open&sort=created&direction=desc&per_page=100&page={page}"
+            );
+            let mut req = self.request(Method::GET, &path);
+            if page == 1 {
+                if let Some(tag) = etag {
+                    req = req.header(IF_NONE_MATCH, tag);
+                }
+            }
+
+            let resp = req
+                .send()
+                .await
+                .context("GitHub list issues request failed")?;
+            self.update_rate_state(resp.headers());
+
+            if page == 1 {
+                new_etag = resp
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(ToString::to_string)
+                    .or_else(|| etag.map(ToString::to_string));
+
+                if resp.status().as_u16() == 304 {
+                    return Ok(ListIssuesResult::NotModified { etag: new_etag });
+                }
+            }
+
+            let has_next = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("rel=\"next\""));
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("GitHub list issues failed ({status}): {body}"));
+            }
+
+            let batch: Vec<Issue> = resp
+                .json::<Vec<Issue>>()
+                .await
+                .context("failed to decode issue list")?
+                .into_iter()
+                .filter(|issue| issue.pull_request.is_none())
+                .collect();
+            let batch_empty = batch.is_empty();
+            all_issues.extend(batch);
+
+            let truncated = has_next && !batch_empty && page >= 10;
+            if truncated {
+                tracing::warn!(
+                    owner = owner,
+                    repo = repo,
+                    issue_count = all_issues.len(),
+                    "issue pagination hit 10-page cap; triage coverage may be partial"
+                );
+            }
+            if !has_next || batch_empty || page >= 10 {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(ListIssuesResult::Updated {
+            issues: all_issues,
+            etag: new_etag,
+        })
+    }
+
     pub async fn get_pull_request(
         &self,
         owner: &str,
@@ -124,6 +219,23 @@ impl GitHubClient {
             .context("GitHub get PR failed")?;
         self.update_rate_state(resp.headers());
         handle_json(resp).await
+    }
+
+    pub async fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<Issue> {
+        let path = format!("/repos/{owner}/{repo}/issues/{number}");
+        let resp = self
+            .request(Method::GET, &path)
+            .send()
+            .await
+            .context("GitHub get issue failed")?;
+        self.update_rate_state(resp.headers());
+        let issue: Issue = handle_json(resp).await?;
+        if issue.pull_request.is_some() {
+            return Err(anyhow!(
+                "target {owner}/{repo}#{number} is a pull request, not an issue"
+            ));
+        }
+        Ok(issue)
     }
 
     pub async fn get_pr_diff(&self, owner: &str, repo: &str, number: u64) -> Result<String> {
@@ -325,6 +437,100 @@ impl GitHubClient {
         }
 
         Ok(())
+    }
+
+    pub async fn add_issue_labels(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        labels: &[String],
+    ) -> Result<()> {
+        let path = format!("/repos/{owner}/{repo}/issues/{issue_number}/labels");
+        let payload = AddLabelsRequest {
+            labels: labels.to_vec(),
+        };
+        let resp = self
+            .request(Method::POST, &path)
+            .json(&payload)
+            .send()
+            .await
+            .context("GitHub add issue labels failed")?;
+        self.update_rate_state(resp.headers());
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("GitHub add issue labels failed ({status}): {text}"));
+        }
+
+        Ok(())
+    }
+
+    pub async fn list_repo_labels(&self, owner: &str, repo: &str) -> Result<Vec<Label>> {
+        let mut all_labels = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let path = format!("/repos/{owner}/{repo}/labels?per_page=100&page={page}");
+            let resp = self
+                .request(Method::GET, &path)
+                .send()
+                .await
+                .context("GitHub list labels failed")?;
+            self.update_rate_state(resp.headers());
+
+            let has_next = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("rel=\"next\""));
+
+            let batch: Vec<Label> = handle_json(resp).await?;
+            let batch_empty = batch.is_empty();
+            all_labels.extend(batch);
+
+            if !has_next || batch_empty || page >= 10 {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(all_labels)
+    }
+
+    pub async fn create_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        name: &str,
+        color: &str,
+        description: Option<&str>,
+    ) -> Result<bool> {
+        let path = format!("/repos/{owner}/{repo}/labels");
+        let payload = CreateLabelRequest {
+            name: name.to_string(),
+            color: color.to_string(),
+            description: description.map(ToString::to_string),
+        };
+        let resp = self
+            .request(Method::POST, &path)
+            .json(&payload)
+            .send()
+            .await
+            .context("GitHub create label failed")?;
+        self.update_rate_state(resp.headers());
+
+        if resp.status().as_u16() == 422 {
+            return Ok(false);
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("GitHub create label failed ({status}): {text}"));
+        }
+
+        Ok(true)
     }
 
     pub async fn reply_to_review_comment(
@@ -670,5 +876,45 @@ mod tests {
             .find(|f| f.new_path == "src/ok.rs")
             .expect("src/ok.rs should be in parsed files");
         assert_eq!(ok_file.hunks.len(), 1);
+    }
+
+    #[test]
+    fn issue_listing_filters_pull_requests() {
+        let payload = r#"
+        [
+          {
+            "number": 1,
+            "title": "real issue",
+            "body": "body",
+            "user": {"login": "alice"},
+            "labels": [],
+            "comments": 0,
+            "html_url": "https://example.com/issues/1",
+            "created_at": "2026-03-25T00:00:00Z",
+            "updated_at": "2026-03-25T00:00:00Z"
+          },
+          {
+            "number": 2,
+            "title": "actually a pr",
+            "body": "body",
+            "user": {"login": "bob"},
+            "labels": [],
+            "comments": 0,
+            "html_url": "https://example.com/issues/2",
+            "created_at": "2026-03-25T00:00:00Z",
+            "updated_at": "2026-03-25T00:00:00Z",
+            "pull_request": {"url": "https://example.com/pulls/2"}
+          }
+        ]
+        "#;
+
+        let issues: Vec<Issue> = serde_json::from_str(payload).expect("parse issues");
+        let filtered: Vec<Issue> = issues
+            .into_iter()
+            .filter(|issue| issue.pull_request.is_none())
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].number, 1);
     }
 }
