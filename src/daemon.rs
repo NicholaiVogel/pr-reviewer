@@ -212,14 +212,15 @@ pub async fn start(
 
                         if let Some(last_issue_number) = last_issue_number {
                             for issue in issues {
-                                if (issue.number as i64) <= last_issue_number {
-                                    continue;
-                                }
-
                                 let state = db
                                     .get_issue_triage_state(&repo_name, issue.number as i64)
                                     .await?;
-                                if !should_triage_issue(state.as_ref(), stale_age as i64) {
+                                if !should_process_issue(
+                                    issue.number as i64,
+                                    last_issue_number,
+                                    state.as_ref(),
+                                    stale_age as i64,
+                                ) {
                                     continue;
                                 }
                                 if !db
@@ -535,6 +536,23 @@ fn should_triage_issue(
     }
 }
 
+fn should_process_issue(
+    issue_number: i64,
+    last_issue_number: i64,
+    state: Option<&crate::store::db::IssueTriageState>,
+    stale_claim_secs: i64,
+) -> bool {
+    let is_new_issue = issue_number > last_issue_number;
+    let has_prior_state = state.is_some();
+
+    if !is_new_issue && !has_prior_state {
+        // Legacy issue from before high-water mark with no prior triage state.
+        return false;
+    }
+
+    should_triage_issue(state, stale_claim_secs)
+}
+
 fn format_duration(secs: i64) -> String {
     let secs = secs.max(0);
     let hours = secs / 3600;
@@ -604,6 +622,29 @@ mod tests {
     fn sqlite_timestamp_parses_as_utc() {
         let parsed = parse_rfc3339_to_utc("2026-03-26 05:49:15").expect("sqlite timestamp");
         assert_eq!(parsed.to_rfc3339(), "2026-03-26T05:49:15+00:00");
+    }
+
+    #[test]
+    fn legacy_issue_without_state_stays_skipped_after_high_water_mark() {
+        assert!(!should_process_issue(100, 100, None, 60));
+        assert!(!should_process_issue(90, 100, None, 60));
+    }
+
+    #[test]
+    fn stale_failed_issue_below_high_water_mark_can_retry() {
+        let state = IssueTriageState {
+            status: "failed".to_string(),
+            claim_version: 1,
+            triage_count: 1,
+            last_attempt_at: Some(
+                (chrono::Utc::now() - chrono::Duration::seconds(ISSUE_TRIAGE_RETRY_SECS + 5))
+                    .to_rfc3339(),
+            ),
+            last_error: Some("boom".to_string()),
+            triaged_at: None,
+        };
+
+        assert!(should_process_issue(90, 100, Some(&state), 60));
     }
 }
 

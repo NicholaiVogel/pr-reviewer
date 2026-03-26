@@ -181,10 +181,9 @@ impl GitHubClient {
                 .into_iter()
                 .filter(|issue| issue.pull_request.is_none())
                 .collect();
-            let batch_empty = batch.is_empty();
             all_issues.extend(batch);
 
-            let truncated = has_next && !batch_empty && page >= 10;
+            let truncated = has_next && page >= 10;
             if truncated {
                 tracing::warn!(
                     owner = owner,
@@ -193,7 +192,7 @@ impl GitHubClient {
                     "issue pagination hit 10-page cap; triage coverage may be partial"
                 );
             }
-            if !has_next || batch_empty || page >= 10 {
+            if !should_continue_issue_pagination(has_next, page) {
                 break;
             }
             page += 1;
@@ -720,6 +719,10 @@ impl GitHubClient {
     }
 }
 
+fn should_continue_issue_pagination(has_next: bool, page: u32) -> bool {
+    has_next && page < 10
+}
+
 pub fn synthesize_diff_from_files(files: &[PrFile]) -> String {
     let mut out = String::new();
     for file in files {
@@ -916,5 +919,16 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].number, 1);
+    }
+
+    #[test]
+    fn issue_pagination_continues_on_empty_filtered_page_when_next_exists() {
+        assert!(should_continue_issue_pagination(true, 1));
+    }
+
+    #[test]
+    fn issue_pagination_stops_at_cap_or_no_next() {
+        assert!(!should_continue_issue_pagination(false, 1));
+        assert!(!should_continue_issue_pagination(true, 10));
     }
 }
