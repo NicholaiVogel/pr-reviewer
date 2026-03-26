@@ -186,7 +186,8 @@ impl Database {
 
                 CREATE TABLE IF NOT EXISTS issue_repo_state (
                     repo TEXT PRIMARY KEY,
-                    etag TEXT
+                    etag TEXT,
+                    last_issue_number INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS issue_triage_state (
@@ -256,6 +257,7 @@ impl Database {
                 "claim_version",
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
+            ensure_column_exists(conn, "issue_repo_state", "last_issue_number", "INTEGER")?;
 
             conn.execute(
                 "INSERT OR IGNORE INTO daemon_state (id, started_at, last_poll_at, rate_limit_total, rate_remaining, rate_reset_epoch, active_reviews) VALUES (1, NULL, NULL, NULL, NULL, NULL, 0)",
@@ -486,13 +488,38 @@ impl Database {
     }
 
     pub async fn set_issue_repo_etag(&self, repo: &str, etag: Option<&str>) -> Result<()> {
+        self.set_issue_repo_state(repo, etag, None).await
+    }
+
+    pub async fn set_issue_repo_last_issue_number(
+        &self,
+        repo: &str,
+        last_issue_number: Option<i64>,
+    ) -> Result<()> {
+        self.set_issue_repo_state(repo, None, last_issue_number)
+            .await
+    }
+
+    pub async fn set_issue_repo_state(
+        &self,
+        repo: &str,
+        etag: Option<&str>,
+        last_issue_number: Option<i64>,
+    ) -> Result<()> {
         let repo = repo.to_string();
         let etag = etag.map(ToString::to_string);
+        let last_issue_number = last_issue_number;
 
         self.run(move |conn| {
             conn.execute(
-                "INSERT INTO issue_repo_state(repo, etag) VALUES (?1, ?2) ON CONFLICT(repo) DO UPDATE SET etag=excluded.etag",
-                params![repo, etag],
+                r#"
+                INSERT INTO issue_repo_state(repo, etag, last_issue_number)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(repo) DO UPDATE SET
+                    etag = COALESCE(excluded.etag, issue_repo_state.etag),
+                    last_issue_number = COALESCE(excluded.last_issue_number, issue_repo_state.last_issue_number)
+                "#,
+                params![repo, etag, last_issue_number],
             )?;
             Ok(())
         })
@@ -511,6 +538,22 @@ impl Database {
                 )
                 .optional()?;
             Ok(etag)
+        })
+        .await
+    }
+
+    pub async fn get_issue_repo_last_issue_number(&self, repo: &str) -> Result<Option<i64>> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            let last_issue_number = conn
+                .query_row(
+                    "SELECT last_issue_number FROM issue_repo_state WHERE repo=?1",
+                    params![repo],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(last_issue_number)
         })
         .await
     }
@@ -1326,5 +1369,64 @@ mod tests {
             .expect("row");
         assert_eq!(state.status, "claimed");
         assert_eq!(state.claim_version, 1);
+    }
+
+    #[tokio::test]
+    async fn issue_repo_state_tracks_etag_and_high_water_mark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        assert!(db.get_issue_repo_etag("o/r").await.expect("etag").is_none());
+        assert!(db
+            .get_issue_repo_last_issue_number("o/r")
+            .await
+            .expect("number")
+            .is_none());
+
+        db.set_issue_repo_etag("o/r", Some("W/initial"))
+            .await
+            .expect("set etag");
+        db.set_issue_repo_last_issue_number("o/r", Some(100))
+            .await
+            .expect("set issue number");
+
+        assert_eq!(
+            db.get_issue_repo_last_issue_number("o/r")
+                .await
+                .expect("number")
+                .expect("row"),
+            100
+        );
+        assert_eq!(
+            db.get_issue_repo_etag("o/r")
+                .await
+                .expect("etag")
+                .expect("row"),
+            "W/initial"
+        );
+
+        db.set_issue_repo_etag("o/r", Some("W/updated"))
+            .await
+            .expect("update etag only");
+        db.set_issue_repo_state("o/r", Some("W/stateful"), Some(150))
+            .await
+            .expect("update state");
+
+        assert_eq!(
+            db.get_issue_repo_last_issue_number("o/r")
+                .await
+                .expect("number")
+                .expect("row"),
+            150
+        );
+        assert_eq!(
+            db.get_issue_repo_etag("o/r")
+                .await
+                .expect("etag")
+                .expect("row"),
+            "W/stateful"
+        );
     }
 }

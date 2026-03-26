@@ -205,12 +205,7 @@ impl IssueTriageEngine {
         .await?;
 
         let decision = parse_issue_triage_output(&run.stdout, &run.stderr)?;
-        let plan = build_label_plan(
-            issue,
-            &label_catalog,
-            &decision,
-            repo_cfg.issue_triage.create_missing_labels,
-        )?;
+        let plan = build_label_plan(issue, &label_catalog, &decision, &repo_cfg.issue_triage)?;
 
         let mut created: Vec<String> = if options.dry_run {
             plan.labels_to_create
@@ -321,7 +316,28 @@ fn build_issue_triage_prompt(
     if !repo_cfg.issue_triage.create_missing_labels {
         prompt.push_str("Label creation is DISABLED for this repo. labels_to_create must be empty, and labels_to_add must only contain labels that already exist in the repo label catalog below.\n\n");
     } else {
-        prompt.push_str("Label creation is ENABLED for this repo. When you need to create labels, prefer the repo's existing naming style. If the repo lacks a taxonomy, you may fall back to labels like bug, enhancement, documentation, question, priority: P0-P3, spec: planned, spec: needs-spec, bucket: ops-hardening, bucket: backlog. Use six-digit GitHub hex colors without '#'.\n\n");
+        let allowed_prefixes = if repo_cfg.issue_triage.allowed_new_label_prefixes.is_empty() {
+            "none".to_string()
+        } else {
+            repo_cfg
+                .issue_triage
+                .allowed_new_label_prefixes
+                .iter()
+                .map(|prefix| format!("`{prefix}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        prompt.push_str(&format!(
+            "Label creation is ENABLED for this repo, but no more than {} labels may be created per triage run.\n",
+            repo_cfg.issue_triage.max_labels_to_create
+        ));
+        prompt.push_str(&format!("Allowed new-label prefixes: {allowed_prefixes}\n"));
+        prompt.push_str(&format!(
+            "Use six-digit hex colors without '#', names <= {} chars, and descriptions <= {} chars.\n\n",
+            repo_cfg.issue_triage.max_new_label_name_chars,
+            repo_cfg.issue_triage.max_new_label_description_chars
+        ));
     }
 
     prompt.push_str(&format!(
@@ -484,7 +500,7 @@ fn build_label_plan(
     issue: &Issue,
     existing_labels: &[Label],
     decision: &IssueTriageDecision,
-    allow_create: bool,
+    triage_config: &crate::config::IssueTriageConfig,
 ) -> Result<LabelPlan> {
     let mut existing_by_key: BTreeMap<String, String> = existing_labels
         .iter()
@@ -506,7 +522,58 @@ fn build_label_plan(
     let mut labels_to_create = Vec::new();
     let mut seen_add = BTreeSet::new();
     let mut seen_create = BTreeSet::new();
+    let mut seen_create_proposals = BTreeSet::new();
     let mut unknown_requested = Vec::new();
+    let allowed_prefixes: Vec<String> = triage_config
+        .allowed_new_label_prefixes
+        .iter()
+        .map(|prefix| prefix.trim().to_ascii_lowercase())
+        .filter(|prefix| !prefix.is_empty())
+        .collect();
+
+    let max_desc_chars = triage_config.max_new_label_description_chars;
+    let max_name_chars = triage_config.max_new_label_name_chars;
+    let max_to_create = triage_config.max_labels_to_create;
+
+    for created in &decision.labels_to_create {
+        let key = normalize_label_key(&created.name);
+        if key.is_empty() {
+            return Err(anyhow!("labels_to_create entries need a name"));
+        }
+        if !seen_create_proposals.insert(key) {
+            return Err(anyhow!(
+                "labels_to_create has duplicate label '{}'",
+                created.name.trim()
+            ));
+        }
+        validate_new_label(
+            created,
+            &allowed_prefixes,
+            max_to_create,
+            max_name_chars,
+            max_desc_chars,
+        )?;
+    }
+
+    if !triage_config.create_missing_labels && !proposed_create.is_empty() {
+        return Err(anyhow!(
+            "labels_to_create was requested while label creation is disabled: {}",
+            proposed_create
+                .values()
+                .map(|label| label.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    if max_to_create > 0 && proposed_create.len() > max_to_create {
+        return Err(anyhow!(
+            "triage requested creation of {} labels, but max allowed is {max_to_create}",
+            proposed_create.len()
+        ));
+    } else if max_to_create == 0 && !proposed_create.is_empty() {
+        return Err(anyhow!("label creation is disabled"));
+    }
 
     for raw in &decision.labels_to_add {
         let key = normalize_label_key(raw);
@@ -519,7 +586,7 @@ fn build_label_plan(
             continue;
         }
 
-        if allow_create {
+        if triage_config.create_missing_labels {
             if let Some(created) = proposed_create.remove(&key) {
                 if seen_create.insert(key.clone()) {
                     existing_by_key.insert(key.clone(), created.name.clone());
@@ -531,6 +598,17 @@ fn build_label_plan(
         }
 
         unknown_requested.push(raw.trim().to_string());
+    }
+
+    if !proposed_create.is_empty() {
+        return Err(anyhow!(
+            "triage requested creation for labels that are not requested to be added: {}",
+            proposed_create
+                .values()
+                .map(|label| label.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     if !unknown_requested.is_empty() {
@@ -611,6 +689,52 @@ fn normalize_output(stdout: &str, stderr: &str) -> String {
     } else {
         err.to_string()
     }
+}
+
+fn validate_new_label(
+    label: &ProposedLabel,
+    allowed_prefixes: &[String],
+    max_to_create: usize,
+    max_name_chars: usize,
+    max_desc_chars: usize,
+) -> Result<()> {
+    let normalized_name = label.name.trim();
+    if normalized_name.is_empty() {
+        return Err(anyhow!("labels_to_create entries need a name"));
+    }
+
+    if normalized_name.chars().count() > max_name_chars {
+        return Err(anyhow!(
+            "proposed label '{}' exceeds max name length of {max_name_chars} chars",
+            normalized_name
+        ));
+    }
+
+    if max_to_create == 0 {
+        return Err(anyhow!(
+            "label creation is disabled for proposals of '{normalized_name}'"
+        ));
+    }
+
+    if !allowed_prefixes.is_empty()
+        && !allowed_prefixes
+            .iter()
+            .any(|prefix| normalized_name.to_ascii_lowercase().starts_with(prefix))
+    {
+        return Err(anyhow!(
+            "proposed label '{normalized_name}' does not match allowed prefixes"
+        ));
+    }
+
+    if let Some(desc) = label.description.as_deref() {
+        if desc.chars().count() > max_desc_chars {
+            return Err(anyhow!(
+                "description for label '{normalized_name}' exceeds max length of {max_desc_chars} chars"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn extract_marked_json(text: &str, marker: &str) -> Option<String> {
@@ -718,6 +842,14 @@ mod tests {
 
     #[test]
     fn build_label_plan_prefers_existing_labels() {
+        let config = crate::config::IssueTriageConfig {
+            create_missing_labels: true,
+            max_labels_to_create: 3,
+            allowed_new_label_prefixes: vec!["bug".to_string(), "priority".to_string()],
+            max_new_label_name_chars: 50,
+            max_new_label_description_chars: 256,
+            ..Default::default()
+        };
         let issue = Issue {
             number: 1,
             title: "title".to_string(),
@@ -747,7 +879,7 @@ mod tests {
             }],
         };
 
-        let plan = build_label_plan(&issue, &existing, &decision, true).expect("plan");
+        let plan = build_label_plan(&issue, &existing, &decision, &config).expect("plan");
         assert_eq!(
             plan.labels_to_add,
             vec!["bug".to_string(), "priority: P1".to_string()]
@@ -757,6 +889,10 @@ mod tests {
 
     #[test]
     fn build_label_plan_rejects_unknown_labels_when_creation_disabled() {
+        let config = crate::config::IssueTriageConfig {
+            allowed_new_label_prefixes: vec!["bug".to_string()],
+            ..Default::default()
+        };
         let issue = Issue {
             number: 1,
             title: "title".to_string(),
@@ -782,9 +918,94 @@ mod tests {
             labels_to_create: vec![],
         };
 
-        let err =
-            build_label_plan(&issue, &existing, &decision, false).expect_err("should fail closed");
+        let err = build_label_plan(&issue, &existing, &decision, &config)
+            .expect_err("should fail closed");
         assert!(err.to_string().contains("priority: P1"));
+    }
+
+    #[test]
+    fn build_label_plan_rejects_unmatched_label_creations() {
+        let config = crate::config::IssueTriageConfig {
+            create_missing_labels: true,
+            ..Default::default()
+        };
+        let issue = Issue {
+            number: 1,
+            title: "title".to_string(),
+            body: Some("body".to_string()),
+            user: crate::github::types::User {
+                login: "alice".to_string(),
+            },
+            labels: vec![],
+            comments: 0,
+            html_url: None,
+            created_at: None,
+            updated_at: None,
+            pull_request: None,
+        };
+
+        let decision = IssueTriageDecision {
+            summary: "summary".to_string(),
+            labels_to_add: vec!["bug".to_string()],
+            labels_to_create: vec![ProposedLabel {
+                name: "priority: p1".to_string(),
+                color: "d73a4a".to_string(),
+                description: Some("desc".to_string()),
+            }],
+        };
+        let existing = vec![Label {
+            name: "bug".to_string(),
+            color: Some("d73a4a".to_string()),
+            description: Some("Bug".to_string()),
+        }];
+
+        let err = build_label_plan(&issue, &existing, &decision, &config)
+            .expect_err("should reject unmatched creation proposal");
+        assert!(err.to_string().contains("not requested to be added"));
+    }
+
+    #[test]
+    fn build_label_plan_rejects_exceeding_max_create_budget() {
+        let config = crate::config::IssueTriageConfig {
+            create_missing_labels: true,
+            max_labels_to_create: 1,
+            ..Default::default()
+        };
+        let issue = Issue {
+            number: 1,
+            title: "title".to_string(),
+            body: Some("body".to_string()),
+            user: crate::github::types::User {
+                login: "alice".to_string(),
+            },
+            labels: vec![],
+            comments: 0,
+            html_url: None,
+            created_at: None,
+            updated_at: None,
+            pull_request: None,
+        };
+        let decision = IssueTriageDecision {
+            summary: "summary".to_string(),
+            labels_to_add: vec!["bug".to_string(), "priority: p2".to_string()],
+            labels_to_create: vec![
+                ProposedLabel {
+                    name: "bug".to_string(),
+                    color: "d73a4a".to_string(),
+                    description: Some("desc".to_string()),
+                },
+                ProposedLabel {
+                    name: "priority: p2".to_string(),
+                    color: "d93f0b".to_string(),
+                    description: Some("high".to_string()),
+                },
+            ],
+        };
+        let existing = vec![];
+
+        let err = build_label_plan(&issue, &existing, &decision, &config)
+            .expect_err("should reject too many labels");
+        assert!(err.to_string().contains("max allowed is 1"));
     }
 
     #[test]

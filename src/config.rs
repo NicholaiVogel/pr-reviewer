@@ -160,6 +160,14 @@ pub struct IssueTriageConfig {
     pub create_missing_labels: bool,
     #[serde(default = "default_issue_triage_context_bytes")]
     pub max_context_bytes: usize,
+    #[serde(default = "default_issue_triage_max_labels_to_create")]
+    pub max_labels_to_create: usize,
+    #[serde(default = "default_issue_triage_label_prefixes")]
+    pub allowed_new_label_prefixes: Vec<String>,
+    #[serde(default = "default_issue_triage_label_name_max_chars")]
+    pub max_new_label_name_chars: usize,
+    #[serde(default = "default_issue_triage_label_description_max_chars")]
+    pub max_new_label_description_chars: usize,
     #[serde(default)]
     pub instructions: Option<String>,
 }
@@ -348,6 +356,35 @@ fn default_issue_triage_context_bytes() -> usize {
     64 * 1024
 }
 
+fn default_issue_triage_max_labels_to_create() -> usize {
+    3
+}
+
+fn default_issue_triage_label_prefixes() -> Vec<String> {
+    vec![
+        "bug".to_string(),
+        "documentation".to_string(),
+        "enhancement".to_string(),
+        "question".to_string(),
+        "spec".to_string(),
+        "spec:".to_string(),
+        "priority".to_string(),
+        "priority: ".to_string(),
+        "area".to_string(),
+        "area:".to_string(),
+        "bucket".to_string(),
+        "bucket:".to_string(),
+    ]
+}
+
+fn default_issue_triage_label_name_max_chars() -> usize {
+    50
+}
+
+fn default_issue_triage_label_description_max_chars() -> usize {
+    256
+}
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
@@ -393,6 +430,10 @@ impl Default for IssueTriageConfig {
             enabled: false,
             create_missing_labels: false,
             max_context_bytes: default_issue_triage_context_bytes(),
+            max_labels_to_create: default_issue_triage_max_labels_to_create(),
+            allowed_new_label_prefixes: default_issue_triage_label_prefixes(),
+            max_new_label_name_chars: default_issue_triage_label_name_max_chars(),
+            max_new_label_description_chars: default_issue_triage_label_description_max_chars(),
             instructions: None,
         }
     }

@@ -205,40 +205,67 @@ pub async fn start(
                     }
                     ListIssuesResult::Updated { issues, etag } => {
                         db.set_issue_repo_etag(&repo_name, etag.as_deref()).await?;
+                        let last_issue_number =
+                            db.get_issue_repo_last_issue_number(&repo_name).await?;
+                        let max_issue_number = issues.iter().map(|issue| issue.number as i64).max();
+                        let max_issue_number = max_issue_number.unwrap_or(0);
 
-                        for issue in issues {
-                            let state = db
-                                .get_issue_triage_state(&repo_name, issue.number as i64)
-                                .await?;
-                            if !should_triage_issue(state.as_ref(), stale_age as i64) {
-                                continue;
-                            }
-                            if !db
-                                .claim_issue_triage(&repo_name, issue.number as i64, state.as_ref())
-                                .await?
-                            {
-                                continue;
-                            }
-
-                            changes_detected = true;
-                            let permit = semaphore.clone().acquire_owned().await?;
-                            let triage_engine = issue_triage.clone();
-                            let repo_cfg = repo_cfg.clone();
-                            let issue_for_triage = issue.clone();
-                            workers.spawn(async move {
-                                let _permit = permit;
-                                let res = triage_engine
-                                    .triage_issue(&repo_cfg, &issue_for_triage)
-                                    .await;
-                                if let Err(err) = res {
-                                    tracing::error!(
-                                        repo = %repo_cfg.full_name(),
-                                        issue = issue_for_triage.number,
-                                        error = %err,
-                                        "issue triage failed"
-                                    );
+                        if let Some(last_issue_number) = last_issue_number {
+                            for issue in issues {
+                                if (issue.number as i64) <= last_issue_number {
+                                    continue;
                                 }
-                            });
+
+                                let state = db
+                                    .get_issue_triage_state(&repo_name, issue.number as i64)
+                                    .await?;
+                                if !should_triage_issue(state.as_ref(), stale_age as i64) {
+                                    continue;
+                                }
+                                if !db
+                                    .claim_issue_triage(
+                                        &repo_name,
+                                        issue.number as i64,
+                                        state.as_ref(),
+                                    )
+                                    .await?
+                                {
+                                    continue;
+                                }
+
+                                changes_detected = true;
+                                let permit = semaphore.clone().acquire_owned().await?;
+                                let triage_engine = issue_triage.clone();
+                                let repo_cfg = repo_cfg.clone();
+                                let issue_for_triage = issue.clone();
+                                workers.spawn(async move {
+                                    let _permit = permit;
+                                    let res = triage_engine
+                                        .triage_issue(&repo_cfg, &issue_for_triage)
+                                        .await;
+                                    if let Err(err) = res {
+                                        tracing::error!(
+                                            repo = %repo_cfg.full_name(),
+                                            issue = issue_for_triage.number,
+                                            error = %err,
+                                            "issue triage failed"
+                                        );
+                                    }
+                                });
+                            }
+
+                            if max_issue_number > last_issue_number {
+                                db.set_issue_repo_last_issue_number(
+                                    &repo_name,
+                                    Some(max_issue_number),
+                                )
+                                .await?;
+                            }
+                        } else {
+                            // First issue-poll for this repo: seed the high-water mark and skip
+                            // triaging previously-open issues.
+                            db.set_issue_repo_last_issue_number(&repo_name, Some(max_issue_number))
+                                .await?;
                         }
                     }
                 }
