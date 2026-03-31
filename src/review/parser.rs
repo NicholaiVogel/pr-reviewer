@@ -116,6 +116,8 @@ pub struct ReviewComment {
     pub line: u32,
     pub body: String,
     #[serde(default)]
+    pub evidence_note: Option<String>,
+    #[serde(default)]
     pub severity: CommentSeverity,
 }
 

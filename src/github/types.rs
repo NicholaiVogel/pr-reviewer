@@ -3,6 +3,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize)]
 pub struct User {
     pub login: String,
+    /// GitHub account type: "User", "Bot", or "Organization".
+    #[serde(rename = "type", default)]
+    pub account_type: Option<String>,
+}
+
+impl User {
+    pub fn is_bot(&self) -> bool {
+        self.account_type.as_deref() == Some("Bot")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
