@@ -278,8 +278,15 @@ impl Database {
 
     pub async fn claim_review(&self, claim: ReviewClaim) -> Result<bool> {
         self.run(move |conn| {
-            let result = conn.execute(
-                "INSERT INTO review_log (dedupe_key, repo, pr_number, sha, harness, model, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'claimed')",
+            conn.execute(
+                "INSERT INTO review_log (dedupe_key, repo, pr_number, sha, harness, model, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'claimed')
+                 ON CONFLICT(dedupe_key) DO UPDATE SET
+                   status = 'claimed',
+                   error_message = NULL,
+                   completed_at = NULL,
+                   created_at = datetime('now')
+                 WHERE status = 'failed'",
                 params![
                     claim.dedupe_key,
                     claim.repo,
@@ -288,15 +295,8 @@ impl Database {
                     claim.harness,
                     claim.model
                 ],
-            );
-
-            match result {
-                Ok(_) => Ok(true),
-                Err(rusqlite::Error::SqliteFailure(err, _)) if err.extended_code == 2067 => {
-                    Ok(false)
-                }
-                Err(e) => Err(anyhow::Error::new(e)),
-            }
+            )?;
+            Ok(conn.changes() > 0)
         })
         .await
     }
@@ -1044,6 +1044,59 @@ mod tests {
             .await
             .expect("delete");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_review_reclaims_failed_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let claim = ReviewClaim {
+            dedupe_key: "retry-after-fail".to_string(),
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            sha: "abc".to_string(),
+            harness: "codex".to_string(),
+            model: None,
+        };
+
+        assert!(db.claim_review(claim.clone()).await.expect("first claim"));
+        db.fail_review("retry-after-fail", "harness timeout", 30.0)
+            .await
+            .expect("fail");
+
+        // reclaiming a failed entry should succeed
+        assert!(db.claim_review(claim.clone()).await.expect("reclaim after failure"));
+
+        // and now it's claimed again, so a third attempt is blocked
+        assert!(!db.claim_review(claim).await.expect("blocked while claimed"));
+    }
+
+    #[tokio::test]
+    async fn claim_review_does_not_reclaim_completed_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let claim = ReviewClaim {
+            dedupe_key: "no-retry-completed".to_string(),
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            sha: "abc".to_string(),
+            harness: "codex".to_string(),
+            model: None,
+        };
+
+        assert!(db.claim_review(claim.clone()).await.expect("claim"));
+        db.complete_review("no-retry-completed", 2, Some("COMMENT"), 5.0, 2, 100, None, None, None)
+            .await
+            .expect("complete");
+
+        // completed entries must not be reclaimed
+        assert!(!db.claim_review(claim).await.expect("blocked by completed"));
     }
 
     #[tokio::test]
