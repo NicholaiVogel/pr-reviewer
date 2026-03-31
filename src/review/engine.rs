@@ -597,6 +597,7 @@ impl ReviewEngine {
             self.config.defaults.bot_name.as_str(),
             self.authenticated_user.as_deref(),
             pr_data.head.sha.as_str(),
+            Some(&changed_files),
         );
         let prior_reviews_context = build_prior_reviews_context(
             &existing_reviews,
@@ -722,6 +723,7 @@ impl ReviewEngine {
         let mut verdict = ReviewVerdict::Comment;
         let mut inline_comments: Vec<CreateReviewComment> = Vec::new();
         let mut unmapped_comments: Vec<String> = Vec::new();
+        let has_structured_findings: bool;
 
         // Prepend bot identity header on every review
         body.push_str(&format!(
@@ -804,6 +806,8 @@ impl ReviewEngine {
                             .push(format!("- {}:{} - {}", path, comment.line, comment.body));
                     }
                 }
+                has_structured_findings =
+                    !inline_comments.is_empty() || !unmapped_comments.is_empty();
             }
             ParseOutcome::RawSummary(raw) => {
                 if looks_like_harness_transport_output(&raw) {
@@ -811,6 +815,7 @@ impl ReviewEngine {
                         "harness returned machine transport output instead of a review body"
                     ));
                 }
+                has_structured_findings = true;
                 body.push_str("Harness output could not be parsed as structured JSON.\n\n");
                 body.push_str(&raw);
             }
@@ -860,6 +865,7 @@ impl ReviewEngine {
             && inline_comments.is_empty()
             && unmapped_comments.is_empty()
             && !screenshot_note_added
+            && !has_structured_findings
         {
             self.db
                 .complete_review(
@@ -1078,12 +1084,14 @@ impl ReviewEngine {
             self.config.defaults.bot_name.as_str(),
             self.authenticated_user.as_deref(),
             pr_data.head.sha.as_str(),
+            None,
         );
 
         if let Some(reply) = build_direct_pushback_reply(
             &thread_history,
             &review_memory,
             self.config.defaults.bot_name.as_str(),
+            self.authenticated_user.as_deref(),
         ) {
             comments::reply_to_review_comment(
                 &self.github,
@@ -1304,6 +1312,7 @@ fn build_review_memory(
     bot_name: &str,
     bot_alias: Option<&str>,
     current_sha: &str,
+    changed_files: Option<&[String]>,
 ) -> ReviewMemory {
     let parent_map: HashMap<u64, Option<u64>> = review_comments
         .iter()
@@ -1338,27 +1347,41 @@ fn build_review_memory(
                 .filter(|c| !login_matches_bot(&c.user.login, bot_name, bot_alias))
                 .collect();
             if human_replies.is_empty() {
+                let mut status = FindingStatus::Open;
+                if let Some(changed_files) = changed_files {
+                    if !changed_files.iter().any(|p| p == &finding.path) {
+                        status = FindingStatus::LikelyAddressed;
+                    }
+                }
                 return Some(FindingRecord {
                     key: finding_key(&finding.path, finding.line, &finding.body),
                     path: finding.path.clone(),
                     line: finding.line,
                     body: finding.body.clone(),
                     token_set: token_set(&finding.body),
-                    status: FindingStatus::Open,
+                    status,
                 });
             }
 
             let mut status = FindingStatus::Open;
+
             for reply in &human_replies {
-                if has_out_of_scope_signal(&reply.body) {
-                    status = FindingStatus::OutOfScopeForPr;
-                    explicit_boundaries.push(reply.body.clone());
-                    break;
+                let reply_status = classify_rebuttal_status(&reply.body);
+                if let Some(reply_status) = reply_status {
+                    if reply_status == FindingStatus::OutOfScopeForPr {
+                        explicit_boundaries.push(reply.body.clone());
+                    }
+                    if status_precedence(&reply_status) > status_precedence(&status) {
+                        status = reply_status;
+                    }
                 }
-                if has_rationale_rejection_signal(&reply.body) {
-                    status = FindingStatus::RejectedWithRationale;
-                } else if has_dismissal_signal(&reply.body) {
-                    status = FindingStatus::DismissedByHuman;
+            }
+
+            if status == FindingStatus::Open {
+                if let Some(changed_files) = changed_files {
+                    if !changed_files.iter().any(|p| p == &finding.path) {
+                        status = FindingStatus::LikelyAddressed;
+                    }
                 }
             }
 
@@ -1397,7 +1420,33 @@ fn build_review_memory(
     }
 }
 
-/// Strip confidence markdown/JSON blocks from a review body to save context space.
+fn classify_rebuttal_status(text: &str) -> Option<FindingStatus> {
+    if has_out_of_scope_signal(text) {
+        return Some(FindingStatus::OutOfScopeForPr);
+    }
+
+    if has_rationale_rejection_signal(text) {
+        return Some(FindingStatus::RejectedWithRationale);
+    }
+
+    if has_dismissal_signal(text) {
+        return Some(FindingStatus::DismissedByHuman);
+    }
+
+    None
+}
+
+fn status_precedence(status: &FindingStatus) -> usize {
+    match status {
+        FindingStatus::Open => 0,
+        FindingStatus::LikelyAddressed => 1,
+        FindingStatus::DismissedByHuman => 2,
+        FindingStatus::RejectedWithRationale => 3,
+        FindingStatus::OutOfScopeForPr => 4,
+    }
+}
+
+// Strip confidence markdown/JSON blocks from a review body to save context space.
 fn strip_confidence_blocks(body: &str) -> String {
     let mut out = String::new();
     let mut in_confidence_block = false;
@@ -1546,24 +1595,34 @@ fn build_addressed_findings(
         return String::new();
     }
 
-    let memory = build_review_memory(&[], review_comments, &[], bot_name, bot_alias, "");
-
-    let changed_files: std::collections::HashSet<&str> = parsed_diff
+    let changed_files: Vec<String> = parsed_diff
         .files
         .iter()
         .map(|f| {
             if f.new_path != "/dev/null" {
-                f.new_path.as_str()
+                f.new_path.clone()
             } else {
-                f.old_path.as_str()
+                f.old_path.clone()
             }
         })
         .collect();
+    let changed_file_set: std::collections::HashSet<&str> =
+        changed_files.iter().map(|f| f.as_str()).collect();
+
+    let memory = build_review_memory(
+        &[],
+        review_comments,
+        &[],
+        bot_name,
+        bot_alias,
+        "",
+        Some(&changed_files),
+    );
 
     let mut out = String::new();
 
     for finding in memory.findings {
-        let file_in_diff = changed_files.contains(finding.path.as_str());
+        let file_in_diff = changed_file_set.contains(finding.path.as_str());
         let status = match finding.status {
             FindingStatus::DismissedByHuman => "[dismissed by human]",
             FindingStatus::RejectedWithRationale => "[rejected with rationale]",
@@ -1749,12 +1808,18 @@ fn build_thread_history(comments: &[ReviewComment], target_comment_id: u64) -> S
 
 fn build_direct_pushback_reply(
     thread_history: &str,
-    memory: &ReviewMemory,
+    _memory: &ReviewMemory,
     bot_name: &str,
+    bot_alias: Option<&str>,
 ) -> Option<String> {
     let lower_history = thread_history.to_ascii_lowercase();
-    if lower_history.contains(&format!(": @{}", bot_name.to_ascii_lowercase())) {
+    if lower_history.contains(&format!("@{}", bot_name.to_ascii_lowercase())) {
         return None;
+    }
+    if let Some(alias) = bot_alias {
+        if lower_history.contains(&format!("@{}", alias.to_ascii_lowercase())) {
+            return None;
+        }
     }
 
     if thread_history
@@ -1774,12 +1839,6 @@ fn build_direct_pushback_reply(
     {
         return Some(
             "got it. treating that as intentional for this PR, so i won't keep re-raising the same concern unless later changes add new concrete evidence.".to_string(),
-        );
-    }
-
-    if !memory.explicit_boundaries.is_empty() {
-        return Some(
-            "noted. there is already an explicit scope boundary on this PR, so i won't reopen adjacent concerns unless a later diff shows a direct issue in the feature under review.".to_string(),
         );
     }
 
@@ -2654,10 +2713,45 @@ mod tests {
             },
         ];
 
-        let memory = build_review_memory(&[], &review_comments, &[], "pr-reviewer", None, "head");
+        let memory = build_review_memory(
+            &[],
+            &review_comments,
+            &[],
+            "pr-reviewer",
+            None,
+            "head",
+            None,
+        );
         assert_eq!(memory.findings.len(), 1);
         assert_eq!(memory.findings[0].status, FindingStatus::OutOfScopeForPr);
         assert_eq!(memory.explicit_boundaries.len(), 1);
+    }
+
+    #[test]
+    fn build_review_memory_marks_unmentioned_findings_as_likely_addressed() {
+        let review_comments = vec![ReviewComment {
+            id: 10,
+            body: "Potential blocking issue in task cleanup".to_string(),
+            path: "src/task.rs".to_string(),
+            line: Some(42),
+            user: User {
+                login: "pr-reviewer".to_string(),
+            },
+            in_reply_to_id: None,
+            created_at: "2026-03-30T00:00:00Z".to_string(),
+        }];
+
+        let memory = build_review_memory(
+            &[],
+            &review_comments,
+            &[],
+            "pr-reviewer",
+            None,
+            "head",
+            Some(&["src/other.rs".to_string()]),
+        );
+
+        assert_eq!(memory.findings[0].status, FindingStatus::LikelyAddressed);
     }
 
     #[test]
@@ -2753,8 +2847,28 @@ mod tests {
             "- [2026-03-30] NicholaiVogel: i'm not taking further task ownership feedback in this PR",
             &memory,
             "pr-reviewer",
+            None,
         )
         .expect("reply");
         assert!(reply.contains("won't keep pushing"));
+    }
+
+    #[test]
+    fn direct_pushback_reply_detects_bot_mention_format() {
+        let memory = ReviewMemory {
+            findings: vec![],
+            already_noted_screenshot: false,
+            has_prior_bot_review: true,
+            explicit_boundaries: vec![],
+        };
+
+        let reply = build_direct_pushback_reply(
+            "- [2026-03-30] NicholaiVogel: thanks @pr-reviewer",
+            &memory,
+            "pr-reviewer",
+            None,
+        );
+
+        assert!(reply.is_none());
     }
 }
