@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,7 +19,8 @@ use crate::github::{client::GitHubClient, pr};
 use crate::harness;
 use crate::harness::spawn::{run_harness, HarnessRunRequest};
 use crate::review::parser::{
-    parse_reply_output, parse_review_output, ParseOutcome, ReplyParseOutcome, ReviewVerdict,
+    parse_reply_output, parse_review_output, CommentSeverity, ParseOutcome, ReplyParseOutcome,
+    ReviewComment as ParsedReviewComment, ReviewVerdict,
 };
 use crate::review::prompt::build_review_prompt;
 use crate::safety::{evaluate_fork_policy, ForkDecision};
@@ -30,6 +31,35 @@ const IN_PROGRESS_COMMENT_MAX_CHARS: usize = 220;
 const GITHUB_COMMENT_MAX_CHARS: usize = 65_536;
 const GITHUB_COMMENT_TRUNCATION_NOTE: &str =
     "\n\n[truncated by pr-reviewer to fit GitHub's comment length limit]";
+const SCREENSHOT_NOTE_TEXT: &str =
+    "> **Note:** This PR touches UI files but no screenshots were referenced in the description. Consider adding visual previews for reviewers.";
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum FindingStatus {
+    Open,
+    LikelyAddressed,
+    DismissedByHuman,
+    RejectedWithRationale,
+    OutOfScopeForPr,
+}
+
+#[derive(Debug, Clone)]
+struct FindingRecord {
+    key: String,
+    path: String,
+    line: Option<u32>,
+    body: String,
+    token_set: HashSet<String>,
+    status: FindingStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReviewMemory {
+    findings: Vec<FindingRecord>,
+    already_noted_screenshot: bool,
+    has_prior_bot_review: bool,
+    explicit_boundaries: Vec<String>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ReviewOptions {
@@ -560,6 +590,14 @@ impl ReviewEngine {
         );
 
         let mut context_with_history = assembled.text.clone();
+        let review_memory = build_review_memory(
+            &existing_reviews,
+            &review_comments,
+            &issue_comments,
+            self.config.defaults.bot_name.as_str(),
+            self.authenticated_user.as_deref(),
+            pr_data.head.sha.as_str(),
+        );
         let prior_reviews_context = build_prior_reviews_context(
             &existing_reviews,
             &review_comments,
@@ -583,6 +621,12 @@ impl ReviewEngine {
         if !addressed_findings.is_empty() {
             context_with_history.push_str("\n## Previously Flagged Items\n");
             context_with_history.push_str(&addressed_findings);
+            context_with_history.push('\n');
+        }
+        let review_state_context = build_review_state_context(&review_memory);
+        if !review_state_context.is_empty() {
+            context_with_history.push_str("\n## Review State\n");
+            context_with_history.push_str(&review_state_context);
             context_with_history.push('\n');
         }
 
@@ -618,7 +662,8 @@ impl ReviewEngine {
             }
         }
 
-        let has_prior_reviews = !prior_reviews_context.is_empty();
+        let has_prior_reviews =
+            review_memory.has_prior_bot_review || !prior_reviews_context.is_empty();
 
         // Detect UI file changes and check for screenshots in PR body
         let ui_files = detect_ui_files(&changed_files);
@@ -702,11 +747,44 @@ impl ReviewEngine {
                     review.confidence.level, confidence_reasons, review.confidence.justification,
                 ));
 
-                if review.ui_screenshot_needed {
-                    body.push_str("\n> **Note:** This PR touches UI files but no screenshots were referenced in the description. Consider adding visual previews for reviewers.\n");
+                if review.ui_screenshot_needed && !review_memory.already_noted_screenshot {
+                    body.push('\n');
+                    body.push_str(SCREENSHOT_NOTE_TEXT);
+                    body.push('\n');
                 }
 
-                for comment in review.comments {
+                let mut seen_keys = HashSet::new();
+                let mut surviving_comments: Vec<ParsedReviewComment> = Vec::new();
+                for mut comment in review.comments {
+                    let path = clean_comment_path(&comment.file);
+                    let key = finding_key(&path, Some(comment.line), &comment.body);
+                    if !seen_keys.insert(key) {
+                        continue;
+                    }
+                    if should_suppress_finding(&comment, &path, &review_memory) {
+                        continue;
+                    }
+                    if comment.severity == CommentSeverity::Blocking
+                        && !blocker_has_sufficient_evidence(
+                            &comment,
+                            &path,
+                            review.confidence.level,
+                        )
+                    {
+                        comment.severity = CommentSeverity::Warning;
+                    }
+                    surviving_comments.push(comment);
+                }
+
+                if verdict == ReviewVerdict::RequestChanges
+                    && !surviving_comments
+                        .iter()
+                        .any(|comment| comment.severity == CommentSeverity::Blocking)
+                {
+                    verdict = ReviewVerdict::Comment;
+                }
+
+                for comment in surviving_comments {
                     let path = clean_comment_path(&comment.file);
                     let right = parsed_diff.position_for(&path, comment.line, DiffSide::Right);
                     let left = parsed_diff.position_for(&path, comment.line, DiffSide::Left);
@@ -743,7 +821,7 @@ impl ReviewEngine {
 
         if !unmapped_comments.is_empty() {
             body.push_str("\n\nUnmapped findings (not on changed lines):\n");
-            for line in unmapped_comments {
+            for line in &unmapped_comments {
                 body.push_str(&line);
                 body.push('\n');
             }
@@ -773,6 +851,37 @@ impl ReviewEngine {
                 status: "completed:dry-run".to_string(),
                 verdict: Some(verdict),
                 comments_posted: inline_comments.len(),
+            });
+        }
+
+        let screenshot_note_added =
+            body.contains(SCREENSHOT_NOTE_TEXT) && !review_memory.already_noted_screenshot;
+        if review_memory.has_prior_bot_review
+            && inline_comments.is_empty()
+            && unmapped_comments.is_empty()
+            && !screenshot_note_added
+        {
+            self.db
+                .complete_review(
+                    &dedupe,
+                    0,
+                    Some(verdict_label(ReviewVerdict::Comment)),
+                    harness_output.duration_secs,
+                    assembled.files_included as i64,
+                    assembled.diff_lines as i64,
+                    gitnexus_used,
+                    gitnexus_latency_ms,
+                    gitnexus_hit_count,
+                )
+                .await?;
+
+            return Ok(ReviewRunResult {
+                repo: repo_name,
+                pr_number: pr_data.number,
+                sha: pr_data.head.sha.clone(),
+                status: "skipped:no-novel-findings".to_string(),
+                verdict: Some(ReviewVerdict::Comment),
+                comments_posted: 0,
             });
         }
 
@@ -954,6 +1063,40 @@ impl ReviewEngine {
         .await
         .unwrap_or_default();
         let thread_history = build_thread_history(&all_comments, comment.id);
+        let issue_comments = comments::get_issue_comments(
+            &self.github,
+            &repo_cfg.owner,
+            &repo_cfg.name,
+            pr_data.number,
+        )
+        .await
+        .unwrap_or_default();
+        let review_memory = build_review_memory(
+            &[],
+            &all_comments,
+            &issue_comments,
+            self.config.defaults.bot_name.as_str(),
+            self.authenticated_user.as_deref(),
+            pr_data.head.sha.as_str(),
+        );
+
+        if let Some(reply) = build_direct_pushback_reply(
+            &thread_history,
+            &review_memory,
+            self.config.defaults.bot_name.as_str(),
+        ) {
+            comments::reply_to_review_comment(
+                &self.github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                pr_data.number,
+                comment.id,
+                &reply,
+            )
+            .await?;
+            return Ok(());
+        }
+
         let mut file_snippet = String::new();
         if let Some(line) = comment.line {
             if let Ok(Some(content)) = self
@@ -971,8 +1114,9 @@ impl ReviewEngine {
         }
 
         let mut prompt = String::new();
-        prompt.push_str("Respond to this review thread comment. Determine whether the referenced issue has been addressed in the current code.\n");
-        prompt.push_str("If fixed, say so explicitly and reference concrete evidence. If not fixed, explain what remains.\n");
+        prompt.push_str("Respond to this review thread comment.\n");
+        prompt.push_str("First classify the thread state as one of: fixed, not_fixed, intentional_or_accepted, out_of_scope_for_this_pr, needs_human_judgment.\n");
+        prompt.push_str("If a human explicitly says the concern is intentional, acceptable, or out of scope for this PR, acknowledge that and stop pressing the same line in this thread. If fixed, say so explicitly and reference concrete evidence. If not fixed, explain what remains without reopening adjacent design debates.\n");
         prompt.push_str("Output JSON in a fenced block tagged exactly `pr-review-reply-json` with this schema:\n");
         prompt.push_str("{\"reply\": string}\n\n");
         prompt.push_str(&format!("Repo: {}/{}\n", repo_cfg.owner, repo_cfg.name));
@@ -985,6 +1129,13 @@ impl ReviewEngine {
         prompt.push_str("\n\nLatest diff (truncated):\n```diff\n");
         prompt.push_str(&truncate_lines(&latest_diff, 300));
         prompt.push_str("\n```\n");
+
+        let review_state_context = build_review_state_context(&review_memory);
+        if !review_state_context.is_empty() {
+            prompt.push_str("\nReview state:\n");
+            prompt.push_str(&review_state_context);
+            prompt.push('\n');
+        }
 
         if !file_snippet.is_empty() {
             prompt.push_str("\nLatest file snippet around referenced line:\n```\n");
@@ -1051,6 +1202,28 @@ const DISMISSAL_SIGNALS: &[&str] = &[
     "on purpose",
 ];
 
+const OUT_OF_SCOPE_SIGNALS: &[&str] = &[
+    "out of scope",
+    "not in scope",
+    "not in this pr",
+    "not for this pr",
+    "not taking further",
+    "not expanding this pr",
+    "not reopening",
+    "not part of this pr",
+];
+
+const RATIONALE_REJECTION_SIGNALS: &[&str] = &[
+    "false positive",
+    "not correct",
+    "you are wrong",
+    "this is wrong",
+    "that is wrong",
+    "misread",
+    "misunderstanding",
+    "not the issue",
+];
+
 fn has_dismissal_signal(text: &str) -> bool {
     let lower = text.to_lowercase();
     // Split on whitespace and punctuation, but keep hyphens attached to words
@@ -1067,6 +1240,161 @@ fn has_dismissal_signal(text: &str) -> bool {
             words.iter().any(|w| *w == *signal)
         }
     })
+}
+
+fn has_out_of_scope_signal(text: &str) -> bool {
+    let lower = normalize_text(text);
+    OUT_OF_SCOPE_SIGNALS
+        .iter()
+        .any(|signal| lower.contains(&normalize_text(signal)))
+}
+
+fn has_rationale_rejection_signal(text: &str) -> bool {
+    let lower = normalize_text(text);
+    RATIONALE_REJECTION_SIGNALS
+        .iter()
+        .any(|signal| lower.contains(&normalize_text(signal)))
+}
+
+fn normalize_text(text: &str) -> String {
+    text.to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn finding_key(path: &str, line: Option<u32>, body: &str) -> String {
+    format!(
+        "{}|{}|{}",
+        path.trim().to_ascii_lowercase(),
+        line.map(|v| v.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+        normalize_text(body)
+    )
+}
+
+fn token_set(text: &str) -> HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "this", "that", "with", "from", "into", "when", "will", "would", "should", "could", "also",
+        "then", "than", "they", "them", "their", "about", "under", "over", "after", "before",
+        "because", "which", "while", "where", "there", "here", "have", "has", "had", "does",
+        "doesnt", "dont", "isnt", "cant", "only", "just", "being", "through", "still", "later",
+        "every", "other", "again", "across", "agent", "scope", "scoped", "pr", "review",
+        "reviewer", "blocking", "warning", "comment",
+    ];
+
+    normalize_text(text)
+        .split_whitespace()
+        .filter(|token| token.len() >= 4 && !STOPWORDS.contains(token))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn token_overlap(left: &HashSet<String>, right: &HashSet<String>) -> usize {
+    left.intersection(right).count()
+}
+
+fn build_review_memory(
+    reviews: &[PullRequestReview],
+    review_comments: &[ReviewComment],
+    issue_comments: &[IssueComment],
+    bot_name: &str,
+    bot_alias: Option<&str>,
+    current_sha: &str,
+) -> ReviewMemory {
+    let parent_map: HashMap<u64, Option<u64>> = review_comments
+        .iter()
+        .map(|c| (c.id, c.in_reply_to_id))
+        .collect();
+    let mut threads: HashMap<u64, Vec<&ReviewComment>> = HashMap::new();
+    for comment in review_comments {
+        let root = find_thread_root_id(&parent_map, comment.id);
+        threads.entry(root).or_default().push(comment);
+    }
+
+    let mut explicit_boundaries = Vec::new();
+    for comment in issue_comments {
+        if !login_matches_bot(&comment.user.login, bot_name, bot_alias)
+            && has_out_of_scope_signal(&comment.body)
+        {
+            explicit_boundaries.push(comment.body.clone());
+        }
+    }
+
+    let findings = threads
+        .into_values()
+        .filter_map(|comments| {
+            let mut sorted = comments;
+            sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            let finding = sorted
+                .iter()
+                .find(|c| login_matches_bot(&c.user.login, bot_name, bot_alias))?;
+
+            let human_replies: Vec<&&ReviewComment> = sorted
+                .iter()
+                .filter(|c| !login_matches_bot(&c.user.login, bot_name, bot_alias))
+                .collect();
+            if human_replies.is_empty() {
+                return Some(FindingRecord {
+                    key: finding_key(&finding.path, finding.line, &finding.body),
+                    path: finding.path.clone(),
+                    line: finding.line,
+                    body: finding.body.clone(),
+                    token_set: token_set(&finding.body),
+                    status: FindingStatus::Open,
+                });
+            }
+
+            let mut status = FindingStatus::Open;
+            for reply in &human_replies {
+                if has_out_of_scope_signal(&reply.body) {
+                    status = FindingStatus::OutOfScopeForPr;
+                    explicit_boundaries.push(reply.body.clone());
+                    break;
+                }
+                if has_rationale_rejection_signal(&reply.body) {
+                    status = FindingStatus::RejectedWithRationale;
+                } else if has_dismissal_signal(&reply.body) {
+                    status = FindingStatus::DismissedByHuman;
+                }
+            }
+
+            Some(FindingRecord {
+                key: finding_key(&finding.path, finding.line, &finding.body),
+                path: finding.path.clone(),
+                line: finding.line,
+                body: finding.body.clone(),
+                token_set: token_set(&finding.body),
+                status,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let already_noted_screenshot = reviews.iter().any(|review| {
+        login_matches_bot(&review.user.login, bot_name, bot_alias)
+            && review
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains(SCREENSHOT_NOTE_TEXT))
+    }) || issue_comments.iter().any(|comment| {
+        login_matches_bot(&comment.user.login, bot_name, bot_alias)
+            && comment.body.contains(SCREENSHOT_NOTE_TEXT)
+    });
+
+    let has_prior_bot_review = reviews.iter().any(|review| {
+        login_matches_bot(&review.user.login, bot_name, bot_alias)
+            && review.commit_id.as_deref() != Some(current_sha)
+    });
+
+    ReviewMemory {
+        findings,
+        already_noted_screenshot,
+        has_prior_bot_review,
+        explicit_boundaries,
+    }
 }
 
 /// Strip confidence markdown/JSON blocks from a review body to save context space.
@@ -1131,7 +1459,7 @@ fn strip_confidence_blocks(body: &str) -> String {
 
 fn build_prior_reviews_context(
     reviews: &[PullRequestReview],
-    review_comments: &[ReviewComment],
+    _review_comments: &[ReviewComment],
     issue_comments: &[IssueComment],
     bot_name: &str,
     bot_alias: Option<&str>,
@@ -1218,17 +1546,7 @@ fn build_addressed_findings(
         return String::new();
     }
 
-    let parent_map: HashMap<u64, Option<u64>> = review_comments
-        .iter()
-        .map(|c| (c.id, c.in_reply_to_id))
-        .collect();
-
-    // Group comments by thread root
-    let mut threads: HashMap<u64, Vec<&ReviewComment>> = HashMap::new();
-    for comment in review_comments {
-        let root = find_thread_root_id(&parent_map, comment.id);
-        threads.entry(root).or_default().push(comment);
-    }
+    let memory = build_review_memory(&[], review_comments, &[], bot_name, bot_alias, "");
 
     let changed_files: std::collections::HashSet<&str> = parsed_diff
         .files
@@ -1244,40 +1562,14 @@ fn build_addressed_findings(
 
     let mut out = String::new();
 
-    for (_, comments) in &threads {
-        // Find bot's original finding (first bot comment in thread)
-        let mut sorted: Vec<&&ReviewComment> = comments.iter().collect();
-        sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-
-        let bot_finding = sorted
-            .iter()
-            .find(|c| login_matches_bot(&c.user.login, bot_name, bot_alias));
-
-        let Some(finding) = bot_finding else {
-            continue;
-        };
-
-        let human_replied = sorted
-            .iter()
-            .any(|c| !login_matches_bot(&c.user.login, bot_name, bot_alias));
-
-        if !human_replied {
-            continue;
-        }
-
-        // Determine status
-        let human_dismissed = sorted.iter().any(|c| {
-            !login_matches_bot(&c.user.login, bot_name, bot_alias) && has_dismissal_signal(&c.body)
-        });
-
+    for finding in memory.findings {
         let file_in_diff = changed_files.contains(finding.path.as_str());
-
-        let status = if human_dismissed {
-            "[dismissed by human]"
-        } else if !file_in_diff {
-            "[likely addressed]"
-        } else {
-            "[potentially addressed]"
+        let status = match finding.status {
+            FindingStatus::DismissedByHuman => "[dismissed by human]",
+            FindingStatus::RejectedWithRationale => "[rejected with rationale]",
+            FindingStatus::OutOfScopeForPr => "[out of scope for this pr]",
+            FindingStatus::Open if !file_in_diff => "[likely addressed]",
+            FindingStatus::Open | FindingStatus::LikelyAddressed => "[potentially addressed]",
         };
 
         let body_preview: String = finding.body.chars().take(200).collect();
@@ -1291,6 +1583,124 @@ fn build_addressed_findings(
     }
 
     out
+}
+
+fn build_review_state_context(memory: &ReviewMemory) -> String {
+    let mut out = String::new();
+
+    for finding in &memory.findings {
+        let status = match finding.status {
+            FindingStatus::Open => "open",
+            FindingStatus::LikelyAddressed => "likely addressed",
+            FindingStatus::DismissedByHuman => "dismissed by human",
+            FindingStatus::RejectedWithRationale => "rejected with rationale",
+            FindingStatus::OutOfScopeForPr => "out of scope for this pr",
+        };
+        let preview: String = finding.body.chars().take(180).collect();
+        out.push_str(&format!(
+            "- {}:{:?} [{}] {}\n",
+            finding.path,
+            finding.line,
+            status,
+            preview.replace('\n', " ")
+        ));
+    }
+
+    if !memory.explicit_boundaries.is_empty() {
+        out.push_str("\n### Explicit PR boundaries from human replies\n");
+        for boundary in &memory.explicit_boundaries {
+            out.push_str("- ");
+            out.push_str(&boundary.replace('\n', " "));
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+fn can_reopen_rebutted_finding(
+    comment: &ParsedReviewComment,
+    path: &str,
+    memory: &ReviewMemory,
+) -> bool {
+    comment
+        .evidence_note
+        .as_deref()
+        .is_some_and(|note| !note.trim().is_empty())
+        || memory.findings.iter().any(|prior| {
+            prior.path == path
+                && prior.status == FindingStatus::Open
+                && prior.line != Some(comment.line)
+                && token_overlap(&prior.token_set, &token_set(&comment.body)) >= 2
+        })
+}
+
+fn should_suppress_finding(
+    comment: &ParsedReviewComment,
+    path: &str,
+    memory: &ReviewMemory,
+) -> bool {
+    let key = finding_key(path, Some(comment.line), &comment.body);
+    let tokens = token_set(&comment.body);
+
+    for prior in &memory.findings {
+        let exact_match = prior.key == key;
+        let same_family = prior.path == path && token_overlap(&prior.token_set, &tokens) >= 2;
+        if !exact_match && !same_family {
+            continue;
+        }
+
+        match prior.status {
+            FindingStatus::DismissedByHuman
+            | FindingStatus::RejectedWithRationale
+            | FindingStatus::OutOfScopeForPr => {
+                if !can_reopen_rebutted_finding(comment, path, memory) {
+                    return true;
+                }
+            }
+            FindingStatus::LikelyAddressed => return true,
+            FindingStatus::Open => {}
+        }
+    }
+
+    if !memory.explicit_boundaries.is_empty() {
+        for boundary in &memory.explicit_boundaries {
+            if token_overlap(&tokens, &token_set(boundary)) >= 2
+                && !can_reopen_rebutted_finding(comment, path, memory)
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn blocker_has_sufficient_evidence(
+    comment: &ParsedReviewComment,
+    path: &str,
+    review_confidence: crate::review::parser::ConfidenceLevel,
+) -> bool {
+    if comment
+        .evidence_note
+        .as_deref()
+        .is_some_and(|note| !note.trim().is_empty())
+    {
+        return true;
+    }
+
+    if review_confidence == crate::review::parser::ConfidenceLevel::Low {
+        return false;
+    }
+
+    let body = normalize_text(&comment.body);
+    let path_lower = path.to_ascii_lowercase();
+    body.contains(&path_lower)
+        || body.contains("directly")
+        || body.contains("unconditionally")
+        || body.contains("will")
+        || body.contains("can query")
+        || body.contains("hardcodes")
 }
 
 fn truncate_lines(input: &str, max_lines: usize) -> String {
@@ -1335,6 +1745,45 @@ fn build_thread_history(comments: &[ReviewComment], target_comment_id: u64) -> S
         out.push_str("No thread history available.");
     }
     out
+}
+
+fn build_direct_pushback_reply(
+    thread_history: &str,
+    memory: &ReviewMemory,
+    bot_name: &str,
+) -> Option<String> {
+    let lower_history = thread_history.to_ascii_lowercase();
+    if lower_history.contains(&format!(": @{}", bot_name.to_ascii_lowercase())) {
+        return None;
+    }
+
+    if thread_history
+        .lines()
+        .rev()
+        .any(|line| has_out_of_scope_signal(line))
+    {
+        return Some(
+            "acknowledged. i won't keep pushing that line in this PR unless later changes show a direct regression in the scoped feature.".to_string(),
+        );
+    }
+
+    if thread_history
+        .lines()
+        .rev()
+        .any(|line| has_dismissal_signal(line) || has_rationale_rejection_signal(line))
+    {
+        return Some(
+            "got it. treating that as intentional for this PR, so i won't keep re-raising the same concern unless later changes add new concrete evidence.".to_string(),
+        );
+    }
+
+    if !memory.explicit_boundaries.is_empty() {
+        return Some(
+            "noted. there is already an explicit scope boundary on this PR, so i won't reopen adjacent concerns unless a later diff shows a direct issue in the feature under review.".to_string(),
+        );
+    }
+
+    None
 }
 
 fn find_thread_root_id(parent_map: &HashMap<u64, Option<u64>>, id: u64) -> u64 {
@@ -1938,15 +2387,19 @@ fn verdict_label(verdict: ReviewVerdict) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::github::types::{CreateReviewComment, PullRequestReview, User};
+    use crate::github::types::{CreateReviewComment, PullRequestReview, ReviewComment, User};
+    use crate::review::parser::{
+        CommentSeverity, ConfidenceLevel, ReviewComment as ParsedReviewComment,
+    };
 
     use super::{
+        blocker_has_sufficient_evidence, build_direct_pushback_reply,
         build_in_progress_comment_fallback, build_prior_reviews_context, build_retry_review_body,
-        extract_in_progress_comment, infer_pr_focus, login_matches_bot,
-        looks_like_harness_error_output, looks_like_harness_transport_output,
+        build_review_memory, extract_in_progress_comment, finding_key, infer_pr_focus,
+        login_matches_bot, looks_like_harness_error_output, looks_like_harness_transport_output,
         looks_like_reintroduction, normalize_in_progress_comment, pr_reviewer_project_url,
-        resolve_project_url, truncate_github_comment_body, GITHUB_COMMENT_MAX_CHARS,
-        GITHUB_COMMENT_TRUNCATION_NOTE,
+        resolve_project_url, should_suppress_finding, truncate_github_comment_body, FindingStatus,
+        ReviewMemory, GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
     };
 
     #[test]
@@ -2172,5 +2625,136 @@ mod tests {
             "currentsha",
         );
         assert!(context.contains("looks good"));
+    }
+
+    #[test]
+    fn build_review_memory_marks_explicit_scope_boundaries() {
+        let review_comments = vec![
+            ReviewComment {
+                id: 10,
+                body: "Blocking: task ownership is wrong here".to_string(),
+                path: "src/task.rs".to_string(),
+                line: Some(42),
+                user: User {
+                    login: "pr-reviewer".to_string(),
+                },
+                in_reply_to_id: None,
+                created_at: "2026-03-30T00:00:00Z".to_string(),
+            },
+            ReviewComment {
+                id: 11,
+                body: "not taking further task ownership feedback in this PR".to_string(),
+                path: "src/task.rs".to_string(),
+                line: Some(42),
+                user: User {
+                    login: "NicholaiVogel".to_string(),
+                },
+                in_reply_to_id: Some(10),
+                created_at: "2026-03-30T00:01:00Z".to_string(),
+            },
+        ];
+
+        let memory = build_review_memory(&[], &review_comments, &[], "pr-reviewer", None, "head");
+        assert_eq!(memory.findings.len(), 1);
+        assert_eq!(memory.findings[0].status, FindingStatus::OutOfScopeForPr);
+        assert_eq!(memory.explicit_boundaries.len(), 1);
+    }
+
+    #[test]
+    fn suppresses_repeated_out_of_scope_finding_without_new_evidence() {
+        let memory = ReviewMemory {
+            findings: vec![super::FindingRecord {
+                key: finding_key(
+                    "src/task.rs",
+                    Some(42),
+                    "Blocking: task ownership is wrong here",
+                ),
+                path: "src/task.rs".to_string(),
+                line: Some(42),
+                body: "Blocking: task ownership is wrong here".to_string(),
+                token_set: super::token_set("Blocking: task ownership is wrong here"),
+                status: FindingStatus::OutOfScopeForPr,
+            }],
+            already_noted_screenshot: false,
+            has_prior_bot_review: true,
+            explicit_boundaries: vec![
+                "not taking further task ownership feedback in this PR".to_string()
+            ],
+        };
+
+        let comment = ParsedReviewComment {
+            file: "src/task.rs".to_string(),
+            line: 42,
+            body: "Blocking: task ownership is wrong here".to_string(),
+            evidence_note: None,
+            severity: CommentSeverity::Blocking,
+        };
+
+        assert!(should_suppress_finding(&comment, "src/task.rs", &memory));
+    }
+
+    #[test]
+    fn allows_reopening_rebutted_finding_with_evidence_note() {
+        let memory = ReviewMemory {
+            findings: vec![super::FindingRecord {
+                key: finding_key("src/task.rs", Some(42), "task ownership is wrong here"),
+                path: "src/task.rs".to_string(),
+                line: Some(42),
+                body: "task ownership is wrong here".to_string(),
+                token_set: super::token_set("task ownership is wrong here"),
+                status: FindingStatus::RejectedWithRationale,
+            }],
+            already_noted_screenshot: false,
+            has_prior_bot_review: true,
+            explicit_boundaries: vec![],
+        };
+
+        let comment = ParsedReviewComment {
+            file: "src/task.rs".to_string(),
+            line: 50,
+            body: "Blocking: task ownership is still wrong on the new trigger path".to_string(),
+            evidence_note: Some(
+                "new trigger path at src/task.rs:50 now routes cross-agent writes".to_string(),
+            ),
+            severity: CommentSeverity::Blocking,
+        };
+
+        assert!(!should_suppress_finding(&comment, "src/task.rs", &memory));
+    }
+
+    #[test]
+    fn weak_blocker_is_downgraded_without_evidence() {
+        let comment = ParsedReviewComment {
+            file: "src/task.rs".to_string(),
+            line: 10,
+            body: "Blocking: this might be a problem later.".to_string(),
+            evidence_note: None,
+            severity: CommentSeverity::Blocking,
+        };
+
+        assert!(!blocker_has_sufficient_evidence(
+            &comment,
+            "src/task.rs",
+            ConfidenceLevel::Low
+        ));
+    }
+
+    #[test]
+    fn direct_pushback_reply_acknowledges_boundary() {
+        let memory = ReviewMemory {
+            findings: vec![],
+            already_noted_screenshot: false,
+            has_prior_bot_review: true,
+            explicit_boundaries: vec![
+                "not taking further task ownership feedback in this PR".to_string()
+            ],
+        };
+        let reply = build_direct_pushback_reply(
+            "- [2026-03-30] NicholaiVogel: i'm not taking further task ownership feedback in this PR",
+            &memory,
+            "pr-reviewer",
+        )
+        .expect("reply");
+        assert!(reply.contains("won't keep pushing"));
     }
 }

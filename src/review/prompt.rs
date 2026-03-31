@@ -40,7 +40,7 @@ pub fn build_review_prompt(
 
     if has_prior_reviews {
         prompt.push_str(&format!(
-            "{}. Prior review history and inline discussion are in the context. Items marked [dismissed by human] or [likely addressed] MUST NOT be re-flagged. Focus on areas not previously examined. If a human replied to a prior finding saying it is intentional, expected, or acceptable, respect that judgment and do not re-flag it.\n",
+            "{}. Prior review history and inline discussion are in the context. Items marked [dismissed by human], [rejected with rationale], [out of scope for this pr], or [likely addressed] MUST NOT be re-flagged unless the new diff adds materially new evidence. If you re-raise a prior concern, include a short `evidence_note` naming the new lines or changed path that justify reopening it. If a human said a concern is intentional, acceptable, or out of scope for this PR, respect that and do not press the same angle again.\n",
             instruction_num,
         ));
         instruction_num += 1;
@@ -53,11 +53,15 @@ pub fn build_review_prompt(
             .collect::<Vec<_>>()
             .join(", ");
         prompt.push_str(&format!(
-            "{}. This PR modifies UI files: {}. If the PR description does not reference screenshots or visual previews, set ui_screenshot_needed to true and note this in your summary.\n",
+            "{}. This PR modifies UI files: {}. If the PR description does not reference screenshots or visual previews, set ui_screenshot_needed to true. This is a non-blocking metadata note only, never a blocker, and it should only be surfaced once per PR.\n",
             instruction_num, file_list,
         ));
         let _ = instruction_num; // suppress unused warning
     }
+
+    prompt.push_str(
+        "Do not turn adjacent architecture preferences into blockers. A blocker must be grounded in concrete evidence from the changed code or targeted context and must directly affect the PR's stated behavior, security, or data integrity.\n\n",
+    );
 
     prompt.push_str(
         "\nYou MUST NOT approve this PR or state it is safe to merge. You are not authorized to make that call. Your role is to flag issues or signal readiness for human review.\n\n",
@@ -80,6 +84,7 @@ pub fn build_review_prompt(
     prompt.push_str("  - file: string (file path)\n");
     prompt.push_str("  - line: integer (line number in the changed file)\n");
     prompt.push_str("  - body: string (the finding)\n");
+    prompt.push_str("  - evidence_note: optional string (required when re-raising a previously rebutted concern, briefly naming the new lines or changed path that justify reopening it)\n");
     prompt.push_str("  - severity: one of [\"blocking\", \"warning\", \"nitpick\"]\n");
     prompt.push_str(
         "\nLine numbers must refer to changed lines in the current diff whenever possible.\n\n",
