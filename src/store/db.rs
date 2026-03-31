@@ -224,6 +224,19 @@ impl Database {
             ensure_column_exists(conn, "daemon_state", "rate_limit_total", "INTEGER")?;
             ensure_column_exists(conn, "daemon_state", "rate_reset_epoch", "INTEGER")?;
 
+            // Reply deduplication: prevents replying to the same comment twice
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS reply_log (
+                    repo TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    comment_id INTEGER NOT NULL,
+                    replied_at TEXT DEFAULT (datetime('now')),
+                    PRIMARY KEY (repo, pr_number, comment_id)
+                );
+                "#,
+            )?;
+
             conn.execute(
                 "INSERT OR IGNORE INTO daemon_state (id, started_at, last_poll_at, rate_limit_total, rate_remaining, rate_reset_epoch, active_reviews) VALUES (1, NULL, NULL, NULL, NULL, NULL, 0)",
                 [],
@@ -418,6 +431,45 @@ impl Database {
                 params![repo, pr_number, last_comment_check],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Attempt to claim a reply slot for a comment. Returns true if this is the
+    /// first reply (inserted), false if we already replied (unique constraint).
+    pub async fn claim_reply(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        comment_id: i64,
+    ) -> Result<bool> {
+        let repo = repo.to_string();
+        self.run(move |conn| {
+            let result = conn.execute(
+                "INSERT OR IGNORE INTO reply_log (repo, pr_number, comment_id) VALUES (?1, ?2, ?3)",
+                params![repo, pr_number, comment_id],
+            )?;
+            Ok(result > 0)
+        })
+        .await
+    }
+
+    /// Returns the number of replies posted to this PR within the last `window_secs` seconds.
+    /// Used as a circuit breaker to prevent runaway reply loops.
+    pub async fn recent_reply_count(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        window_secs: i64,
+    ) -> Result<i64> {
+        let repo = repo.to_string();
+        self.run(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM reply_log WHERE repo = ?1 AND pr_number = ?2 AND replied_at > datetime('now', ?3)",
+                params![repo, pr_number, format!("-{window_secs} seconds")],
+                |row| row.get(0),
+            )?;
+            Ok(count)
         })
         .await
     }
@@ -1012,5 +1064,50 @@ mod tests {
 
         assert!(db.claim_review(claim).await.expect("claim"));
         assert_eq!(db.get_claimed_reviews().await.expect("depth"), 1);
+    }
+
+    #[tokio::test]
+    async fn reply_claim_prevents_duplicates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        // First claim succeeds
+        assert!(db.claim_reply("o/r", 1, 100).await.expect("first claim"));
+        // Second claim for same comment fails (already replied)
+        assert!(
+            !db.claim_reply("o/r", 1, 100).await.expect("second claim"),
+            "duplicate reply claim should return false"
+        );
+        // Different comment on same PR succeeds
+        assert!(db
+            .claim_reply("o/r", 1, 200)
+            .await
+            .expect("different comment"));
+    }
+
+    #[tokio::test]
+    async fn recent_reply_count_tracks_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        // No replies yet
+        let count = db.recent_reply_count("o/r", 1, 600).await.expect("count");
+        assert_eq!(count, 0);
+
+        // Add some replies
+        db.claim_reply("o/r", 1, 100).await.expect("claim 1");
+        db.claim_reply("o/r", 1, 200).await.expect("claim 2");
+        db.claim_reply("o/r", 1, 300).await.expect("claim 3");
+
+        let count = db.recent_reply_count("o/r", 1, 600).await.expect("count");
+        assert_eq!(count, 3);
+
+        // Different PR should have 0
+        let count = db.recent_reply_count("o/r", 2, 600).await.expect("count");
+        assert_eq!(count, 0);
     }
 }

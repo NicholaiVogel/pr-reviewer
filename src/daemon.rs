@@ -139,6 +139,7 @@ pub async fn start(
                             .await
                         {
                             for comment in review_comments {
+                                // Skip our own comments
                                 if comment
                                     .user
                                     .login
@@ -146,7 +147,67 @@ pub async fn start(
                                 {
                                     continue;
                                 }
+                                if engine.authenticated_user().is_some_and(|u| {
+                                    comment.user.login.eq_ignore_ascii_case(u)
+                                }) {
+                                    continue;
+                                }
+                                // Skip comments from any GitHub Bot account (other
+                                // pr-reviewer instances, CI bots, etc.)
+                                if comment.user.is_bot() {
+                                    tracing::debug!(
+                                        repo = %repo_name,
+                                        pr = pr.number,
+                                        comment_id = comment.id,
+                                        login = %comment.user.login,
+                                        "skipping comment from bot account"
+                                    );
+                                    continue;
+                                }
                                 if !comment.body.contains(&bot_mention) {
+                                    continue;
+                                }
+
+                                // Circuit breaker: if we've replied to this PR more
+                                // than 5 times in the last 10 minutes, stop. This
+                                // catches runaway loops that bypass other guards.
+                                // Checked BEFORE claim_reply so we don't burn slots
+                                // in the reply_log when the breaker is active.
+                                const COOLDOWN_WINDOW_SECS: i64 = 600;
+                                const COOLDOWN_MAX_REPLIES: i64 = 5;
+                                let recent = db
+                                    .recent_reply_count(
+                                        &repo_name,
+                                        pr.number as i64,
+                                        COOLDOWN_WINDOW_SECS,
+                                    )
+                                    .await?;
+                                if recent >= COOLDOWN_MAX_REPLIES {
+                                    tracing::warn!(
+                                        repo = %repo_name,
+                                        pr = pr.number,
+                                        recent_replies = recent,
+                                        "reply cooldown active, skipping comment {}",
+                                        comment.id
+                                    );
+                                    continue;
+                                }
+
+                                // Deduplication: skip if we already replied to this comment
+                                let claimed = db
+                                    .claim_reply(
+                                        &repo_name,
+                                        pr.number as i64,
+                                        comment.id as i64,
+                                    )
+                                    .await?;
+                                if !claimed {
+                                    tracing::debug!(
+                                        repo = %repo_name,
+                                        pr = pr.number,
+                                        comment_id = comment.id,
+                                        "skipping already-replied comment"
+                                    );
                                     continue;
                                 }
 

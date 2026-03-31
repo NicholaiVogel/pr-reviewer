@@ -102,6 +102,10 @@ impl ReviewEngine {
         self.authenticated_user = self.github.get_authenticated_user().await.ok();
     }
 
+    pub fn authenticated_user(&self) -> Option<&str> {
+        self.authenticated_user.as_deref()
+    }
+
     pub async fn review_pr(
         &self,
         repo_cfg: &RepoConfig,
@@ -1089,7 +1093,6 @@ impl ReviewEngine {
 
         if let Some(reply) = build_direct_pushback_reply(
             &thread_history,
-            &review_memory,
             self.config.defaults.bot_name.as_str(),
             self.authenticated_user.as_deref(),
         ) {
@@ -1753,13 +1756,57 @@ fn blocker_has_sufficient_evidence(
     }
 
     let body = normalize_text(&comment.body);
-    let path_lower = path.to_ascii_lowercase();
-    body.contains(&path_lower)
-        || body.contains("directly")
-        || body.contains("unconditionally")
-        || body.contains("will")
-        || body.contains("can query")
-        || body.contains("hardcodes")
+    let path_normalized = normalize_text(path);
+
+    // Strong: body references the specific file path
+    if body.contains(&path_normalized) {
+        return true;
+    }
+
+    // Strong: causal verb phrases that indicate concrete reasoning
+    const CAUSAL_PHRASES: &[&str] = &[
+        "will panic",
+        "will fail",
+        "will crash",
+        "will break",
+        "will deadlock",
+        "will overflow",
+        "will loop",
+        "will block",
+        "will hang",
+        "will leak",
+        "will corrupt",
+        "will lose",
+        "will drop",
+        "will skip",
+        "will miss",
+        "will silently",
+        "will always",
+        "will never",
+        "can panic",
+        "can fail",
+        "can crash",
+        "can deadlock",
+        "can overflow",
+        "can corrupt",
+        "can lose",
+        "unconditionally",
+        "hardcodes",
+        "hardcoded",
+        "unreachable",
+        "always returns",
+        "never returns",
+        "infinite loop",
+        "use after free",
+        "null dereference",
+        "data race",
+        "undefined behavior",
+        "buffer overflow",
+        "sql injection",
+        "command injection",
+    ];
+
+    CAUSAL_PHRASES.iter().any(|phrase| body.contains(phrase))
 }
 
 fn truncate_lines(input: &str, max_lines: usize) -> String {
@@ -1793,10 +1840,15 @@ fn build_thread_history(comments: &[ReviewComment], target_comment_id: u64) -> S
 
     let mut out = String::new();
     for c in thread_comments {
+        let label = if c.user.is_bot() {
+            format!("{} (bot)", c.user.login)
+        } else {
+            c.user.login.clone()
+        };
         out.push_str(&format!(
             "- [{}] {}: {}\n",
             c.created_at,
-            c.user.login,
+            label,
             c.body.replace('\n', " ")
         ));
     }
@@ -1808,22 +1860,42 @@ fn build_thread_history(comments: &[ReviewComment], target_comment_id: u64) -> S
 
 fn build_direct_pushback_reply(
     thread_history: &str,
-    _memory: &ReviewMemory,
     bot_name: &str,
     bot_alias: Option<&str>,
 ) -> Option<String> {
-    let lower_history = thread_history.to_ascii_lowercase();
-    if lower_history.contains(&format!("@{}", bot_name.to_ascii_lowercase())) {
-        return None;
-    }
-    if let Some(alias) = bot_alias {
-        if lower_history.contains(&format!("@{}", alias.to_ascii_lowercase())) {
+    let bot_lower = bot_name.to_ascii_lowercase();
+    let alias_lower = bot_alias.map(|a| a.to_ascii_lowercase());
+    let mention_target = format!("@{}", bot_lower);
+    let mention_alias = alias_lower.as_ref().map(|a| format!("@{}", a));
+
+    // Check for @bot mentions only in non-bot lines (avoid matching the bot's own text)
+    let human_lines: Vec<&str> = thread_history
+        .lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            // Thread history format: "- [timestamp] login: body"
+            // Skip lines authored by the bot itself
+            !line_is_authored_by_bot(&lower, &bot_lower, alias_lower.as_deref())
+        })
+        .collect();
+
+    for line in &human_lines {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains(&mention_target) {
             return None;
+        }
+        if let Some(ref alias_mention) = mention_alias {
+            if lower.contains(alias_mention) {
+                return None;
+            }
         }
     }
 
-    if thread_history
-        .lines()
+    // Only scan human lines for pushback signals. The bot's own review body
+    // can contain phrases like "not correct" or "on purpose" as part of its
+    // analysis, which would falsely trigger a canned acknowledgement.
+    if human_lines
+        .iter()
         .rev()
         .any(|line| has_out_of_scope_signal(line))
     {
@@ -1832,8 +1904,8 @@ fn build_direct_pushback_reply(
         );
     }
 
-    if thread_history
-        .lines()
+    if human_lines
+        .iter()
         .rev()
         .any(|line| has_dismissal_signal(line) || has_rationale_rejection_signal(line))
     {
@@ -1843,6 +1915,25 @@ fn build_direct_pushback_reply(
     }
 
     None
+}
+
+/// Check if a lowercased thread-history line was authored by the bot.
+/// Thread history format: `- [timestamp] login: body` or `- [timestamp] login (bot): body`
+fn line_is_authored_by_bot(lower_line: &str, bot_lower: &str, alias_lower: Option<&str>) -> bool {
+    // Strip leading "- [timestamp] " to get "login: body" or "login (bot): body"
+    let after_bracket = match lower_line.find("] ") {
+        Some(pos) => &lower_line[pos + 2..],
+        None => return false,
+    };
+    let raw_login = match after_bracket.find(": ") {
+        Some(pos) => after_bracket[..pos].trim(),
+        None => return false,
+    };
+    // Strip " (bot)" suffix if present
+    let login = raw_login
+        .strip_suffix(" (bot)")
+        .unwrap_or(raw_login);
+    login == bot_lower || alias_lower.is_some_and(|a| login == a)
 }
 
 fn find_thread_root_id(parent_map: &HashMap<u64, Option<u64>>, id: u64) -> u64 {
@@ -2454,12 +2545,47 @@ mod tests {
     use super::{
         blocker_has_sufficient_evidence, build_direct_pushback_reply,
         build_in_progress_comment_fallback, build_prior_reviews_context, build_retry_review_body,
-        build_review_memory, extract_in_progress_comment, finding_key, infer_pr_focus,
-        login_matches_bot, looks_like_harness_error_output, looks_like_harness_transport_output,
+        build_review_memory, build_thread_history, extract_in_progress_comment, finding_key,
+        infer_pr_focus, line_is_authored_by_bot, login_matches_bot,
+        looks_like_harness_error_output, looks_like_harness_transport_output,
         looks_like_reintroduction, normalize_in_progress_comment, pr_reviewer_project_url,
-        resolve_project_url, should_suppress_finding, truncate_github_comment_body, FindingStatus,
-        ReviewMemory, GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
+        resolve_project_url, should_suppress_finding, status_precedence,
+        truncate_github_comment_body, FindingStatus, ReviewMemory, GITHUB_COMMENT_MAX_CHARS,
+        GITHUB_COMMENT_TRUNCATION_NOTE,
     };
+
+    fn test_user(login: &str) -> User {
+        User {
+            login: login.to_string(),
+            account_type: None,
+        }
+    }
+
+    fn test_bot_user(login: &str) -> User {
+        User {
+            login: login.to_string(),
+            account_type: Some("Bot".to_string()),
+        }
+    }
+
+    fn review_comment(
+        id: u64,
+        in_reply_to: Option<u64>,
+        login: &str,
+        path: &str,
+        line: Option<u32>,
+        body: &str,
+    ) -> ReviewComment {
+        ReviewComment {
+            id,
+            body: body.to_string(),
+            path: path.to_string(),
+            line,
+            user: test_user(login),
+            in_reply_to_id: in_reply_to,
+            created_at: format!("2026-03-30T00:{:02}:00Z", id),
+        }
+    }
 
     #[test]
     fn first_touch_comment_mentions_repo_link() {
@@ -2667,9 +2793,7 @@ mod tests {
         let reviews = vec![PullRequestReview {
             id: 1,
             body: Some("looks good".to_string()),
-            user: User {
-                login: "NicholaiVogel".to_string(),
-            },
+            user: test_user("NicholaiVogel"),
             state: Some("COMMENTED".to_string()),
             commit_id: Some("previoussha".to_string()),
             submitted_at: Some("2026-03-17T00:00:00Z".to_string()),
@@ -2694,9 +2818,7 @@ mod tests {
                 body: "Blocking: task ownership is wrong here".to_string(),
                 path: "src/task.rs".to_string(),
                 line: Some(42),
-                user: User {
-                    login: "pr-reviewer".to_string(),
-                },
+                user: test_user("pr-reviewer"),
                 in_reply_to_id: None,
                 created_at: "2026-03-30T00:00:00Z".to_string(),
             },
@@ -2705,9 +2827,7 @@ mod tests {
                 body: "not taking further task ownership feedback in this PR".to_string(),
                 path: "src/task.rs".to_string(),
                 line: Some(42),
-                user: User {
-                    login: "NicholaiVogel".to_string(),
-                },
+                user: test_user("NicholaiVogel"),
                 in_reply_to_id: Some(10),
                 created_at: "2026-03-30T00:01:00Z".to_string(),
             },
@@ -2734,9 +2854,7 @@ mod tests {
             body: "Potential blocking issue in task cleanup".to_string(),
             path: "src/task.rs".to_string(),
             line: Some(42),
-            user: User {
-                login: "pr-reviewer".to_string(),
-            },
+            user: test_user("pr-reviewer"),
             in_reply_to_id: None,
             created_at: "2026-03-30T00:00:00Z".to_string(),
         }];
@@ -2835,17 +2953,8 @@ mod tests {
 
     #[test]
     fn direct_pushback_reply_acknowledges_boundary() {
-        let memory = ReviewMemory {
-            findings: vec![],
-            already_noted_screenshot: false,
-            has_prior_bot_review: true,
-            explicit_boundaries: vec![
-                "not taking further task ownership feedback in this PR".to_string()
-            ],
-        };
         let reply = build_direct_pushback_reply(
             "- [2026-03-30] NicholaiVogel: i'm not taking further task ownership feedback in this PR",
-            &memory,
             "pr-reviewer",
             None,
         )
@@ -2855,20 +2964,451 @@ mod tests {
 
     #[test]
     fn direct_pushback_reply_detects_bot_mention_format() {
-        let memory = ReviewMemory {
-            findings: vec![],
-            already_noted_screenshot: false,
-            has_prior_bot_review: true,
-            explicit_boundaries: vec![],
-        };
-
         let reply = build_direct_pushback_reply(
             "- [2026-03-30] NicholaiVogel: thanks @pr-reviewer",
-            &memory,
             "pr-reviewer",
             None,
         );
 
         assert!(reply.is_none());
+    }
+
+    // --- Regression tests: blocker evidence gate ---
+
+    #[test]
+    fn blocker_with_causal_phrase_passes_evidence_gate() {
+        let comment = ParsedReviewComment {
+            file: "src/engine.rs".to_string(),
+            line: 100,
+            body: "This will panic when the input is empty because unwrap() is called on None".to_string(),
+            evidence_note: None,
+            severity: CommentSeverity::Blocking,
+        };
+
+        assert!(blocker_has_sufficient_evidence(
+            &comment,
+            "src/engine.rs",
+            ConfidenceLevel::Medium,
+        ));
+    }
+
+    #[test]
+    fn blocker_with_bare_will_no_consequence_fails_evidence_gate() {
+        // "will" alone without a consequence verb should NOT pass
+        let comment = ParsedReviewComment {
+            file: "src/engine.rs".to_string(),
+            line: 100,
+            body: "This function will need refactoring eventually for maintainability.".to_string(),
+            evidence_note: None,
+            severity: CommentSeverity::Blocking,
+        };
+
+        assert!(!blocker_has_sufficient_evidence(
+            &comment,
+            "src/engine.rs",
+            ConfidenceLevel::Medium,
+        ));
+    }
+
+    #[test]
+    fn blocker_referencing_file_path_passes_evidence_gate() {
+        let comment = ParsedReviewComment {
+            file: "src/config.rs".to_string(),
+            line: 55,
+            body: "The default in src/config.rs contradicts the documented behavior".to_string(),
+            evidence_note: None,
+            severity: CommentSeverity::Blocking,
+        };
+
+        assert!(blocker_has_sufficient_evidence(
+            &comment,
+            "src/config.rs",
+            ConfidenceLevel::Medium,
+        ));
+    }
+
+    #[test]
+    fn blocker_with_evidence_note_always_passes() {
+        let comment = ParsedReviewComment {
+            file: "src/task.rs".to_string(),
+            line: 10,
+            body: "something vague".to_string(),
+            evidence_note: Some("line 10 assigns None then unwraps at line 12".to_string()),
+            severity: CommentSeverity::Blocking,
+        };
+
+        assert!(blocker_has_sufficient_evidence(
+            &comment,
+            "src/task.rs",
+            ConfidenceLevel::Low,
+        ));
+    }
+
+    #[test]
+    fn blocker_with_sql_injection_phrase_passes() {
+        let comment = ParsedReviewComment {
+            file: "src/db.rs".to_string(),
+            line: 30,
+            body: "User input is interpolated directly into the query, creating a sql injection vector".to_string(),
+            evidence_note: None,
+            severity: CommentSeverity::Blocking,
+        };
+
+        assert!(blocker_has_sufficient_evidence(
+            &comment,
+            "src/db.rs",
+            ConfidenceLevel::Medium,
+        ));
+    }
+
+    #[test]
+    fn blocker_low_confidence_no_evidence_fails() {
+        let comment = ParsedReviewComment {
+            file: "src/db.rs".to_string(),
+            line: 30,
+            body: "This will panic and crash and burn".to_string(),
+            evidence_note: None,
+            severity: CommentSeverity::Blocking,
+        };
+
+        assert!(!blocker_has_sufficient_evidence(
+            &comment,
+            "src/db.rs",
+            ConfidenceLevel::Low,
+        ));
+    }
+
+    // --- Regression tests: bot-mention guard ---
+
+    #[test]
+    fn bot_mention_guard_ignores_bots_own_text() {
+        // Bot's own comment references @pr-reviewer, but a human said "not in scope"
+        // The guard should NOT bail just because the bot mentioned itself
+        let history = "- [2026-03-30] pr-reviewer: see @pr-reviewer docs for details\n\
+                        - [2026-03-30] NicholaiVogel: this is out of scope for this PR";
+        let reply = build_direct_pushback_reply(history, "pr-reviewer", None);
+        assert!(reply.is_some(), "should produce a pushback reply");
+        assert!(reply.unwrap().contains("won't keep pushing"));
+    }
+
+    #[test]
+    fn bot_mention_guard_fires_on_human_mention() {
+        // Human explicitly @-mentions the bot, expecting a substantive response
+        let history = "- [2026-03-30] pr-reviewer: this code has a bug\n\
+                        - [2026-03-30] NicholaiVogel: @pr-reviewer can you re-check this?";
+        let reply = build_direct_pushback_reply(history, "pr-reviewer", None);
+        assert!(reply.is_none(), "should bail when human mentions the bot");
+    }
+
+    #[test]
+    fn bot_mention_guard_checks_alias() {
+        let history = "- [2026-03-30] NicholaiVogel: @PR-Reviewer-Ant please look again";
+        let reply = build_direct_pushback_reply(history, "pr-reviewer", Some("PR-Reviewer-Ant"));
+        assert!(reply.is_none(), "should bail when human mentions the bot alias");
+    }
+
+    #[test]
+    fn bot_mention_guard_alias_in_bot_line_ignored() {
+        let history = "- [2026-03-30] PR-Reviewer-Ant: reviewed by @PR-Reviewer-Ant\n\
+                        - [2026-03-30] NicholaiVogel: nah, out of scope";
+        let reply = build_direct_pushback_reply(history, "pr-reviewer", Some("PR-Reviewer-Ant"));
+        assert!(reply.is_some(), "bot's own alias mention should not trigger the guard");
+    }
+
+    // --- Regression tests: status precedence in build_review_memory ---
+
+    #[test]
+    fn status_precedence_keeps_strongest_signal() {
+        // RejectedWithRationale (3) > DismissedByHuman (2)
+        // If reply #1 is rationale rejection and reply #2 is dismissal,
+        // the final status should remain RejectedWithRationale
+        use super::status_precedence;
+
+        assert!(
+            status_precedence(&FindingStatus::RejectedWithRationale)
+                > status_precedence(&FindingStatus::DismissedByHuman)
+        );
+        assert!(
+            status_precedence(&FindingStatus::OutOfScopeForPr)
+                > status_precedence(&FindingStatus::RejectedWithRationale)
+        );
+        assert!(
+            status_precedence(&FindingStatus::DismissedByHuman)
+                > status_precedence(&FindingStatus::LikelyAddressed)
+        );
+    }
+
+    #[test]
+    fn build_review_memory_rationale_not_downgraded_by_later_dismissal() {
+        // Simulates: reply #1 has rationale rejection, reply #2 is a soft dismissal.
+        // Final status must be RejectedWithRationale (stronger), not DismissedByHuman.
+        let review_comments = vec![
+            review_comment(1, None, "pr-reviewer", "src/task.rs", Some(10), "Bug: wrong logic here"),
+            review_comment(2, Some(1), "NicholaiVogel", "src/task.rs", Some(10), "this is a false positive, the spec requires this behavior"),
+            review_comment(3, Some(1), "AnotherDev", "src/task.rs", Some(10), "yeah just leave it, it's fine"),
+        ];
+
+        let memory = build_review_memory(
+            &[],
+            &review_comments,
+            &[],
+            "pr-reviewer",
+            None,
+            "head-sha",
+            Some(&["src/task.rs".to_string()]),
+        );
+
+        assert_eq!(memory.findings.len(), 1);
+        assert_eq!(
+            memory.findings[0].status,
+            FindingStatus::RejectedWithRationale,
+            "stronger rationale rejection should not be downgraded by a later soft dismissal"
+        );
+    }
+
+    // --- Regression tests: LikelyAddressed ---
+
+    #[test]
+    fn finding_on_unchanged_file_is_likely_addressed() {
+        let review_comments = vec![
+            review_comment(1, None, "pr-reviewer", "src/old.rs", Some(10), "Bug found here"),
+        ];
+
+        let memory = build_review_memory(
+            &[],
+            &review_comments,
+            &[],
+            "pr-reviewer",
+            None,
+            "new-sha",
+            Some(&["src/new.rs".to_string()]),
+        );
+
+        assert_eq!(memory.findings.len(), 1);
+        assert_eq!(memory.findings[0].status, FindingStatus::LikelyAddressed);
+    }
+
+    #[test]
+    fn likely_addressed_finding_is_suppressed() {
+        let memory = ReviewMemory {
+            findings: vec![super::FindingRecord {
+                key: finding_key("src/old.rs", Some(10), "Bug found here"),
+                path: "src/old.rs".to_string(),
+                line: Some(10),
+                body: "Bug found here".to_string(),
+                token_set: super::token_set("Bug found here"),
+                status: FindingStatus::LikelyAddressed,
+            }],
+            already_noted_screenshot: false,
+            has_prior_bot_review: true,
+            explicit_boundaries: vec![],
+        };
+
+        let comment = ParsedReviewComment {
+            file: "src/old.rs".to_string(),
+            line: 10,
+            body: "Bug found here".to_string(),
+            evidence_note: None,
+            severity: CommentSeverity::Warning,
+        };
+
+        assert!(should_suppress_finding(&comment, "src/old.rs", &memory));
+    }
+
+    // --- Regression test: line_is_authored_by_bot ---
+
+    #[test]
+    fn line_is_authored_by_bot_parses_thread_format() {
+        use super::line_is_authored_by_bot;
+
+        assert!(line_is_authored_by_bot(
+            "- [2026-03-30t04:14:20z] pr-reviewer: some review text",
+            "pr-reviewer",
+            None,
+        ));
+        assert!(!line_is_authored_by_bot(
+            "- [2026-03-30t04:14:20z] nicholaivogel: some comment",
+            "pr-reviewer",
+            None,
+        ));
+        assert!(line_is_authored_by_bot(
+            "- [2026-03-30t04:14:20z] pr-reviewer-ant: automated review",
+            "pr-reviewer",
+            Some("pr-reviewer-ant"),
+        ));
+        assert!(!line_is_authored_by_bot(
+            "no bracket line",
+            "pr-reviewer",
+            None,
+        ));
+    }
+
+    // --- Regression test: pushback reply for dismissal signal ---
+
+    #[test]
+    fn direct_pushback_reply_acknowledges_dismissal() {
+        let reply = build_direct_pushback_reply(
+            "- [2026-03-30] NicholaiVogel: nah, this is intentional, leave it",
+            "pr-reviewer",
+            None,
+        )
+        .expect("should produce reply");
+        assert!(reply.contains("treating that as intentional"));
+    }
+
+    #[test]
+    fn direct_pushback_reply_returns_none_for_neutral_comment() {
+        let reply = build_direct_pushback_reply(
+            "- [2026-03-30] NicholaiVogel: interesting, let me think about it",
+            "pr-reviewer",
+            None,
+        );
+        assert!(reply.is_none(), "neutral comments should not trigger a canned reply");
+    }
+
+    // --- Multi-bot safeguard tests ---
+
+    #[test]
+    fn user_is_bot_detects_github_bot_accounts() {
+        let bot = test_bot_user("BusyBee3333");
+        assert!(bot.is_bot());
+
+        let human = test_user("NicholaiVogel");
+        assert!(!human.is_bot());
+
+        let unknown = User {
+            login: "someone".to_string(),
+            account_type: None,
+        };
+        assert!(!unknown.is_bot(), "None account_type should not be treated as bot");
+    }
+
+    #[test]
+    fn build_thread_history_labels_bot_comments() {
+        let comments = vec![
+            ReviewComment {
+                id: 1,
+                body: "Bug: wrong logic here".to_string(),
+                path: "src/task.rs".to_string(),
+                line: Some(10),
+                user: test_bot_user("BusyBee3333"),
+                in_reply_to_id: None,
+                created_at: "2026-03-30T04:16:00Z".to_string(),
+            },
+            ReviewComment {
+                id: 2,
+                body: "I disagree, this is intentional".to_string(),
+                path: "src/task.rs".to_string(),
+                line: Some(10),
+                user: test_user("NicholaiVogel"),
+                in_reply_to_id: Some(1),
+                created_at: "2026-03-30T04:17:00Z".to_string(),
+            },
+        ];
+
+        let history = build_thread_history(&comments, 1);
+        assert!(
+            history.contains("BusyBee3333 (bot):"),
+            "bot comments should be labeled: {history}"
+        );
+        assert!(
+            !history.contains("NicholaiVogel (bot)"),
+            "human comments should not be labeled as bot: {history}"
+        );
+        assert!(history.contains("NicholaiVogel:"));
+    }
+
+    #[test]
+    fn line_is_authored_by_bot_handles_bot_label_suffix() {
+        // The new format includes "(bot)" for bot accounts
+        assert!(line_is_authored_by_bot(
+            "- [2026-03-30t04:14:20z] pr-reviewer (bot): some review text",
+            "pr-reviewer",
+            None,
+        ));
+        assert!(!line_is_authored_by_bot(
+            "- [2026-03-30t04:14:20z] nicholaivogel: some comment",
+            "pr-reviewer",
+            None,
+        ));
+    }
+
+    #[test]
+    fn bot_mention_guard_ignores_bot_labeled_lines() {
+        // Bot's own comment has (bot) label and references @pr-reviewer,
+        // but a human said "out of scope". Guard should not bail.
+        let history = "- [2026-03-30] pr-reviewer (bot): see @pr-reviewer docs for details\n\
+                        - [2026-03-30] NicholaiVogel: this is out of scope for this PR";
+        let reply = build_direct_pushback_reply(history, "pr-reviewer", None);
+        assert!(reply.is_some(), "should produce a pushback reply despite bot's own @mention");
+    }
+
+    #[test]
+    fn build_review_memory_treats_other_bot_as_non_human() {
+        // When another bot (BusyBee3333) replies to our finding, it should not
+        // be treated as a human dismissal. Only this bot's own comments and
+        // genuine human comments should influence finding status.
+        //
+        // Note: currently build_review_memory uses login_matches_bot which only
+        // knows about *this* bot's identity. Other bots' comments are treated as
+        // human replies. This test documents the current behavior and would need
+        // updating if we add peer-bot awareness to build_review_memory.
+        let review_comments = vec![
+            review_comment(1, None, "pr-reviewer", "src/task.rs", Some(10), "Bug here"),
+            // Another bot says "fine" (a dismissal signal)
+            ReviewComment {
+                id: 2,
+                body: "fine, this looks acceptable".to_string(),
+                path: "src/task.rs".to_string(),
+                line: Some(10),
+                user: test_bot_user("BusyBee3333"),
+                in_reply_to_id: Some(1),
+                created_at: "2026-03-30T00:02:00Z".to_string(),
+            },
+        ];
+
+        let memory = build_review_memory(
+            &[],
+            &review_comments,
+            &[],
+            "pr-reviewer",
+            None,
+            "head-sha",
+            Some(&["src/task.rs".to_string()]),
+        );
+
+        // Currently other bots ARE treated as human. This test documents
+        // that behavior so we notice if/when we change it.
+        assert_eq!(memory.findings.len(), 1);
+        assert_eq!(
+            memory.findings[0].status,
+            FindingStatus::DismissedByHuman,
+            "other bot comments are currently classified as human replies (known limitation)"
+        );
+    }
+
+    #[test]
+    fn signal_scan_ignores_bots_own_review_text() {
+        // The bot's previous review body might contain phrases like "not correct"
+        // or "on purpose" as part of its analysis. These should NOT trigger
+        // a canned pushback reply when a human makes a neutral comment afterward.
+        let history = "- [2026-03-30] pr-reviewer: this logic is not correct and the pattern is intentional duplication\n\
+                        - [2026-03-30] NicholaiVogel: interesting, let me look at this more closely";
+        let reply = build_direct_pushback_reply(history, "pr-reviewer", None);
+        assert!(
+            reply.is_none(),
+            "bot's own text containing 'not correct' or 'intentional' should not trigger a canned reply"
+        );
+    }
+
+    #[test]
+    fn signal_scan_still_fires_on_human_dismissal_with_bot_noise() {
+        // Even when the bot's own text contains signal words, a genuine human
+        // dismissal should still be detected.
+        let history = "- [2026-03-30] pr-reviewer: this is not correct behavior\n\
+                        - [2026-03-30] NicholaiVogel: nah, it's fine, leave it";
+        let reply = build_direct_pushback_reply(history, "pr-reviewer", None);
+        assert!(reply.is_some(), "human dismissal should still be detected");
+        assert!(reply.unwrap().contains("treating that as intentional"));
     }
 }
