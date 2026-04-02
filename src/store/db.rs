@@ -58,6 +58,26 @@ pub struct ReviewLogEntry {
     pub completed_at: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReviewAttemptRecord {
+    pub sha: String,
+    pub harness: String,
+    pub model: Option<String>,
+    pub status: String,
+    pub comments_posted: Option<i64>,
+    pub verdict: Option<String>,
+    pub duration_secs: Option<f64>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingFinalization {
+    pub pr_number: i64,
+    pub last_reviewed_sha: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LogsFilter {
     pub repo: Option<String>,
@@ -194,6 +214,18 @@ impl Database {
                     error_message TEXT,
                     created_at TEXT DEFAULT (datetime('now')),
                     completed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS review_archive (
+                    repo TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    reviewed_sha TEXT NOT NULL,
+                    terminal_state TEXT NOT NULL,
+                    closed_at TEXT,
+                    transcript TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    generated_at TEXT DEFAULT (datetime('now')),
+                    PRIMARY KEY (repo, pr_number)
                 );
 
                 CREATE TABLE IF NOT EXISTS daemon_state (
@@ -350,6 +382,94 @@ impl Database {
             conn.execute(
                 "UPDATE review_log SET status='failed', error_message=?2, duration_secs=?3, completed_at=datetime('now') WHERE dedupe_key=?1",
                 params![dedupe_key, message, duration_secs],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn list_pr_review_attempts(
+        &self,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<Vec<ReviewAttemptRecord>> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT sha, harness, model, status, comments_posted, verdict, duration_secs, error_message, created_at, completed_at FROM review_log WHERE repo = ?1 AND pr_number = ?2 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map(params![repo, pr_number], |row| {
+                Ok(ReviewAttemptRecord {
+                    sha: row.get(0)?,
+                    harness: row.get(1)?,
+                    model: row.get(2)?,
+                    status: row.get(3)?,
+                    comments_posted: row.get(4)?,
+                    verdict: row.get(5)?,
+                    duration_secs: row.get(6)?,
+                    error_message: row.get(7)?,
+                    created_at: row.get(8)?,
+                    completed_at: row.get(9)?,
+                })
+            })?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub async fn list_prs_pending_finalization(
+        &self,
+        repo: &str,
+    ) -> Result<Vec<PendingFinalization>> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT p.pr_number, p.last_reviewed_sha FROM pr_state p LEFT JOIN review_archive a ON a.repo = p.repo AND a.pr_number = p.pr_number WHERE p.repo = ?1 AND p.last_reviewed_sha IS NOT NULL AND (a.reviewed_sha IS NULL OR a.reviewed_sha != p.last_reviewed_sha) ORDER BY p.pr_number ASC",
+            )?;
+            let rows = stmt.query_map(params![repo], |row| {
+                Ok(PendingFinalization {
+                    pr_number: row.get(0)?,
+                    last_reviewed_sha: row.get(1)?,
+                })
+            })?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub async fn upsert_review_archive(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        reviewed_sha: &str,
+        terminal_state: &str,
+        closed_at: Option<&str>,
+        transcript: &str,
+        summary: &str,
+    ) -> Result<()> {
+        let repo = repo.to_string();
+        let reviewed_sha = reviewed_sha.to_string();
+        let terminal_state = terminal_state.to_string();
+        let closed_at = closed_at.map(ToString::to_string);
+        let transcript = transcript.to_string();
+        let summary = summary.to_string();
+
+        self.run(move |conn| {
+            conn.execute(
+                "INSERT INTO review_archive (repo, pr_number, reviewed_sha, terminal_state, closed_at, transcript, summary, generated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now')) ON CONFLICT(repo, pr_number) DO UPDATE SET reviewed_sha = excluded.reviewed_sha, terminal_state = excluded.terminal_state, closed_at = excluded.closed_at, transcript = excluded.transcript, summary = excluded.summary, generated_at = datetime('now')",
+                params![repo, pr_number, reviewed_sha, terminal_state, closed_at, transcript, summary],
             )?;
             Ok(())
         })
@@ -958,6 +1078,120 @@ mod tests {
         assert!(daemon_columns.contains(&"started_at".to_string()));
         assert!(daemon_columns.contains(&"rate_limit_total".to_string()));
         assert!(daemon_columns.contains(&"rate_reset_epoch".to_string()));
+    }
+
+    #[tokio::test]
+    async fn migrate_creates_review_archive_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+        let conn = open_conn(db.path()).expect("open migrated db");
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(review_archive)")
+            .expect("prepare archive pragma");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("query archive table_info");
+        let columns: Vec<String> = rows.map(|r| r.expect("col")).collect();
+
+        assert!(columns.contains(&"reviewed_sha".to_string()));
+        assert!(columns.contains(&"terminal_state".to_string()));
+        assert!(columns.contains(&"transcript".to_string()));
+        assert!(columns.contains(&"summary".to_string()));
+    }
+
+    #[tokio::test]
+    async fn pending_finalization_clears_once_review_archive_is_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        db.upsert_pr_state("o/r", 7, Some("sha-1"), None)
+            .await
+            .expect("upsert pr state");
+
+        let pending = db
+            .list_prs_pending_finalization("o/r")
+            .await
+            .expect("pending before archive");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].pr_number, 7);
+        assert_eq!(pending[0].last_reviewed_sha, "sha-1");
+
+        db.upsert_review_archive(
+            "o/r",
+            7,
+            "sha-1",
+            "merged",
+            Some("2026-04-01T12:00:00Z"),
+            "transcript",
+            "summary",
+        )
+        .await
+        .expect("save archive");
+
+        let pending = db
+            .list_prs_pending_finalization("o/r")
+            .await
+            .expect("pending after archive");
+        assert!(pending.is_empty());
+
+        db.upsert_pr_state("o/r", 7, Some("sha-2"), None)
+            .await
+            .expect("advance reviewed sha");
+        let pending = db
+            .list_prs_pending_finalization("o/r")
+            .await
+            .expect("pending after new sha");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].last_reviewed_sha, "sha-2");
+    }
+
+    #[tokio::test]
+    async fn list_pr_review_attempts_returns_attempts_in_created_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let first = ReviewClaim {
+            dedupe_key: "attempt-1".to_string(),
+            repo: "o/r".to_string(),
+            pr_number: 9,
+            sha: "sha-1".to_string(),
+            harness: "codex".to_string(),
+            model: Some("model-a".to_string()),
+        };
+        let second = ReviewClaim {
+            dedupe_key: "attempt-2".to_string(),
+            repo: "o/r".to_string(),
+            pr_number: 9,
+            sha: "sha-2".to_string(),
+            harness: "claude-code".to_string(),
+            model: Some("model-b".to_string()),
+        };
+
+        assert!(db.claim_review(first).await.expect("claim first"));
+        db.complete_review("attempt-1", 1, Some("COMMENT"), 1.5, 1, 10, None, None, None)
+            .await
+            .expect("complete first");
+        assert!(db.claim_review(second).await.expect("claim second"));
+        db.fail_review("attempt-2", "timeout", 2.0)
+            .await
+            .expect("fail second");
+
+        let attempts = db
+            .list_pr_review_attempts("o/r", 9)
+            .await
+            .expect("list attempts");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].sha, "sha-1");
+        assert_eq!(attempts[0].status, "completed");
+        assert_eq!(attempts[1].sha, "sha-2");
+        assert_eq!(attempts[1].status, "failed");
+        assert_eq!(attempts[1].error_message.as_deref(), Some("timeout"));
     }
 
     #[tokio::test]
