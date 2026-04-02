@@ -1055,7 +1055,13 @@ impl ReviewEngine {
                 format!("failed fetching PR {}#{pr_number} for final archive", repo_cfg.full_name())
             })?;
 
-        if pr_data.state.eq_ignore_ascii_case("open") {
+        // A PR is terminal when state != "open" OR merged_at is set.  The
+        // `state` field defaults to "open" when absent from the payload (see
+        // #[serde(default = "default_pr_state")]).  Checking merged_at as a
+        // secondary signal ensures that a PR with a missing state field but a
+        // populated merged_at (e.g. a partial payload) is still finalized rather
+        // than silently skipped.
+        if pr_data.state.eq_ignore_ascii_case("open") && pr_data.merged_at.is_none() {
             return Ok(false);
         }
 
@@ -2162,7 +2168,11 @@ struct ReviewTranscriptEvent {
 }
 
 fn terminal_pr_state(pr_data: &PullRequest) -> &'static str {
-    if pr_data.merged_at.is_some() {
+    // GitHub represents a merged PR as state="closed" + merged_at.is_some().
+    // Check both fields so a missing/defaulted state field doesn't mislabel
+    // the terminal state, and so merged_at alone (e.g. an edge-case payload)
+    // doesn't report "merged" for a PR whose state is still "open".
+    if pr_data.state.eq_ignore_ascii_case("closed") && pr_data.merged_at.is_some() {
         "merged"
     } else {
         "closed"
