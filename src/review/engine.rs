@@ -2168,11 +2168,16 @@ struct ReviewTranscriptEvent {
 }
 
 fn terminal_pr_state(pr_data: &PullRequest) -> &'static str {
-    // GitHub represents a merged PR as state="closed" + merged_at.is_some().
-    // Check both fields so a missing/defaulted state field doesn't mislabel
-    // the terminal state, and so merged_at alone (e.g. an edge-case payload)
-    // doesn't report "merged" for a PR whose state is still "open".
-    if pr_data.state.eq_ignore_ascii_case("closed") && pr_data.merged_at.is_some() {
+    // merged_at being set is the authoritative signal that a PR was merged.
+    // We intentionally do not also require state=="closed" here, because
+    // finalize_closed_pr_review proceeds whenever merged_at.is_some()
+    // (regardless of the state field).  Requiring state=="closed" in the
+    // labeler would cause a partial payload (merged_at set, state absent /
+    // defaulting to "open") to be archived by the gate but labeled "closed"
+    // — a contradiction.  Using merged_at alone keeps both functions
+    // consistent: if the gate treats merged_at as sufficient evidence of a
+    // merge, so does the labeler.
+    if pr_data.merged_at.is_some() {
         "merged"
     } else {
         "closed"

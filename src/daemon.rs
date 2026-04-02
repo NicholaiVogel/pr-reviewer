@@ -73,7 +73,7 @@ pub async fn start(
 
         // Seed changes_detected from confirmed finalizations that workers
         // completed since the last time we evaluated backoff.
-        let mut changes_detected = finalization_detected.swap(false, Ordering::Relaxed);
+        let mut changes_detected = finalization_detected.swap(false, Ordering::Acquire);
         let rate_state = github.rate_state();
         let rate_limit_budget = rate_state.limit.unwrap_or(RATE_LIMIT_TOTAL);
         let remaining = rate_state.remaining;
@@ -285,7 +285,7 @@ pub async fn start(
                                 Ok(true) => {
                                     // PR was confirmed closed/merged and archive was written.
                                     // Signal the main loop so adaptive backoff resets.
-                                    finalization_flag.store(true, Ordering::Relaxed);
+                                    finalization_flag.store(true, Ordering::Release);
                                     tracing::info!(
                                         repo = %repo_name,
                                         pr = pending.pr_number,
