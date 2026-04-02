@@ -1097,14 +1097,53 @@ impl ReviewEngine {
             ),
         );
 
+        // Log warnings for API failures so the transcript honestly reflects
+        // missing data instead of silently treating errors as "no content".
+        let existing_reviews = match existing_reviews {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    repo = %repo_name,
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to fetch reviews for final archive; transcript will be incomplete"
+                );
+                vec![]
+            }
+        };
+        let review_comments = match review_comments {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    repo = %repo_name,
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to fetch review comments for final archive; transcript will be incomplete"
+                );
+                vec![]
+            }
+        };
+        let issue_comments = match issue_comments {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    repo = %repo_name,
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to fetch issue comments for final archive; transcript will be incomplete"
+                );
+                vec![]
+            }
+        };
+
         let transcript = build_final_review_transcript(
             &repo_name,
             pr_data,
             terminal_state,
             &review_attempts,
-            &existing_reviews.unwrap_or_default(),
-            &review_comments.unwrap_or_default(),
-            &issue_comments.unwrap_or_default(),
+            &existing_reviews,
+            &review_comments,
+            &issue_comments,
         );
 
         let summary = match self
@@ -2345,12 +2384,33 @@ fn normalize_summary_output(stdout: &str, stderr: &str) -> Option<String> {
     } else {
         return None;
     };
-    let normalized = combined.trim().trim_matches('`').trim();
+    let normalized = strip_fenced_code_block(combined.trim());
     if normalized.is_empty() {
         None
     } else {
-        Some(normalized.to_string())
+        Some(normalized)
     }
+}
+
+/// Strip an optional fenced code block wrapper (``` or ```lang) that some
+/// harnesses add around their output.  Falls back to plain backtick trimming
+/// for outputs that are just backtick-quoted without a newline.
+fn strip_fenced_code_block(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() >= 2 {
+        let first = lines[0].trim();
+        let last = lines[lines.len() - 1].trim();
+        if first.starts_with("```") && last == "```" {
+            // Strip the opening fence (with optional language tag) and closing fence
+            let inner = &lines[1..lines.len() - 1];
+            let joined = inner.join("\n").trim().to_string();
+            if !joined.is_empty() {
+                return joined;
+            }
+        }
+    }
+    // Fallback: strip loose backticks from edges (bare ` wrapping)
+    text.trim_matches('`').trim().to_string()
 }
 
 fn quote_markdown_block(text: &str) -> String {

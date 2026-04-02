@@ -44,6 +44,7 @@ pub struct PullRequest {
     pub body: Option<String>,
     #[serde(default)]
     pub draft: bool,
+    #[serde(default = "default_pr_state")]
     pub state: String,
     pub user: User,
     pub head: PullRequestHead,
@@ -124,4 +125,11 @@ pub struct PrFile {
     pub changes: u32,
     pub patch: Option<String>,
     pub previous_filename: Option<String>,
+}
+
+/// Fallback state when `state` is absent from the API response.
+/// Treating unknown state as "open" is the safest default — finalization
+/// logic will simply skip the PR (no-op) rather than incorrectly archiving it.
+fn default_pr_state() -> String {
+    "open".to_string()
 }

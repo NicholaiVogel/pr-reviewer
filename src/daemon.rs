@@ -104,6 +104,11 @@ pub async fn start(
                 ListPullsResult::Updated { prs, etag } => {
                     db.set_repo_etag(&repo_name, etag.as_deref()).await?;
                     let open_pr_numbers: HashSet<u64> = prs.iter().map(|pr| pr.number).collect();
+                    // list_open_prs fetches all pages (up to 10 × 100 = 1000).
+                    // When the total is small we can trust the set is complete and
+                    // skip finalization API calls for PRs still in it.  The
+                    // threshold is intentionally conservative — above the default
+                    // GitHub page size (30) but well below the pagination cap.
                     let can_trust_open_set = prs.len() < 50;
                     for pr in prs {
                         let state = db.get_pr_state(&repo_name, pr.number as i64).await?;
@@ -254,14 +259,24 @@ pub async fn start(
                         let engine = engine.clone();
                         let repo_cfg = repo_cfg.clone();
                         let repo_name = repo_name.clone();
-                        changes_detected = true;
+                        // NOTE: do NOT set changes_detected here — we don't
+                        // know whether the PR is actually closed until the
+                        // worker calls GitHub.  Setting it speculatively would
+                        // defeat adaptive backoff for repos with many
+                        // pending-finalization entries whose PRs are still open.
                         workers.spawn(async move {
                             let _permit = permit;
                             match engine
                                 .finalize_closed_pr_review(&repo_cfg, pending.pr_number as u64)
                                 .await
                             {
-                                Ok(true) => {}
+                                Ok(true) => {
+                                    tracing::info!(
+                                        repo = %repo_name,
+                                        pr = pending.pr_number,
+                                        "archived final review transcript and summary"
+                                    );
+                                }
                                 Ok(false) => {
                                     tracing::debug!(
                                         repo = %repo_name,
