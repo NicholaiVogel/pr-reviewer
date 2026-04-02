@@ -24,7 +24,7 @@ use crate::review::parser::{
 };
 use crate::review::prompt::build_review_prompt;
 use crate::safety::{evaluate_fork_policy, ForkDecision};
-use crate::store::db::{dedupe_key, Database, ReviewClaim};
+use crate::store::db::{Database, ReviewAttemptRecord, ReviewClaim, dedupe_key};
 
 const IN_PROGRESS_COMMENT_TIMEOUT_SECS: u64 = 4;
 const IN_PROGRESS_COMMENT_MAX_CHARS: usize = 220;
@@ -1044,6 +1044,152 @@ impl ReviewEngine {
         })
     }
 
+    pub async fn finalize_closed_pr_review(
+        &self,
+        repo_cfg: &RepoConfig,
+        pr_number: u64,
+    ) -> Result<bool> {
+        let pr_data = pr::get_pull_request(&self.github, &repo_cfg.owner, &repo_cfg.name, pr_number)
+            .await
+            .with_context(|| {
+                format!("failed fetching PR {}#{pr_number} for final archive", repo_cfg.full_name())
+            })?;
+
+        if pr_data.state.eq_ignore_ascii_case("open") {
+            return Ok(false);
+        }
+
+        self.archive_closed_pr_review(repo_cfg, &pr_data).await?;
+        Ok(true)
+    }
+
+    async fn archive_closed_pr_review(
+        &self,
+        repo_cfg: &RepoConfig,
+        pr_data: &PullRequest,
+    ) -> Result<()> {
+        let repo_name = repo_cfg.full_name();
+        let terminal_state = terminal_pr_state(pr_data);
+        let review_attempts = self
+            .db
+            .list_pr_review_attempts(&repo_name, pr_data.number as i64)
+            .await?;
+
+        let (existing_reviews, review_comments, issue_comments) = tokio::join!(
+            comments::get_existing_reviews(
+                &self.github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                pr_data.number,
+            ),
+            comments::get_review_comments(
+                &self.github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                pr_data.number,
+                None,
+            ),
+            comments::get_issue_comments(
+                &self.github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                pr_data.number,
+            ),
+        );
+
+        let transcript = build_final_review_transcript(
+            &repo_name,
+            pr_data,
+            terminal_state,
+            &review_attempts,
+            &existing_reviews.unwrap_or_default(),
+            &review_comments.unwrap_or_default(),
+            &issue_comments.unwrap_or_default(),
+        );
+
+        let summary = match self
+            .compose_final_review_summary(repo_cfg, pr_data, terminal_state, &transcript)
+            .await
+        {
+            Ok(summary) => summary,
+            Err(err) => {
+                tracing::warn!(
+                    repo = %repo_name,
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to generate final review summary; using fallback"
+                );
+                build_final_review_summary_fallback(pr_data, terminal_state, &review_attempts)
+            }
+        };
+
+        self.db
+            .upsert_review_archive(
+                &repo_name,
+                pr_data.number as i64,
+                &pr_data.head.sha,
+                terminal_state,
+                pr_data.closed_at.as_deref().or(pr_data.merged_at.as_deref()),
+                &transcript,
+                &summary,
+            )
+            .await?;
+
+        tracing::info!(
+            repo = %repo_name,
+            pr = pr_data.number,
+            terminal_state,
+            "saved final review transcript and summary"
+        );
+        Ok(())
+    }
+
+    async fn compose_final_review_summary(
+        &self,
+        repo_cfg: &RepoConfig,
+        pr_data: &PullRequest,
+        terminal_state: &str,
+        transcript: &str,
+    ) -> Result<String> {
+        let harness_kind = repo_cfg.resolved_harness(&self.config);
+        let model = repo_cfg.resolved_model(&self.config).to_string();
+        let reasoning_effort = repo_cfg.resolved_reasoning_effort(&self.config);
+        let mut prompt = build_final_review_summary_prompt(
+            &repo_cfg.full_name(),
+            pr_data,
+            terminal_state,
+            transcript,
+        );
+        let max_bytes = self.config.defaults.max_prompt_bytes;
+        let note = "\n\n[review transcript truncated before final-summary generation due size budget]\n";
+        if prompt.len() > max_bytes {
+            if max_bytes > note.len() {
+                truncate_utf8_to_max_bytes(&mut prompt, max_bytes - note.len());
+                prompt.push_str(note);
+            } else {
+                truncate_utf8_to_max_bytes(&mut prompt, max_bytes);
+            }
+        }
+
+        let temp = tempdir().context("failed to create temp dir for final review summary")?;
+        let harness_impl = harness::for_kind(harness_kind);
+        let output = run_harness(
+            harness_impl.as_ref(),
+            HarnessRunRequest {
+                prompt,
+                model,
+                reasoning_effort,
+                working_dir: temp.path().to_path_buf(),
+                timeout_secs: self.config.harness.timeout_secs,
+            },
+        )
+        .await?;
+
+        let summary = normalize_summary_output(&output.stdout, &output.stderr)
+            .ok_or_else(|| anyhow!("final review summary harness returned empty output"))?;
+        Ok(summary)
+    }
+
     pub async fn reply_to_comment(
         &self,
         repo_cfg: &RepoConfig,
@@ -1968,6 +2114,271 @@ fn extract_file_snippet(content: &str, line: usize, radius: usize) -> String {
     out
 }
 
+#[derive(Debug)]
+struct ReviewTranscriptEvent {
+    sort_key: String,
+    ordinal: usize,
+    heading: String,
+    body: String,
+}
+
+fn terminal_pr_state(pr_data: &PullRequest) -> &'static str {
+    if pr_data.merged_at.is_some() {
+        "merged"
+    } else {
+        "closed"
+    }
+}
+
+fn build_final_review_transcript(
+    repo_name: &str,
+    pr_data: &PullRequest,
+    terminal_state: &str,
+    review_attempts: &[ReviewAttemptRecord],
+    existing_reviews: &[PullRequestReview],
+    review_comments: &[ReviewComment],
+    issue_comments: &[IssueComment],
+) -> String {
+    let mut transcript = String::new();
+    transcript.push_str("# PR Review Transcript\n\n");
+    transcript.push_str(&format!("- Repo: {repo_name}\n"));
+    transcript.push_str(&format!("- PR: #{} - {}\n", pr_data.number, pr_data.title));
+    transcript.push_str(&format!("- Author: @{}\n", pr_data.user.login));
+    transcript.push_str(&format!("- Terminal state: {terminal_state}\n"));
+    transcript.push_str(&format!("- Head SHA at archive time: {}\n", pr_data.head.sha));
+    if let Some(url) = pr_data.html_url.as_deref() {
+        transcript.push_str(&format!("- URL: {url}\n"));
+    }
+    if let Some(closed_at) = pr_data.closed_at.as_deref().or(pr_data.merged_at.as_deref()) {
+        transcript.push_str(&format!("- Closed at: {closed_at}\n"));
+    }
+    transcript.push('\n');
+
+    let mut events = Vec::new();
+    let mut ordinal = 0usize;
+
+    for attempt in review_attempts {
+        ordinal += 1;
+        let mut body = String::new();
+        body.push_str(&format!("- sha: {}\n", attempt.sha));
+        body.push_str(&format!("- harness: {}\n", attempt.harness));
+        if let Some(model) = attempt.model.as_deref() {
+            body.push_str(&format!("- model: {model}\n"));
+        }
+        body.push_str(&format!("- status: {}\n", attempt.status));
+        if let Some(verdict) = attempt.verdict.as_deref() {
+            body.push_str(&format!("- verdict: {verdict}\n"));
+        }
+        if let Some(comments_posted) = attempt.comments_posted {
+            body.push_str(&format!("- comments_posted: {comments_posted}\n"));
+        }
+        if let Some(duration_secs) = attempt.duration_secs {
+            body.push_str(&format!("- duration_secs: {:.1}\n", duration_secs));
+        }
+        if let Some(completed_at) = attempt.completed_at.as_deref() {
+            body.push_str(&format!("- completed_at: {completed_at}\n"));
+        }
+        if let Some(error) = attempt.error_message.as_deref() {
+            body.push_str("- error:\n");
+            body.push_str(&quote_markdown_block(error));
+        }
+
+        events.push(ReviewTranscriptEvent {
+            sort_key: timestamp_sort_key(&attempt.created_at),
+            ordinal,
+            heading: format!("Local review attempt {}", attempt.created_at),
+            body,
+        });
+    }
+
+    for review in existing_reviews {
+        ordinal += 1;
+        let submitted_at = review.submitted_at.as_deref().unwrap_or("unknown");
+        let mut body = String::new();
+        if let Some(state) = review.state.as_deref() {
+            body.push_str(&format!("- state: {state}\n"));
+        }
+        if let Some(commit_id) = review.commit_id.as_deref() {
+            body.push_str(&format!("- commit: {commit_id}\n"));
+        }
+        body.push_str("- body:\n");
+        body.push_str(&quote_markdown_block(
+            review.body.as_deref().unwrap_or("(empty review body)"),
+        ));
+
+        events.push(ReviewTranscriptEvent {
+            sort_key: timestamp_sort_key(submitted_at),
+            ordinal,
+            heading: format!("GitHub review by @{} ({submitted_at})", review.user.login),
+            body,
+        });
+    }
+
+    for comment in review_comments {
+        ordinal += 1;
+        let location = comment
+            .line
+            .map(|line| format!("{}:{}", comment.path, line))
+            .unwrap_or_else(|| comment.path.clone());
+        let mut body = String::new();
+        if let Some(parent_id) = comment.in_reply_to_id {
+            body.push_str(&format!("- in_reply_to_id: {parent_id}\n"));
+        }
+        body.push_str("- body:\n");
+        body.push_str(&quote_markdown_block(&comment.body));
+
+        events.push(ReviewTranscriptEvent {
+            sort_key: timestamp_sort_key(&comment.created_at),
+            ordinal,
+            heading: format!(
+                "Review thread comment by @{} on {} ({})",
+                comment.user.login, location, comment.created_at
+            ),
+            body,
+        });
+    }
+
+    for comment in issue_comments {
+        ordinal += 1;
+        let mut body = String::new();
+        body.push_str("- body:\n");
+        body.push_str(&quote_markdown_block(&comment.body));
+
+        events.push(ReviewTranscriptEvent {
+            sort_key: timestamp_sort_key(&comment.created_at),
+            ordinal,
+            heading: format!("Issue comment by @{} ({})", comment.user.login, comment.created_at),
+            body,
+        });
+    }
+
+    events.sort_by(|left, right| {
+        left.sort_key
+            .cmp(&right.sort_key)
+            .then(left.ordinal.cmp(&right.ordinal))
+    });
+
+    if events.is_empty() {
+        transcript.push_str("No persisted review attempts or GitHub conversation were available.\n");
+        return transcript;
+    }
+
+    transcript.push_str("## Timeline\n\n");
+    for event in events {
+        transcript.push_str("### ");
+        transcript.push_str(&event.heading);
+        transcript.push('\n');
+        transcript.push_str(&event.body);
+        if !event.body.ends_with('\n') {
+            transcript.push('\n');
+        }
+        transcript.push('\n');
+    }
+
+    transcript
+}
+
+fn build_final_review_summary_prompt(
+    repo_name: &str,
+    pr_data: &PullRequest,
+    terminal_state: &str,
+    transcript: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Write a concise retrospective summary of this completed PR review.\n");
+    prompt.push_str("The PR is already closed or merged, so describe what the review covered and how it concluded.\n");
+    prompt.push_str("Focus on the important review themes, notable issues raised, whether follow-up discussion resolved them, and the final outcome.\n");
+    prompt.push_str("If details are sparse, say that plainly instead of inventing specifics.\n");
+    prompt.push_str("Output plain markdown only. No code fences. Keep it under 250 words.\n\n");
+    prompt.push_str(&format!("Repo: {repo_name}\n"));
+    prompt.push_str(&format!("PR: #{}\n", pr_data.number));
+    prompt.push_str(&format!("Title: {}\n", pr_data.title));
+    prompt.push_str(&format!("Author: @{}\n", pr_data.user.login));
+    prompt.push_str(&format!("Terminal state: {terminal_state}\n"));
+    prompt.push_str(&format!("Head SHA at archive time: {}\n\n", pr_data.head.sha));
+    prompt.push_str("Transcript:\n\n");
+    prompt.push_str(transcript);
+    prompt
+}
+
+fn build_final_review_summary_fallback(
+    pr_data: &PullRequest,
+    terminal_state: &str,
+    review_attempts: &[ReviewAttemptRecord],
+) -> String {
+    let completed = review_attempts
+        .iter()
+        .filter(|attempt| attempt.status == "completed")
+        .count();
+    let failed = review_attempts
+        .iter()
+        .filter(|attempt| attempt.status == "failed")
+        .count();
+    let last_verdict = review_attempts
+        .iter()
+        .rev()
+        .find_map(|attempt| attempt.verdict.as_deref());
+
+    let mut summary = format!(
+        "PR #{} ended as {} after {} recorded review attempt(s).",
+        pr_data.number,
+        terminal_state,
+        review_attempts.len()
+    );
+    if completed > 0 || failed > 0 {
+        summary.push_str(&format!(" {} completed, {} failed.", completed, failed));
+    }
+    if let Some(verdict) = last_verdict {
+        summary.push_str(&format!(" Final recorded verdict: {verdict}."));
+    }
+    summary.push_str(" Full transcript archived in the database.");
+    summary
+}
+
+fn normalize_summary_output(stdout: &str, stderr: &str) -> Option<String> {
+    let out = stdout.trim();
+    let err = stderr.trim();
+    let combined = if !out.is_empty() {
+        out
+    } else if !err.is_empty() {
+        err
+    } else {
+        return None;
+    };
+    let normalized = combined.trim().trim_matches('`').trim();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_string())
+    }
+}
+
+fn quote_markdown_block(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "> (empty)\n".to_string();
+    }
+
+    let mut out = String::new();
+    for line in trimmed.lines() {
+        out.push_str("> ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn timestamp_sort_key(timestamp: &str) -> String {
+    let trimmed = timestamp.trim();
+    if trimmed.is_empty() {
+        return "9999-12-31T23:59:59Z".to_string();
+    }
+    if trimmed.contains('T') {
+        return trimmed.to_string();
+    }
+    format!("{}Z", trimmed.replace(' ', "T"))
+}
+
 fn short_sha(sha: &str) -> &str {
     if sha.len() <= 8 {
         sha
@@ -2549,9 +2960,8 @@ mod tests {
         infer_pr_focus, line_is_authored_by_bot, login_matches_bot,
         looks_like_harness_error_output, looks_like_harness_transport_output,
         looks_like_reintroduction, normalize_in_progress_comment, pr_reviewer_project_url,
-        resolve_project_url, should_suppress_finding, status_precedence,
-        truncate_github_comment_body, FindingStatus, ReviewMemory, GITHUB_COMMENT_MAX_CHARS,
-        GITHUB_COMMENT_TRUNCATION_NOTE,
+        resolve_project_url, should_suppress_finding, truncate_github_comment_body,
+        FindingStatus, ReviewMemory, GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
     };
 
     fn test_user(login: &str) -> User {

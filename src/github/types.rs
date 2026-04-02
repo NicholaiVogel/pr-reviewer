@@ -44,11 +44,14 @@ pub struct PullRequest {
     pub body: Option<String>,
     #[serde(default)]
     pub draft: bool,
+    pub state: String,
     pub user: User,
     pub head: PullRequestHead,
     pub base: PullRequestBase,
     pub html_url: Option<String>,
     pub updated_at: Option<String>,
+    pub closed_at: Option<String>,
+    pub merged_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

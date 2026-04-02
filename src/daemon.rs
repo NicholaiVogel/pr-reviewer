@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -102,6 +103,8 @@ pub async fn start(
                 }
                 ListPullsResult::Updated { prs, etag } => {
                     db.set_repo_etag(&repo_name, etag.as_deref()).await?;
+                    let open_pr_numbers: HashSet<u64> = prs.iter().map(|pr| pr.number).collect();
+                    let can_trust_open_set = prs.len() < 50;
                     for pr in prs {
                         let state = db.get_pr_state(&repo_name, pr.number as i64).await?;
                         let already = state.as_ref().and_then(|s| s.last_reviewed_sha.clone());
@@ -239,6 +242,43 @@ pub async fn start(
                             &chrono::Utc::now().to_rfc3339(),
                         )
                         .await?;
+                    }
+
+                    let pending_finalizations = db.list_prs_pending_finalization(&repo_name).await?;
+                    for pending in pending_finalizations {
+                        if can_trust_open_set && open_pr_numbers.contains(&(pending.pr_number as u64)) {
+                            continue;
+                        }
+
+                        let permit = semaphore.clone().acquire_owned().await?;
+                        let engine = engine.clone();
+                        let repo_cfg = repo_cfg.clone();
+                        let repo_name = repo_name.clone();
+                        changes_detected = true;
+                        workers.spawn(async move {
+                            let _permit = permit;
+                            match engine
+                                .finalize_closed_pr_review(&repo_cfg, pending.pr_number as u64)
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    tracing::debug!(
+                                        repo = %repo_name,
+                                        pr = pending.pr_number,
+                                        "skipping final archive because PR is still open"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        repo = %repo_name,
+                                        pr = pending.pr_number,
+                                        error = %err,
+                                        "final review archive failed"
+                                    );
+                                }
+                            }
+                        });
                     }
                 }
             }
