@@ -2401,12 +2401,12 @@ fn strip_fenced_code_block(text: &str) -> String {
         let first = lines[0].trim();
         let last = lines[lines.len() - 1].trim();
         if first.starts_with("```") && last == "```" {
-            // Strip the opening fence (with optional language tag) and closing fence
+            // Strip the opening fence (with optional language tag) and closing fence.
+            // Return the inner content — even if empty — rather than falling through
+            // to the backtick-trimming path, which would leave the language tag (e.g.
+            // "markdown") as if it were real content when the inner body is blank.
             let inner = &lines[1..lines.len() - 1];
-            let joined = inner.join("\n").trim().to_string();
-            if !joined.is_empty() {
-                return joined;
-            }
+            return inner.join("\n").trim().to_string();
         }
     }
     // Fallback: strip loose backticks from edges (bare ` wrapping)
