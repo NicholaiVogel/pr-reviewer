@@ -111,15 +111,18 @@ pub async fn start(
                 ListPullsResult::NotModified { etag } => {
                     db.set_repo_etag(&repo_name, etag.as_deref()).await?;
                 }
-                ListPullsResult::Updated { prs, etag } => {
+                ListPullsResult::Updated {
+                    prs,
+                    etag,
+                    complete,
+                } => {
                     db.set_repo_etag(&repo_name, etag.as_deref()).await?;
                     let open_pr_numbers: HashSet<u64> = prs.iter().map(|pr| pr.number).collect();
-                    // list_open_prs fetches all pages (up to 10 × 100 = 1000).
-                    // When the total is small we can trust the set is complete and
-                    // skip finalization API calls for PRs still in it.  The
-                    // threshold is intentionally conservative — above the default
-                    // GitHub page size (30) but well below the pagination cap.
-                    let can_trust_open_set = prs.len() < 50;
+                    // Only skip per-PR finalization probes when list_open_prs
+                    // confirmed it walked the complete open-PR set. If pagination
+                    // hit the safety cap, stay conservative and ask GitHub for the
+                    // current state before archiving anything missing from the set.
+                    let can_trust_open_set = complete;
                     for pr in prs {
                         let state = db.get_pr_state(&repo_name, pr.number as i64).await?;
                         let already = state.as_ref().and_then(|s| s.last_reviewed_sha.clone());
@@ -165,9 +168,10 @@ pub async fn start(
                                 {
                                     continue;
                                 }
-                                if engine.authenticated_user().is_some_and(|u| {
-                                    comment.user.login.eq_ignore_ascii_case(u)
-                                }) {
+                                if engine
+                                    .authenticated_user()
+                                    .is_some_and(|u| comment.user.login.eq_ignore_ascii_case(u))
+                                {
                                     continue;
                                 }
                                 // Skip comments from any GitHub Bot account (other
@@ -213,11 +217,7 @@ pub async fn start(
 
                                 // Deduplication: skip if we already replied to this comment
                                 let claimed = db
-                                    .claim_reply(
-                                        &repo_name,
-                                        pr.number as i64,
-                                        comment.id as i64,
-                                    )
+                                    .claim_reply(&repo_name, pr.number as i64, comment.id as i64)
                                     .await?;
                                 if !claimed {
                                     tracing::debug!(
@@ -259,9 +259,12 @@ pub async fn start(
                         .await?;
                     }
 
-                    let pending_finalizations = db.list_prs_pending_finalization(&repo_name).await?;
+                    let pending_finalizations =
+                        db.list_prs_pending_finalization(&repo_name).await?;
                     for pending in pending_finalizations {
-                        if can_trust_open_set && open_pr_numbers.contains(&(pending.pr_number as u64)) {
+                        if can_trust_open_set
+                            && open_pr_numbers.contains(&(pending.pr_number as u64))
+                        {
                             continue;
                         }
 

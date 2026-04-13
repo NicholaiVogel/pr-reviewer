@@ -24,7 +24,7 @@ use crate::review::parser::{
 };
 use crate::review::prompt::build_review_prompt;
 use crate::safety::{evaluate_fork_policy, ForkDecision};
-use crate::store::db::{Database, ReviewAttemptRecord, ReviewClaim, dedupe_key};
+use crate::store::db::{dedupe_key, Database, ReviewAttemptRecord, ReviewClaim};
 
 const IN_PROGRESS_COMMENT_TIMEOUT_SECS: u64 = 4;
 const IN_PROGRESS_COMMENT_MAX_CHARS: usize = 220;
@@ -1059,11 +1059,15 @@ impl ReviewEngine {
         repo_cfg: &RepoConfig,
         pr_number: u64,
     ) -> Result<bool> {
-        let pr_data = pr::get_pull_request(&self.github, &repo_cfg.owner, &repo_cfg.name, pr_number)
-            .await
-            .with_context(|| {
-                format!("failed fetching PR {}#{pr_number} for final archive", repo_cfg.full_name())
-            })?;
+        let pr_data =
+            pr::get_pull_request(&self.github, &repo_cfg.owner, &repo_cfg.name, pr_number)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed fetching PR {}#{pr_number} for final archive",
+                        repo_cfg.full_name()
+                    )
+                })?;
 
         // A PR is terminal when state != "open" OR merged_at is set.  The
         // `state` field defaults to "open" when absent from the payload (see
@@ -1184,7 +1188,10 @@ impl ReviewEngine {
                 pr_data.number as i64,
                 &pr_data.head.sha,
                 terminal_state,
-                pr_data.closed_at.as_deref().or(pr_data.merged_at.as_deref()),
+                pr_data
+                    .closed_at
+                    .as_deref()
+                    .or(pr_data.merged_at.as_deref()),
                 &transcript,
                 &summary,
             )
@@ -1216,7 +1223,8 @@ impl ReviewEngine {
             transcript,
         );
         let max_bytes = self.config.defaults.max_prompt_bytes;
-        let note = "\n\n[review transcript truncated before final-summary generation due size budget]\n";
+        let note =
+            "\n\n[review transcript truncated before final-summary generation due size budget]\n";
         if prompt.len() > max_bytes {
             if max_bytes > note.len() {
                 truncate_utf8_to_max_bytes(&mut prompt, max_bytes - note.len());
@@ -2131,9 +2139,7 @@ fn line_is_authored_by_bot(lower_line: &str, bot_lower: &str, alias_lower: Optio
         None => return false,
     };
     // Strip " (bot)" suffix if present
-    let login = raw_login
-        .strip_suffix(" (bot)")
-        .unwrap_or(raw_login);
+    let login = raw_login.strip_suffix(" (bot)").unwrap_or(raw_login);
     login == bot_lower || alias_lower.is_some_and(|a| login == a)
 }
 
@@ -2209,12 +2215,29 @@ fn build_final_review_transcript(
     transcript.push_str(&format!("- PR: #{} - {}\n", pr_data.number, pr_data.title));
     transcript.push_str(&format!("- Author: @{}\n", pr_data.user.login));
     transcript.push_str(&format!("- Terminal state: {terminal_state}\n"));
-    transcript.push_str(&format!("- Head SHA at archive time: {}\n", pr_data.head.sha));
+    transcript.push_str(&format!(
+        "- Head SHA at archive time: {}\n",
+        pr_data.head.sha
+    ));
     if let Some(url) = pr_data.html_url.as_deref() {
         transcript.push_str(&format!("- URL: {url}\n"));
     }
-    if let Some(closed_at) = pr_data.closed_at.as_deref().or(pr_data.merged_at.as_deref()) {
+    if let Some(closed_at) = pr_data
+        .closed_at
+        .as_deref()
+        .or(pr_data.merged_at.as_deref())
+    {
         transcript.push_str(&format!("- Closed at: {closed_at}\n"));
+    }
+    if let Some(body) = pr_data
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+    {
+        transcript.push_str("\n## PR Description\n\n");
+        transcript.push_str(&quote_markdown_block(body));
+        transcript.push('\n');
     }
     transcript.push('\n');
 
@@ -2311,7 +2334,10 @@ fn build_final_review_transcript(
         events.push(ReviewTranscriptEvent {
             sort_key: timestamp_sort_key(&comment.created_at),
             ordinal,
-            heading: format!("Issue comment by @{} ({})", comment.user.login, comment.created_at),
+            heading: format!(
+                "Issue comment by @{} ({})",
+                comment.user.login, comment.created_at
+            ),
             body,
         });
     }
@@ -2323,7 +2349,8 @@ fn build_final_review_transcript(
     });
 
     if events.is_empty() {
-        transcript.push_str("No persisted review attempts or GitHub conversation were available.\n");
+        transcript
+            .push_str("No persisted review attempts or GitHub conversation were available.\n");
         return transcript;
     }
 
@@ -2359,7 +2386,10 @@ fn build_final_review_summary_prompt(
     prompt.push_str(&format!("Title: {}\n", pr_data.title));
     prompt.push_str(&format!("Author: @{}\n", pr_data.user.login));
     prompt.push_str(&format!("Terminal state: {terminal_state}\n"));
-    prompt.push_str(&format!("Head SHA at archive time: {}\n\n", pr_data.head.sha));
+    prompt.push_str(&format!(
+        "Head SHA at archive time: {}\n\n",
+        pr_data.head.sha
+    ));
     prompt.push_str("Transcript:\n\n");
     prompt.push_str(transcript);
     prompt
@@ -2399,17 +2429,13 @@ fn build_final_review_summary_fallback(
     summary
 }
 
-fn normalize_summary_output(stdout: &str, stderr: &str) -> Option<String> {
+fn normalize_summary_output(stdout: &str, _stderr: &str) -> Option<String> {
     let out = stdout.trim();
-    let err = stderr.trim();
-    let combined = if !out.is_empty() {
-        out
-    } else if !err.is_empty() {
-        err
-    } else {
+    if out.is_empty() {
         return None;
-    };
-    let normalized = strip_fenced_code_block(combined.trim());
+    }
+
+    let normalized = strip_fenced_code_block(out);
     if normalized.is_empty() {
         None
     } else {
@@ -3033,20 +3059,25 @@ fn verdict_label(verdict: ReviewVerdict) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::github::types::{CreateReviewComment, PullRequestReview, ReviewComment, User};
+    use crate::github::types::{
+        CreateReviewComment, PullRequest, PullRequestBase, PullRequestHead, PullRequestReview,
+        RepoRef, ReviewComment, User,
+    };
     use crate::review::parser::{
         CommentSeverity, ConfidenceLevel, ReviewComment as ParsedReviewComment,
     };
 
     use super::{
         blocker_has_sufficient_evidence, build_direct_pushback_reply,
+        build_final_review_summary_prompt, build_final_review_transcript,
         build_in_progress_comment_fallback, build_prior_reviews_context, build_retry_review_body,
         build_review_memory, build_thread_history, extract_in_progress_comment, finding_key,
         infer_pr_focus, line_is_authored_by_bot, login_matches_bot,
         looks_like_harness_error_output, looks_like_harness_transport_output,
-        looks_like_reintroduction, normalize_in_progress_comment, pr_reviewer_project_url,
-        resolve_project_url, should_suppress_finding, truncate_github_comment_body,
-        FindingStatus, ReviewMemory, GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
+        looks_like_reintroduction, normalize_in_progress_comment, normalize_summary_output,
+        pr_reviewer_project_url, resolve_project_url, should_suppress_finding,
+        truncate_github_comment_body, FindingStatus, ReviewMemory, GITHUB_COMMENT_MAX_CHARS,
+        GITHUB_COMMENT_TRUNCATION_NOTE,
     };
 
     fn test_user(login: &str) -> User {
@@ -3060,6 +3091,38 @@ mod tests {
         User {
             login: login.to_string(),
             account_type: Some("Bot".to_string()),
+        }
+    }
+
+    fn test_repo_ref(full_name: &str, owner: &str) -> RepoRef {
+        RepoRef {
+            full_name: full_name.to_string(),
+            fork: false,
+            owner: test_user(owner),
+        }
+    }
+
+    fn test_pull_request_with_body(body: Option<&str>) -> PullRequest {
+        PullRequest {
+            number: 15,
+            title: "archive review transcript".to_string(),
+            body: body.map(ToString::to_string),
+            draft: false,
+            state: "closed".to_string(),
+            user: test_user("contributor"),
+            head: PullRequestHead {
+                sha: "abc123".to_string(),
+                ref_name: "feature/archive".to_string(),
+                repo: Some(test_repo_ref("owner/repo", "owner")),
+            },
+            base: PullRequestBase {
+                ref_name: "main".to_string(),
+                repo: test_repo_ref("owner/repo", "owner"),
+            },
+            html_url: Some("https://github.com/owner/repo/pull/15".to_string()),
+            updated_at: Some("2026-04-13T00:00:00Z".to_string()),
+            closed_at: Some("2026-04-13T01:00:00Z".to_string()),
+            merged_at: Some("2026-04-13T01:00:00Z".to_string()),
         }
     }
 
@@ -3080,6 +3143,52 @@ mod tests {
             in_reply_to_id: in_reply_to,
             created_at: format!("2026-03-30T00:{:02}:00Z", id),
         }
+    }
+
+    #[test]
+    fn final_review_transcript_includes_pr_description() {
+        let pr = test_pull_request_with_body(Some(
+            "## Goal
+Ship the archive feature safely.",
+        ));
+        let transcript =
+            build_final_review_transcript("owner/repo", &pr, "merged", &[], &[], &[], &[]);
+
+        assert!(transcript.contains("## PR Description"));
+        assert!(transcript.contains("> ## Goal"));
+        assert!(transcript.contains("> Ship the archive feature safely."));
+    }
+
+    #[test]
+    fn final_review_summary_prompt_carries_pr_description_through_transcript() {
+        let pr = test_pull_request_with_body(Some("Summarize this context too."));
+        let transcript =
+            build_final_review_transcript("owner/repo", &pr, "merged", &[], &[], &[], &[]);
+        let prompt = build_final_review_summary_prompt("owner/repo", &pr, "merged", &transcript);
+
+        assert!(prompt.contains("Transcript:"));
+        assert!(prompt.contains("## PR Description"));
+        assert!(prompt.contains("> Summarize this context too."));
+    }
+
+    #[test]
+    fn summary_output_ignores_stderr_when_stdout_is_empty() {
+        let normalized = normalize_summary_output("", "claude diagnostic: auth warning");
+
+        assert!(normalized.is_none());
+    }
+
+    #[test]
+    fn summary_output_strips_fenced_stdout() {
+        let normalized = normalize_summary_output(
+            "```markdown
+Reviewed the archive flow.
+```",
+            "ignored warning",
+        )
+        .expect("stdout should be normalized");
+
+        assert_eq!(normalized, "Reviewed the archive flow.");
     }
 
     #[test]
@@ -3475,7 +3584,8 @@ mod tests {
         let comment = ParsedReviewComment {
             file: "src/engine.rs".to_string(),
             line: 100,
-            body: "This will panic when the input is empty because unwrap() is called on None".to_string(),
+            body: "This will panic when the input is empty because unwrap() is called on None"
+                .to_string(),
             evidence_note: None,
             severity: CommentSeverity::Blocking,
         };
@@ -3599,7 +3709,10 @@ mod tests {
     fn bot_mention_guard_checks_alias() {
         let history = "- [2026-03-30] NicholaiVogel: @PR-Reviewer-Ant please look again";
         let reply = build_direct_pushback_reply(history, "pr-reviewer", Some("PR-Reviewer-Ant"));
-        assert!(reply.is_none(), "should bail when human mentions the bot alias");
+        assert!(
+            reply.is_none(),
+            "should bail when human mentions the bot alias"
+        );
     }
 
     #[test]
@@ -3607,7 +3720,10 @@ mod tests {
         let history = "- [2026-03-30] PR-Reviewer-Ant: reviewed by @PR-Reviewer-Ant\n\
                         - [2026-03-30] NicholaiVogel: nah, out of scope";
         let reply = build_direct_pushback_reply(history, "pr-reviewer", Some("PR-Reviewer-Ant"));
-        assert!(reply.is_some(), "bot's own alias mention should not trigger the guard");
+        assert!(
+            reply.is_some(),
+            "bot's own alias mention should not trigger the guard"
+        );
     }
 
     // --- Regression tests: status precedence in build_review_memory ---
@@ -3638,9 +3754,30 @@ mod tests {
         // Simulates: reply #1 has rationale rejection, reply #2 is a soft dismissal.
         // Final status must be RejectedWithRationale (stronger), not DismissedByHuman.
         let review_comments = vec![
-            review_comment(1, None, "pr-reviewer", "src/task.rs", Some(10), "Bug: wrong logic here"),
-            review_comment(2, Some(1), "NicholaiVogel", "src/task.rs", Some(10), "this is a false positive, the spec requires this behavior"),
-            review_comment(3, Some(1), "AnotherDev", "src/task.rs", Some(10), "yeah just leave it, it's fine"),
+            review_comment(
+                1,
+                None,
+                "pr-reviewer",
+                "src/task.rs",
+                Some(10),
+                "Bug: wrong logic here",
+            ),
+            review_comment(
+                2,
+                Some(1),
+                "NicholaiVogel",
+                "src/task.rs",
+                Some(10),
+                "this is a false positive, the spec requires this behavior",
+            ),
+            review_comment(
+                3,
+                Some(1),
+                "AnotherDev",
+                "src/task.rs",
+                Some(10),
+                "yeah just leave it, it's fine",
+            ),
         ];
 
         let memory = build_review_memory(
@@ -3665,9 +3802,14 @@ mod tests {
 
     #[test]
     fn finding_on_unchanged_file_is_likely_addressed() {
-        let review_comments = vec![
-            review_comment(1, None, "pr-reviewer", "src/old.rs", Some(10), "Bug found here"),
-        ];
+        let review_comments = vec![review_comment(
+            1,
+            None,
+            "pr-reviewer",
+            "src/old.rs",
+            Some(10),
+            "Bug found here",
+        )];
 
         let memory = build_review_memory(
             &[],
@@ -3758,7 +3900,10 @@ mod tests {
             "pr-reviewer",
             None,
         );
-        assert!(reply.is_none(), "neutral comments should not trigger a canned reply");
+        assert!(
+            reply.is_none(),
+            "neutral comments should not trigger a canned reply"
+        );
     }
 
     // --- Multi-bot safeguard tests ---
@@ -3775,7 +3920,10 @@ mod tests {
             login: "someone".to_string(),
             account_type: None,
         };
-        assert!(!unknown.is_bot(), "None account_type should not be treated as bot");
+        assert!(
+            !unknown.is_bot(),
+            "None account_type should not be treated as bot"
+        );
     }
 
     #[test]
@@ -3835,7 +3983,10 @@ mod tests {
         let history = "- [2026-03-30] pr-reviewer (bot): see @pr-reviewer docs for details\n\
                         - [2026-03-30] NicholaiVogel: this is out of scope for this PR";
         let reply = build_direct_pushback_reply(history, "pr-reviewer", None);
-        assert!(reply.is_some(), "should produce a pushback reply despite bot's own @mention");
+        assert!(
+            reply.is_some(),
+            "should produce a pushback reply despite bot's own @mention"
+        );
     }
 
     #[test]
