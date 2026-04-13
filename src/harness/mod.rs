@@ -12,6 +12,7 @@ pub mod spawn;
 pub trait Harness: Send + Sync {
     fn kind(&self) -> HarnessKind;
     fn name(&self) -> &'static str;
+    fn executable(&self) -> &'static str;
     fn build_command(
         &self,
         prompt: &str,

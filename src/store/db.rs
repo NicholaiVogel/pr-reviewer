@@ -313,12 +313,7 @@ impl Database {
             conn.execute(
                 "INSERT INTO review_log (dedupe_key, repo, pr_number, sha, harness, model, status)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'claimed')
-                 ON CONFLICT(dedupe_key) DO UPDATE SET
-                   status = 'claimed',
-                   error_message = NULL,
-                   completed_at = NULL,
-                   created_at = datetime('now')
-                 WHERE status = 'failed'",
+                 ON CONFLICT(dedupe_key) DO NOTHING",
                 params![
                     claim.dedupe_key,
                     claim.repo,
@@ -1281,7 +1276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_review_reclaims_failed_entry() {
+    async fn claim_review_does_not_reclaim_failed_entry() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::new(dir.path().join("state.db"))
             .await
@@ -1301,11 +1296,16 @@ mod tests {
             .await
             .expect("fail");
 
-        // reclaiming a failed entry should succeed
-        assert!(db.claim_review(claim.clone()).await.expect("reclaim after failure"));
+        // failed entries are terminal for the same PR/SHA/harness unless --force deletes them
+        assert!(!db.claim_review(claim.clone()).await.expect("blocked after failure"));
 
-        // and now it's claimed again, so a third attempt is blocked
-        assert!(!db.claim_review(claim).await.expect("blocked while claimed"));
+        let deleted = db
+            .delete_review_claim("retry-after-fail")
+            .await
+            .expect("delete failed claim");
+        assert_eq!(deleted.as_deref(), Some("failed"));
+
+        assert!(db.claim_review(claim).await.expect("reclaim after force delete"));
     }
 
     #[tokio::test]

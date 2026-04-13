@@ -31,6 +31,10 @@ impl Harness for CodexHarness {
         "codex"
     }
 
+    fn executable(&self) -> &'static str {
+        codex_binary()
+    }
+
     fn build_command(
         &self,
         _prompt: &str,

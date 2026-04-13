@@ -33,6 +33,7 @@ After=network.target
 Type=simple
 User=nicholai
 EnvironmentFile=/etc/pr-reviewer/secrets
+Environment=PATH=/home/nicholai/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
 ExecStart=/usr/local/bin/pr-reviewer start
 Restart=on-failure
 RestartSec=10s
@@ -44,6 +45,9 @@ WantedBy=multi-user.target
 ```
 
 Replace `User=nicholai` with the user that has the pr-reviewer config in `~/.config/pr-reviewer/`.
+Also replace the `/home/nicholai/.local/bin` PATH entry with the directory that contains your
+AI CLI tools (`claude`, `opencode`, or `codex`). systemd does not inherit your interactive shell
+PATH, so a CLI that works in your terminal can still be invisible to the daemon.
 
 ### 2. Create the secrets file
 

@@ -17,7 +17,7 @@ use crate::github::types::{
 };
 use crate::github::{client::GitHubClient, pr};
 use crate::harness;
-use crate::harness::spawn::{run_harness, HarnessRunRequest};
+use crate::harness::spawn::{ensure_harness_available, run_harness, HarnessRunRequest};
 use crate::review::parser::{
     parse_reply_output, parse_review_output, CommentSeverity, ParseOutcome, ReplyParseOutcome,
     ReviewComment as ParsedReviewComment, ReviewVerdict,
@@ -216,6 +216,17 @@ impl ReviewEngine {
             });
         }
 
+        let started = Instant::now();
+        let harness_impl = harness::for_kind(harness_kind);
+        if let Err(err) = ensure_harness_available(harness_impl.as_ref()) {
+            let duration = started.elapsed().as_secs_f64();
+            let _ = self
+                .db
+                .fail_review(&dedupe, &format!("{err:#}"), duration)
+                .await;
+            return Err(err);
+        }
+
         // Fetch existing reviews once — used for both in-progress guard and duplicate check
         // inside run_review_pipeline, avoiding a redundant API call.
         let existing_reviews = comments::get_existing_reviews(
@@ -291,7 +302,6 @@ impl ReviewEngine {
             }
         }
 
-        let started = Instant::now();
         let outcome = self
             .run_review_pipeline(
                 repo_cfg,
