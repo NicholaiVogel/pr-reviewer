@@ -282,7 +282,11 @@ pub async fn start(
                         workers.spawn(async move {
                             let _permit = permit;
                             match engine
-                                .finalize_closed_pr_review(&repo_cfg, pending.pr_number as u64)
+                                .finalize_closed_pr_review(
+                                    &repo_cfg,
+                                    pending.pr_number as u64,
+                                    &pending.last_reviewed_sha,
+                                )
                                 .await
                             {
                                 Ok(true) => {

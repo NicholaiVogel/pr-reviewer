@@ -1145,6 +1145,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_finalization_requires_archive_sha_to_match_last_reviewed_sha() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        db.upsert_pr_state("o/r", 7, Some("last-reviewed-sha"), None)
+            .await
+            .expect("upsert pr state");
+
+        db.upsert_review_archive(
+            "o/r",
+            7,
+            "closed-head-sha",
+            "merged",
+            Some("2026-04-01T12:00:00Z"),
+            "transcript",
+            "summary",
+        )
+        .await
+        .expect("save archive with wrong sha");
+
+        let pending = db
+            .list_prs_pending_finalization("o/r")
+            .await
+            .expect("pending after mismatched archive sha");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].last_reviewed_sha, "last-reviewed-sha");
+
+        db.upsert_review_archive(
+            "o/r",
+            7,
+            "last-reviewed-sha",
+            "merged",
+            Some("2026-04-01T12:00:00Z"),
+            "transcript",
+            "summary",
+        )
+        .await
+        .expect("save archive with matching sha");
+
+        let pending = db
+            .list_prs_pending_finalization("o/r")
+            .await
+            .expect("pending after matching archive sha");
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
     async fn list_pr_review_attempts_returns_attempts_in_created_order() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::new(dir.path().join("state.db"))

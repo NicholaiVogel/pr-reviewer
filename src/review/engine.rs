@@ -1058,6 +1058,7 @@ impl ReviewEngine {
         &self,
         repo_cfg: &RepoConfig,
         pr_number: u64,
+        reviewed_sha: &str,
     ) -> Result<bool> {
         let pr_data =
             pr::get_pull_request(&self.github, &repo_cfg.owner, &repo_cfg.name, pr_number)
@@ -1079,7 +1080,8 @@ impl ReviewEngine {
             return Ok(false);
         }
 
-        self.archive_closed_pr_review(repo_cfg, &pr_data).await?;
+        self.archive_closed_pr_review(repo_cfg, &pr_data, reviewed_sha)
+            .await?;
         Ok(true)
     }
 
@@ -1087,6 +1089,7 @@ impl ReviewEngine {
         &self,
         repo_cfg: &RepoConfig,
         pr_data: &PullRequest,
+        reviewed_sha: &str,
     ) -> Result<()> {
         let repo_name = repo_cfg.full_name();
         let terminal_state = terminal_pr_state(pr_data);
@@ -1186,7 +1189,7 @@ impl ReviewEngine {
             .upsert_review_archive(
                 &repo_name,
                 pr_data.number as i64,
-                &pr_data.head.sha,
+                reviewed_sha,
                 terminal_state,
                 pr_data
                     .closed_at
