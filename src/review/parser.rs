@@ -110,6 +110,46 @@ impl Default for CommentSeverity {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    Correctness,
+    Security,
+    DataIntegrity,
+    RaceCondition,
+    BreakingChange,
+    ScopeDrift,
+    GeneratedArtifact,
+    SecretExposure,
+    LocalEnvironmentLeak,
+    TestGap,
+    Documentation,
+}
+
+impl Default for FindingKind {
+    fn default() -> Self {
+        FindingKind::Correctness
+    }
+}
+
+impl FindingKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FindingKind::Correctness => "correctness",
+            FindingKind::Security => "security",
+            FindingKind::DataIntegrity => "data_integrity",
+            FindingKind::RaceCondition => "race_condition",
+            FindingKind::BreakingChange => "breaking_change",
+            FindingKind::ScopeDrift => "scope_drift",
+            FindingKind::GeneratedArtifact => "generated_artifact",
+            FindingKind::SecretExposure => "secret_exposure",
+            FindingKind::LocalEnvironmentLeak => "local_environment_leak",
+            FindingKind::TestGap => "test_gap",
+            FindingKind::Documentation => "documentation",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewComment {
     pub file: String,
@@ -119,6 +159,8 @@ pub struct ReviewComment {
     pub evidence_note: Option<String>,
     #[serde(default)]
     pub severity: CommentSeverity,
+    #[serde(default)]
+    pub finding_kind: FindingKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +454,22 @@ mod tests {
         match parsed {
             ParseOutcome::Structured(review) => {
                 assert_eq!(review.comments[0].severity, CommentSeverity::Blocking);
+            }
+            _ => panic!("expected structured review"),
+        }
+    }
+
+    #[test]
+    fn parses_finding_kind_and_defaults_to_correctness() {
+        let input = format!(
+            "```pr-review-json\n{{\"summary\":\"found stuff\",\"verdict\":\"comment\",{},\"comments\":[{{\"file\":\"src/main.rs\",\"line\":10,\"body\":\"scope\",\"severity\":\"warning\",\"finding_kind\":\"scope_drift\"}},{{\"file\":\"src/lib.rs\",\"line\":5,\"body\":\"bug\",\"severity\":\"warning\"}}]}}\n```",
+            confidence_json()
+        );
+        let parsed = parse_review_output(&input, "").expect("parse output");
+        match parsed {
+            ParseOutcome::Structured(review) => {
+                assert_eq!(review.comments[0].finding_kind, FindingKind::ScopeDrift);
+                assert_eq!(review.comments[1].finding_kind, FindingKind::Correctness);
             }
             _ => panic!("expected structured review"),
         }

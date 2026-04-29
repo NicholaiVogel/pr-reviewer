@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -59,10 +61,19 @@ pub async fn start(
     let stale_age = config.harness.timeout_secs + 30;
     let _ = db.sweep_stale_claims(stale_age).await?;
 
+    // Shared flag so finalization workers can signal that a PR was actually
+    // archived (i.e. confirmed closed/merged) back to the main poll loop.
+    // swap(false) at the top of each iteration atomically reads-and-resets, so
+    // any `Ok(true)` set by a worker that completed during the previous cycle
+    // (or during the current one before we evaluate backoff) is captured once.
+    let finalization_detected = Arc::new(AtomicBool::new(false));
+
     loop {
         while workers.try_join_next().is_some() {}
 
-        let mut changes_detected = false;
+        // Seed changes_detected from confirmed finalizations that workers
+        // completed since the last time we evaluated backoff.
+        let mut changes_detected = finalization_detected.swap(false, Ordering::Acquire);
         let rate_state = github.rate_state();
         let rate_limit_budget = rate_state.limit.unwrap_or(RATE_LIMIT_TOTAL);
         let remaining = rate_state.remaining;
@@ -100,8 +111,18 @@ pub async fn start(
                 ListPullsResult::NotModified { etag } => {
                     db.set_repo_etag(&repo_name, etag.as_deref()).await?;
                 }
-                ListPullsResult::Updated { prs, etag } => {
+                ListPullsResult::Updated {
+                    prs,
+                    etag,
+                    complete,
+                } => {
                     db.set_repo_etag(&repo_name, etag.as_deref()).await?;
+                    let open_pr_numbers: HashSet<u64> = prs.iter().map(|pr| pr.number).collect();
+                    // Only skip per-PR finalization probes when list_open_prs
+                    // confirmed it walked the complete open-PR set. If pagination
+                    // hit the safety cap, stay conservative and ask GitHub for the
+                    // current state before archiving anything missing from the set.
+                    let can_trust_open_set = complete;
                     for pr in prs {
                         let state = db.get_pr_state(&repo_name, pr.number as i64).await?;
                         let already = state.as_ref().and_then(|s| s.last_reviewed_sha.clone());
@@ -147,9 +168,10 @@ pub async fn start(
                                 {
                                     continue;
                                 }
-                                if engine.authenticated_user().is_some_and(|u| {
-                                    comment.user.login.eq_ignore_ascii_case(u)
-                                }) {
+                                if engine
+                                    .authenticated_user()
+                                    .is_some_and(|u| comment.user.login.eq_ignore_ascii_case(u))
+                                {
                                     continue;
                                 }
                                 // Skip comments from any GitHub Bot account (other
@@ -195,11 +217,7 @@ pub async fn start(
 
                                 // Deduplication: skip if we already replied to this comment
                                 let claimed = db
-                                    .claim_reply(
-                                        &repo_name,
-                                        pr.number as i64,
-                                        comment.id as i64,
-                                    )
+                                    .claim_reply(&repo_name, pr.number as i64, comment.id as i64)
                                     .await?;
                                 if !claimed {
                                     tracing::debug!(
@@ -239,6 +257,65 @@ pub async fn start(
                             &chrono::Utc::now().to_rfc3339(),
                         )
                         .await?;
+                    }
+
+                    let pending_finalizations =
+                        db.list_prs_pending_finalization(&repo_name).await?;
+                    for pending in pending_finalizations {
+                        if can_trust_open_set
+                            && open_pr_numbers.contains(&(pending.pr_number as u64))
+                        {
+                            continue;
+                        }
+
+                        let permit = semaphore.clone().acquire_owned().await?;
+                        let engine = engine.clone();
+                        let repo_cfg = repo_cfg.clone();
+                        let repo_name = repo_name.clone();
+                        let finalization_flag = finalization_detected.clone();
+                        // NOTE: do NOT set changes_detected here — we don't
+                        // know whether the PR is actually closed until the
+                        // worker calls GitHub.  Setting it speculatively would
+                        // defeat adaptive backoff for repos with many
+                        // pending-finalization entries whose PRs are still open.
+                        // Instead the worker signals back via finalization_flag.
+                        workers.spawn(async move {
+                            let _permit = permit;
+                            match engine
+                                .finalize_closed_pr_review(
+                                    &repo_cfg,
+                                    pending.pr_number as u64,
+                                    &pending.last_reviewed_sha,
+                                )
+                                .await
+                            {
+                                Ok(true) => {
+                                    // PR was confirmed closed/merged and archive was written.
+                                    // Signal the main loop so adaptive backoff resets.
+                                    finalization_flag.store(true, Ordering::Release);
+                                    tracing::info!(
+                                        repo = %repo_name,
+                                        pr = pending.pr_number,
+                                        "archived final review transcript and summary"
+                                    );
+                                }
+                                Ok(false) => {
+                                    tracing::debug!(
+                                        repo = %repo_name,
+                                        pr = pending.pr_number,
+                                        "skipping final archive because PR is still open"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        repo = %repo_name,
+                                        pr = pending.pr_number,
+                                        error = %err,
+                                        "final review archive failed"
+                                    );
+                                }
+                            }
+                        });
                     }
                 }
             }

@@ -293,6 +293,30 @@ RUST_LOG=info pr-reviewer start   # run foreground first to see startup errors
 
 Common causes: missing token, config parse error, binary not found.
 
+### Reviews fail with "harness executable ... was not found in PATH"
+
+The daemon process cannot see the configured AI CLI (`claude`, `opencode`, or `codex`).
+This is common under systemd because services do not inherit your shell startup files.
+
+Check the service environment:
+
+```bash
+systemctl show pr-reviewer --property=Environment
+```
+
+Add the CLI install directory to the unit file:
+
+```ini
+Environment=PATH=/home/nicholai/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
+```
+
+Then reload and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart pr-reviewer
+```
+
 ---
 
 ## GitNexus issues

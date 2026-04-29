@@ -17,14 +17,17 @@ use crate::github::types::{
 };
 use crate::github::{client::GitHubClient, pr};
 use crate::harness;
-use crate::harness::spawn::{run_harness, HarnessRunRequest};
+use crate::harness::spawn::{ensure_harness_available, run_harness, HarnessRunRequest};
 use crate::review::parser::{
-    parse_reply_output, parse_review_output, CommentSeverity, ParseOutcome, ReplyParseOutcome,
-    ReviewComment as ParsedReviewComment, ReviewVerdict,
+    parse_reply_output, parse_review_output, CommentSeverity, FindingKind, ParseOutcome,
+    ReplyParseOutcome, ReviewComment as ParsedReviewComment, ReviewVerdict,
 };
 use crate::review::prompt::build_review_prompt;
 use crate::safety::{evaluate_fork_policy, ForkDecision};
-use crate::store::db::{dedupe_key, Database, ReviewClaim};
+use crate::store::db::{
+    dedupe_key, Database, ReviewAttemptRecord, ReviewClaim, ReviewFindingRecord,
+    ReviewFindingUpsert,
+};
 
 const IN_PROGRESS_COMMENT_TIMEOUT_SECS: u64 = 4;
 const IN_PROGRESS_COMMENT_MAX_CHARS: usize = 220;
@@ -59,6 +62,25 @@ struct ReviewMemory {
     already_noted_screenshot: bool,
     has_prior_bot_review: bool,
     explicit_boundaries: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingFinding {
+    fingerprint: String,
+    path: String,
+    line: Option<u32>,
+    body: String,
+    evidence_note: Option<String>,
+    severity: CommentSeverity,
+    finding_kind: FindingKind,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FindingDelta {
+    newly_found: usize,
+    still_blocking: usize,
+    likely_fixed: usize,
+    rebutted_or_scoped: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -216,6 +238,17 @@ impl ReviewEngine {
             });
         }
 
+        let started = Instant::now();
+        let harness_impl = harness::for_kind(harness_kind);
+        if let Err(err) = ensure_harness_available(harness_impl.as_ref()) {
+            let duration = started.elapsed().as_secs_f64();
+            let _ = self
+                .db
+                .fail_review(&dedupe, &format!("{err:#}"), duration)
+                .await;
+            return Err(err);
+        }
+
         // Fetch existing reviews once — used for both in-progress guard and duplicate check
         // inside run_review_pipeline, avoiding a redundant API call.
         let existing_reviews = comments::get_existing_reviews(
@@ -291,7 +324,6 @@ impl ReviewEngine {
             }
         }
 
-        let started = Instant::now();
         let outcome = self
             .run_review_pipeline(
                 repo_cfg,
@@ -594,6 +626,19 @@ impl ReviewEngine {
         );
 
         let mut context_with_history = assembled.text.clone();
+        let stored_findings = self
+            .db
+            .list_review_findings(&repo_name, pr_data.number as i64)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    repo = %repo_name,
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to load review finding ledger; continuing with GitHub thread memory only"
+                );
+                vec![]
+            });
         let review_memory = build_review_memory(
             &existing_reviews,
             &review_comments,
@@ -634,6 +679,12 @@ impl ReviewEngine {
             context_with_history.push_str(&review_state_context);
             context_with_history.push('\n');
         }
+        let finding_ledger_context = build_stored_findings_context(&stored_findings);
+        if !finding_ledger_context.is_empty() {
+            context_with_history.push_str("\n## Persisted Finding Ledger\n");
+            context_with_history.push_str(&finding_ledger_context);
+            context_with_history.push('\n');
+        }
 
         if let Some(previous_sha) = prior_sha.as_deref() {
             if let Ok(delta_diff) = self
@@ -667,8 +718,9 @@ impl ReviewEngine {
             }
         }
 
-        let has_prior_reviews =
-            review_memory.has_prior_bot_review || !prior_reviews_context.is_empty();
+        let has_prior_reviews = review_memory.has_prior_bot_review
+            || !prior_reviews_context.is_empty()
+            || !stored_findings.is_empty();
 
         // Detect UI file changes and check for screenshots in PR body
         let ui_files = detect_ui_files(&changed_files);
@@ -727,6 +779,7 @@ impl ReviewEngine {
         let mut verdict = ReviewVerdict::Comment;
         let mut inline_comments: Vec<CreateReviewComment> = Vec::new();
         let mut unmapped_comments: Vec<String> = Vec::new();
+        let mut pending_findings: Vec<PendingFinding> = Vec::new();
         let has_structured_findings: bool;
 
         // Prepend bot identity header on every review
@@ -770,6 +823,7 @@ impl ReviewEngine {
                     if should_suppress_finding(&comment, &path, &review_memory) {
                         continue;
                     }
+                    apply_scope_drift_policy(&mut comment);
                     if comment.severity == CommentSeverity::Blocking
                         && !blocker_has_sufficient_evidence(
                             &comment,
@@ -792,6 +846,15 @@ impl ReviewEngine {
 
                 for comment in surviving_comments {
                     let path = clean_comment_path(&comment.file);
+                    pending_findings.push(PendingFinding {
+                        fingerprint: finding_key(&path, Some(comment.line), &comment.body),
+                        path: path.clone(),
+                        line: Some(comment.line),
+                        body: comment.body.clone(),
+                        evidence_note: comment.evidence_note.clone(),
+                        severity: comment.severity,
+                        finding_kind: comment.finding_kind,
+                    });
                     let right = parsed_diff.position_for(&path, comment.line, DiffSide::Right);
                     let left = parsed_diff.position_for(&path, comment.line, DiffSide::Left);
 
@@ -836,6 +899,28 @@ impl ReviewEngine {
             }
         }
 
+        let (finding_updates, finding_delta) = reconcile_finding_ledger(
+            &repo_name,
+            pr_data.number as i64,
+            &pr_data.head.sha,
+            &stored_findings,
+            &pending_findings,
+            &review_memory,
+        );
+        if !finding_updates.is_empty() {
+            self.db.upsert_review_findings(finding_updates).await?;
+        }
+        let finding_delta_summary = if stored_findings.is_empty() {
+            None
+        } else {
+            build_finding_delta_summary(&finding_delta)
+        };
+        if let Some(delta_summary) = finding_delta_summary.as_deref() {
+            body.push_str("\n\n");
+            body.push_str(delta_summary);
+            body.push('\n');
+        }
+
         let body = truncate_github_comment_body(&body);
 
         if dry_run {
@@ -869,6 +954,7 @@ impl ReviewEngine {
             && inline_comments.is_empty()
             && unmapped_comments.is_empty()
             && !screenshot_note_added
+            && finding_delta_summary.is_none()
             && !has_structured_findings
         {
             self.db
@@ -1042,6 +1128,222 @@ impl ReviewEngine {
             verdict: Some(verdict),
             comments_posted: if used_retry { 0 } else { inline_comments.len() },
         })
+    }
+
+    pub async fn finalize_closed_pr_review(
+        &self,
+        repo_cfg: &RepoConfig,
+        pr_number: u64,
+        reviewed_sha: &str,
+    ) -> Result<bool> {
+        let pr_data =
+            pr::get_pull_request(&self.github, &repo_cfg.owner, &repo_cfg.name, pr_number)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed fetching PR {}#{pr_number} for final archive",
+                        repo_cfg.full_name()
+                    )
+                })?;
+
+        // A PR is terminal when state != "open" OR merged_at is set.  The
+        // `state` field defaults to "open" when absent from the payload (see
+        // #[serde(default = "default_pr_state")]).  Checking merged_at as a
+        // secondary signal ensures that a PR with a missing state field but a
+        // populated merged_at (e.g. a partial payload) is still finalized rather
+        // than silently skipped.
+        if pr_data.state.eq_ignore_ascii_case("open") && pr_data.merged_at.is_none() {
+            return Ok(false);
+        }
+
+        self.archive_closed_pr_review(repo_cfg, &pr_data, reviewed_sha)
+            .await?;
+        Ok(true)
+    }
+
+    async fn archive_closed_pr_review(
+        &self,
+        repo_cfg: &RepoConfig,
+        pr_data: &PullRequest,
+        reviewed_sha: &str,
+    ) -> Result<()> {
+        let repo_name = repo_cfg.full_name();
+        let terminal_state = terminal_pr_state(pr_data);
+        let review_attempts = self
+            .db
+            .list_pr_review_attempts(&repo_name, pr_data.number as i64)
+            .await?;
+        let finding_ledger = self
+            .db
+            .list_review_findings(&repo_name, pr_data.number as i64)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    repo = %repo_name,
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to fetch finding ledger for final archive"
+                );
+                vec![]
+            });
+
+        let (existing_reviews, review_comments, issue_comments) = tokio::join!(
+            comments::get_existing_reviews(
+                &self.github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                pr_data.number,
+            ),
+            comments::get_review_comments(
+                &self.github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                pr_data.number,
+                None,
+            ),
+            comments::get_issue_comments(
+                &self.github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                pr_data.number,
+            ),
+        );
+
+        // Log warnings for API failures so the transcript honestly reflects
+        // missing data instead of silently treating errors as "no content".
+        let existing_reviews = match existing_reviews {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    repo = %repo_name,
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to fetch reviews for final archive; transcript will be incomplete"
+                );
+                vec![]
+            }
+        };
+        let review_comments = match review_comments {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    repo = %repo_name,
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to fetch review comments for final archive; transcript will be incomplete"
+                );
+                vec![]
+            }
+        };
+        let issue_comments = match issue_comments {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    repo = %repo_name,
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to fetch issue comments for final archive; transcript will be incomplete"
+                );
+                vec![]
+            }
+        };
+
+        let transcript = build_final_review_transcript(
+            &repo_name,
+            pr_data,
+            terminal_state,
+            &review_attempts,
+            &existing_reviews,
+            &review_comments,
+            &issue_comments,
+            &finding_ledger,
+        );
+
+        let summary = match self
+            .compose_final_review_summary(repo_cfg, pr_data, terminal_state, &transcript)
+            .await
+        {
+            Ok(summary) => summary,
+            Err(err) => {
+                tracing::warn!(
+                    repo = %repo_name,
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to generate final review summary; using fallback"
+                );
+                build_final_review_summary_fallback(pr_data, terminal_state, &review_attempts)
+            }
+        };
+
+        self.db
+            .upsert_review_archive(
+                &repo_name,
+                pr_data.number as i64,
+                reviewed_sha,
+                terminal_state,
+                pr_data
+                    .closed_at
+                    .as_deref()
+                    .or(pr_data.merged_at.as_deref()),
+                &transcript,
+                &summary,
+            )
+            .await?;
+
+        tracing::info!(
+            repo = %repo_name,
+            pr = pr_data.number,
+            terminal_state,
+            "saved final review transcript and summary"
+        );
+        Ok(())
+    }
+
+    async fn compose_final_review_summary(
+        &self,
+        repo_cfg: &RepoConfig,
+        pr_data: &PullRequest,
+        terminal_state: &str,
+        transcript: &str,
+    ) -> Result<String> {
+        let harness_kind = repo_cfg.resolved_harness(&self.config);
+        let model = repo_cfg.resolved_model(&self.config).to_string();
+        let reasoning_effort = repo_cfg.resolved_reasoning_effort(&self.config);
+        let mut prompt = build_final_review_summary_prompt(
+            &repo_cfg.full_name(),
+            pr_data,
+            terminal_state,
+            transcript,
+        );
+        let max_bytes = self.config.defaults.max_prompt_bytes;
+        let note =
+            "\n\n[review transcript truncated before final-summary generation due size budget]\n";
+        if prompt.len() > max_bytes {
+            if max_bytes > note.len() {
+                truncate_utf8_to_max_bytes(&mut prompt, max_bytes - note.len());
+                prompt.push_str(note);
+            } else {
+                truncate_utf8_to_max_bytes(&mut prompt, max_bytes);
+            }
+        }
+
+        let temp = tempdir().context("failed to create temp dir for final review summary")?;
+        let harness_impl = harness::for_kind(harness_kind);
+        let output = run_harness(
+            harness_impl.as_ref(),
+            HarnessRunRequest {
+                prompt,
+                model,
+                reasoning_effort,
+                working_dir: temp.path().to_path_buf(),
+                timeout_secs: self.config.harness.timeout_secs,
+            },
+        )
+        .await?;
+
+        let summary = normalize_summary_output(&output.stdout, &output.stderr)
+            .ok_or_else(|| anyhow!("final review summary harness returned empty output"))?;
+        Ok(summary)
     }
 
     pub async fn reply_to_comment(
@@ -1680,6 +1982,218 @@ fn build_review_state_context(memory: &ReviewMemory) -> String {
     out
 }
 
+fn build_stored_findings_context(findings: &[ReviewFindingRecord]) -> String {
+    let active: Vec<&ReviewFindingRecord> = findings
+        .iter()
+        .filter(|finding| finding_status_is_active(&finding.status))
+        .collect();
+    if active.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    for finding in active.iter().rev().take(12).rev() {
+        let line = finding
+            .line
+            .map(|line| line.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let preview: String = finding.body.chars().take(220).collect();
+        out.push_str(&format!(
+            "- {}:{} [{} / {} / {}] {}\n",
+            finding.path,
+            line,
+            finding.status,
+            finding.severity,
+            finding.finding_kind,
+            preview.replace('\n', " ")
+        ));
+    }
+    out
+}
+
+fn reconcile_finding_ledger(
+    repo: &str,
+    pr_number: i64,
+    sha: &str,
+    stored_findings: &[ReviewFindingRecord],
+    current_findings: &[PendingFinding],
+    review_memory: &ReviewMemory,
+) -> (Vec<ReviewFindingUpsert>, FindingDelta) {
+    let current_keys: HashSet<&str> = current_findings
+        .iter()
+        .map(|finding| finding.fingerprint.as_str())
+        .collect();
+    let stored_by_key: HashMap<&str, &ReviewFindingRecord> = stored_findings
+        .iter()
+        .map(|finding| (finding.fingerprint.as_str(), finding))
+        .collect();
+
+    let mut updates = Vec::new();
+    let mut delta = FindingDelta::default();
+
+    for finding in current_findings {
+        let existing = stored_by_key.get(finding.fingerprint.as_str()).copied();
+        let status = if existing.is_some_and(|stored| finding_status_is_active(&stored.status)) {
+            if finding.severity == CommentSeverity::Blocking {
+                delta.still_blocking += 1;
+                "still_blocking"
+            } else {
+                "open"
+            }
+        } else {
+            delta.newly_found += 1;
+            "open"
+        };
+
+        updates.push(ReviewFindingUpsert {
+            repo: repo.to_string(),
+            pr_number,
+            fingerprint: finding.fingerprint.clone(),
+            sha: sha.to_string(),
+            status: status.to_string(),
+            severity: severity_label(finding.severity).to_string(),
+            finding_kind: finding.finding_kind.as_str().to_string(),
+            path: finding.path.clone(),
+            line: finding.line.map(i64::from),
+            body: finding.body.clone(),
+            evidence_note: finding.evidence_note.clone(),
+            github_comment_id: None,
+            resolved_by_sha: None,
+            resolution_reason: None,
+        });
+    }
+
+    for stored in stored_findings {
+        if !finding_status_is_active(&stored.status)
+            || current_keys.contains(stored.fingerprint.as_str())
+        {
+            continue;
+        }
+
+        let (status, reason) = match classified_prior_status(stored, review_memory) {
+            Some(FindingStatus::DismissedByHuman) | Some(FindingStatus::RejectedWithRationale) => {
+                delta.rebutted_or_scoped += 1;
+                ("rebutted", "human rebuttal or rationale")
+            }
+            Some(FindingStatus::OutOfScopeForPr) => {
+                delta.rebutted_or_scoped += 1;
+                ("out_of_scope", "human marked out of scope")
+            }
+            Some(FindingStatus::LikelyAddressed) => {
+                delta.likely_fixed += 1;
+                ("likely_fixed", "finding no longer present in current diff")
+            }
+            _ => {
+                delta.likely_fixed += 1;
+                ("likely_fixed", "not re-emitted by latest review")
+            }
+        };
+
+        updates.push(ReviewFindingUpsert {
+            repo: repo.to_string(),
+            pr_number,
+            fingerprint: stored.fingerprint.clone(),
+            sha: sha.to_string(),
+            status: status.to_string(),
+            severity: stored.severity.clone(),
+            finding_kind: stored.finding_kind.clone(),
+            path: stored.path.clone(),
+            line: stored.line,
+            body: stored.body.clone(),
+            evidence_note: stored.evidence_note.clone(),
+            github_comment_id: stored.github_comment_id,
+            resolved_by_sha: Some(sha.to_string()),
+            resolution_reason: Some(reason.to_string()),
+        });
+    }
+
+    (updates, delta)
+}
+
+fn classified_prior_status(
+    stored: &ReviewFindingRecord,
+    review_memory: &ReviewMemory,
+) -> Option<FindingStatus> {
+    let stored_tokens = token_set(&stored.body);
+    review_memory
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.path == stored.path && token_overlap(&finding.token_set, &stored_tokens) >= 2
+        })
+        .map(|finding| finding.status)
+        .max_by_key(status_precedence)
+}
+
+fn finding_status_is_active(status: &str) -> bool {
+    matches!(status, "open" | "still_blocking")
+}
+
+fn severity_label(severity: CommentSeverity) -> &'static str {
+    match severity {
+        CommentSeverity::Blocking => "blocking",
+        CommentSeverity::Warning => "warning",
+        CommentSeverity::Nitpick => "nitpick",
+    }
+}
+
+fn build_finding_delta_summary(delta: &FindingDelta) -> Option<String> {
+    if delta.newly_found == 0
+        && delta.still_blocking == 0
+        && delta.likely_fixed == 0
+        && delta.rebutted_or_scoped == 0
+    {
+        return None;
+    }
+
+    Some(format!(
+        "**Since my last review:**\n- Fixed or likely addressed: {}\n- Still blocking: {}\n- Newly found: {}\n- Suppressed due to human rebuttal/out-of-scope: {}",
+        delta.likely_fixed, delta.still_blocking, delta.newly_found, delta.rebutted_or_scoped
+    ))
+}
+
+fn apply_scope_drift_policy(comment: &mut ParsedReviewComment) {
+    if comment.finding_kind != FindingKind::ScopeDrift
+        || comment.severity != CommentSeverity::Blocking
+        || scope_drift_is_high_risk(comment)
+    {
+        return;
+    }
+
+    comment.severity = CommentSeverity::Warning;
+}
+
+fn scope_drift_is_high_risk(comment: &ParsedReviewComment) -> bool {
+    matches!(
+        comment.finding_kind,
+        FindingKind::GeneratedArtifact
+            | FindingKind::SecretExposure
+            | FindingKind::LocalEnvironmentLeak
+            | FindingKind::Security
+            | FindingKind::DataIntegrity
+    ) || {
+        let body = normalize_text(&comment.body);
+        let path = normalize_text(&comment.file);
+        const HIGH_RISK_SCOPE_TERMS: &[&str] = &[
+            "generated",
+            "dist/",
+            ".svelte-kit",
+            "secret",
+            "token",
+            "private environment",
+            "local path",
+            "machine-specific",
+            "unrelated production",
+            "data exposure",
+            "attack surface",
+            "credential",
+        ];
+        HIGH_RISK_SCOPE_TERMS
+            .iter()
+            .any(|term| body.contains(term) || path.contains(term))
+    }
+}
+
 fn can_reopen_rebutted_finding(
     comment: &ParsedReviewComment,
     path: &str,
@@ -1930,9 +2444,7 @@ fn line_is_authored_by_bot(lower_line: &str, bot_lower: &str, alias_lower: Optio
         None => return false,
     };
     // Strip " (bot)" suffix if present
-    let login = raw_login
-        .strip_suffix(" (bot)")
-        .unwrap_or(raw_login);
+    let login = raw_login.strip_suffix(" (bot)").unwrap_or(raw_login);
     login == bot_lower || alias_lower.is_some_and(|a| login == a)
 }
 
@@ -1966,6 +2478,352 @@ fn extract_file_snippet(content: &str, line: usize, radius: usize) -> String {
         out.push_str(&format!("{:>5}: {}\n", idx + 1, lines[idx]));
     }
     out
+}
+
+#[derive(Debug)]
+struct ReviewTranscriptEvent {
+    sort_key: String,
+    ordinal: usize,
+    heading: String,
+    body: String,
+}
+
+fn terminal_pr_state(pr_data: &PullRequest) -> &'static str {
+    // merged_at being set is the authoritative signal that a PR was merged.
+    // We intentionally do not also require state=="closed" here, because
+    // finalize_closed_pr_review proceeds whenever merged_at.is_some()
+    // (regardless of the state field).  Requiring state=="closed" in the
+    // labeler would cause a partial payload (merged_at set, state absent /
+    // defaulting to "open") to be archived by the gate but labeled "closed"
+    // — a contradiction.  Using merged_at alone keeps both functions
+    // consistent: if the gate treats merged_at as sufficient evidence of a
+    // merge, so does the labeler.
+    if pr_data.merged_at.is_some() {
+        "merged"
+    } else {
+        "closed"
+    }
+}
+
+fn build_final_review_transcript(
+    repo_name: &str,
+    pr_data: &PullRequest,
+    terminal_state: &str,
+    review_attempts: &[ReviewAttemptRecord],
+    existing_reviews: &[PullRequestReview],
+    review_comments: &[ReviewComment],
+    issue_comments: &[IssueComment],
+    finding_ledger: &[ReviewFindingRecord],
+) -> String {
+    let mut transcript = String::new();
+    transcript.push_str("# PR Review Transcript\n\n");
+    transcript.push_str(&format!("- Repo: {repo_name}\n"));
+    transcript.push_str(&format!("- PR: #{} - {}\n", pr_data.number, pr_data.title));
+    transcript.push_str(&format!("- Author: @{}\n", pr_data.user.login));
+    transcript.push_str(&format!("- Terminal state: {terminal_state}\n"));
+    transcript.push_str(&format!(
+        "- Head SHA at archive time: {}\n",
+        pr_data.head.sha
+    ));
+    if let Some(url) = pr_data.html_url.as_deref() {
+        transcript.push_str(&format!("- URL: {url}\n"));
+    }
+    if let Some(closed_at) = pr_data
+        .closed_at
+        .as_deref()
+        .or(pr_data.merged_at.as_deref())
+    {
+        transcript.push_str(&format!("- Closed at: {closed_at}\n"));
+    }
+    if let Some(body) = pr_data
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+    {
+        transcript.push_str("\n## PR Description\n\n");
+        transcript.push_str(&quote_markdown_block(body));
+        transcript.push('\n');
+    }
+    transcript.push('\n');
+
+    if !finding_ledger.is_empty() {
+        transcript.push_str("## Finding Resolution State\n\n");
+        for finding in finding_ledger {
+            let line = finding
+                .line
+                .map(|line| line.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            transcript.push_str(&format!(
+                "- {}:{} [{} / {} / {}] first_sha={} last_seen_sha={}",
+                finding.path,
+                line,
+                finding.status,
+                finding.severity,
+                finding.finding_kind,
+                short_sha(&finding.first_sha),
+                short_sha(&finding.last_seen_sha)
+            ));
+            if let Some(resolved_by) = finding.resolved_by_sha.as_deref() {
+                transcript.push_str(&format!(" resolved_by={}", short_sha(resolved_by)));
+            }
+            if let Some(reason) = finding.resolution_reason.as_deref() {
+                transcript.push_str(&format!(" reason={}", reason.replace('\n', " ")));
+            }
+            transcript.push('\n');
+            let preview: String = finding.body.chars().take(280).collect();
+            transcript.push_str(&format!("  - {}\n", preview.replace('\n', " ")));
+        }
+        transcript.push('\n');
+    }
+
+    let mut events = Vec::new();
+    let mut ordinal = 0usize;
+
+    for attempt in review_attempts {
+        ordinal += 1;
+        let mut body = String::new();
+        body.push_str(&format!("- sha: {}\n", attempt.sha));
+        body.push_str(&format!("- harness: {}\n", attempt.harness));
+        if let Some(model) = attempt.model.as_deref() {
+            body.push_str(&format!("- model: {model}\n"));
+        }
+        body.push_str(&format!("- status: {}\n", attempt.status));
+        if let Some(verdict) = attempt.verdict.as_deref() {
+            body.push_str(&format!("- verdict: {verdict}\n"));
+        }
+        if let Some(comments_posted) = attempt.comments_posted {
+            body.push_str(&format!("- comments_posted: {comments_posted}\n"));
+        }
+        if let Some(duration_secs) = attempt.duration_secs {
+            body.push_str(&format!("- duration_secs: {:.1}\n", duration_secs));
+        }
+        if let Some(completed_at) = attempt.completed_at.as_deref() {
+            body.push_str(&format!("- completed_at: {completed_at}\n"));
+        }
+        if let Some(error) = attempt.error_message.as_deref() {
+            body.push_str("- error:\n");
+            body.push_str(&quote_markdown_block(error));
+        }
+
+        events.push(ReviewTranscriptEvent {
+            sort_key: timestamp_sort_key(&attempt.created_at),
+            ordinal,
+            heading: format!("Local review attempt {}", attempt.created_at),
+            body,
+        });
+    }
+
+    for review in existing_reviews {
+        ordinal += 1;
+        let submitted_at = review.submitted_at.as_deref().unwrap_or("unknown");
+        let mut body = String::new();
+        if let Some(state) = review.state.as_deref() {
+            body.push_str(&format!("- state: {state}\n"));
+        }
+        if let Some(commit_id) = review.commit_id.as_deref() {
+            body.push_str(&format!("- commit: {commit_id}\n"));
+        }
+        body.push_str("- body:\n");
+        body.push_str(&quote_markdown_block(
+            review.body.as_deref().unwrap_or("(empty review body)"),
+        ));
+
+        events.push(ReviewTranscriptEvent {
+            sort_key: timestamp_sort_key(submitted_at),
+            ordinal,
+            heading: format!("GitHub review by @{} ({submitted_at})", review.user.login),
+            body,
+        });
+    }
+
+    for comment in review_comments {
+        ordinal += 1;
+        let location = comment
+            .line
+            .map(|line| format!("{}:{}", comment.path, line))
+            .unwrap_or_else(|| comment.path.clone());
+        let mut body = String::new();
+        if let Some(parent_id) = comment.in_reply_to_id {
+            body.push_str(&format!("- in_reply_to_id: {parent_id}\n"));
+        }
+        body.push_str("- body:\n");
+        body.push_str(&quote_markdown_block(&comment.body));
+
+        events.push(ReviewTranscriptEvent {
+            sort_key: timestamp_sort_key(&comment.created_at),
+            ordinal,
+            heading: format!(
+                "Review thread comment by @{} on {} ({})",
+                comment.user.login, location, comment.created_at
+            ),
+            body,
+        });
+    }
+
+    for comment in issue_comments {
+        ordinal += 1;
+        let mut body = String::new();
+        body.push_str("- body:\n");
+        body.push_str(&quote_markdown_block(&comment.body));
+
+        events.push(ReviewTranscriptEvent {
+            sort_key: timestamp_sort_key(&comment.created_at),
+            ordinal,
+            heading: format!(
+                "Issue comment by @{} ({})",
+                comment.user.login, comment.created_at
+            ),
+            body,
+        });
+    }
+
+    events.sort_by(|left, right| {
+        left.sort_key
+            .cmp(&right.sort_key)
+            .then(left.ordinal.cmp(&right.ordinal))
+    });
+
+    if events.is_empty() {
+        transcript
+            .push_str("No persisted review attempts or GitHub conversation were available.\n");
+        return transcript;
+    }
+
+    transcript.push_str("## Timeline\n\n");
+    for event in events {
+        transcript.push_str("### ");
+        transcript.push_str(&event.heading);
+        transcript.push('\n');
+        transcript.push_str(&event.body);
+        if !event.body.ends_with('\n') {
+            transcript.push('\n');
+        }
+        transcript.push('\n');
+    }
+
+    transcript
+}
+
+fn build_final_review_summary_prompt(
+    repo_name: &str,
+    pr_data: &PullRequest,
+    terminal_state: &str,
+    transcript: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Write a concise retrospective summary of this completed PR review.\n");
+    prompt.push_str("The PR is already closed or merged, so describe what the review covered and how it concluded.\n");
+    prompt.push_str("Focus on the important review themes, notable issues raised, the Finding Resolution State section, whether follow-up discussion resolved them, and the final outcome.\n");
+    prompt.push_str("If details are sparse, say that plainly instead of inventing specifics.\n");
+    prompt.push_str("Output plain markdown only. No code fences. Keep it under 250 words.\n\n");
+    prompt.push_str(&format!("Repo: {repo_name}\n"));
+    prompt.push_str(&format!("PR: #{}\n", pr_data.number));
+    prompt.push_str(&format!("Title: {}\n", pr_data.title));
+    prompt.push_str(&format!("Author: @{}\n", pr_data.user.login));
+    prompt.push_str(&format!("Terminal state: {terminal_state}\n"));
+    prompt.push_str(&format!(
+        "Head SHA at archive time: {}\n\n",
+        pr_data.head.sha
+    ));
+    prompt.push_str("Transcript:\n\n");
+    prompt.push_str(transcript);
+    prompt
+}
+
+fn build_final_review_summary_fallback(
+    pr_data: &PullRequest,
+    terminal_state: &str,
+    review_attempts: &[ReviewAttemptRecord],
+) -> String {
+    let completed = review_attempts
+        .iter()
+        .filter(|attempt| attempt.status == "completed")
+        .count();
+    let failed = review_attempts
+        .iter()
+        .filter(|attempt| attempt.status == "failed")
+        .count();
+    let last_verdict = review_attempts
+        .iter()
+        .rev()
+        .find_map(|attempt| attempt.verdict.as_deref());
+
+    let mut summary = format!(
+        "PR #{} ended as {} after {} recorded review attempt(s).",
+        pr_data.number,
+        terminal_state,
+        review_attempts.len()
+    );
+    if completed > 0 || failed > 0 {
+        summary.push_str(&format!(" {} completed, {} failed.", completed, failed));
+    }
+    if let Some(verdict) = last_verdict {
+        summary.push_str(&format!(" Final recorded verdict: {verdict}."));
+    }
+    summary.push_str(" Full transcript archived in the database.");
+    summary
+}
+
+fn normalize_summary_output(stdout: &str, _stderr: &str) -> Option<String> {
+    let out = stdout.trim();
+    if out.is_empty() {
+        return None;
+    }
+
+    let normalized = strip_fenced_code_block(out);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+/// Strip an optional fenced code block wrapper (``` or ```lang) that some
+/// harnesses add around their output.  Falls back to plain backtick trimming
+/// for outputs that are just backtick-quoted without a newline.
+fn strip_fenced_code_block(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() >= 2 {
+        let first = lines[0].trim();
+        let last = lines[lines.len() - 1].trim();
+        if first.starts_with("```") && last == "```" {
+            // Strip the opening fence (with optional language tag) and closing fence.
+            // Return the inner content — even if empty — rather than falling through
+            // to the backtick-trimming path, which would leave the language tag (e.g.
+            // "markdown") as if it were real content when the inner body is blank.
+            let inner = &lines[1..lines.len() - 1];
+            return inner.join("\n").trim().to_string();
+        }
+    }
+    // Fallback: strip loose backticks from edges (bare ` wrapping)
+    text.trim_matches('`').trim().to_string()
+}
+
+fn quote_markdown_block(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "> (empty)\n".to_string();
+    }
+
+    let mut out = String::new();
+    for line in trimmed.lines() {
+        out.push_str("> ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn timestamp_sort_key(timestamp: &str) -> String {
+    let trimmed = timestamp.trim();
+    if trimmed.is_empty() {
+        return "9999-12-31T23:59:59Z".to_string();
+    }
+    if trimmed.contains('T') {
+        return trimmed.to_string();
+    }
+    format!("{}Z", trimmed.replace(' ', "T"))
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -2537,21 +3395,27 @@ fn verdict_label(verdict: ReviewVerdict) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::github::types::{CreateReviewComment, PullRequestReview, ReviewComment, User};
-    use crate::review::parser::{
-        CommentSeverity, ConfidenceLevel, ReviewComment as ParsedReviewComment,
+    use crate::github::types::{
+        CreateReviewComment, PullRequest, PullRequestBase, PullRequestHead, PullRequestReview,
+        RepoRef, ReviewComment, User,
     };
+    use crate::review::parser::{
+        CommentSeverity, ConfidenceLevel, FindingKind, ReviewComment as ParsedReviewComment,
+    };
+    use crate::store::db::ReviewFindingRecord;
 
     use super::{
-        blocker_has_sufficient_evidence, build_direct_pushback_reply,
-        build_in_progress_comment_fallback, build_prior_reviews_context, build_retry_review_body,
-        build_review_memory, build_thread_history, extract_in_progress_comment, finding_key,
-        infer_pr_focus, line_is_authored_by_bot, login_matches_bot,
-        looks_like_harness_error_output, looks_like_harness_transport_output,
-        looks_like_reintroduction, normalize_in_progress_comment, pr_reviewer_project_url,
-        resolve_project_url, should_suppress_finding, status_precedence,
-        truncate_github_comment_body, FindingStatus, ReviewMemory, GITHUB_COMMENT_MAX_CHARS,
-        GITHUB_COMMENT_TRUNCATION_NOTE,
+        apply_scope_drift_policy, blocker_has_sufficient_evidence, build_direct_pushback_reply,
+        build_final_review_summary_prompt, build_final_review_transcript,
+        build_finding_delta_summary, build_in_progress_comment_fallback,
+        build_prior_reviews_context, build_retry_review_body, build_review_memory,
+        build_thread_history, extract_in_progress_comment, finding_key, infer_pr_focus,
+        line_is_authored_by_bot, login_matches_bot, looks_like_harness_error_output,
+        looks_like_harness_transport_output, looks_like_reintroduction,
+        normalize_in_progress_comment, normalize_summary_output, pr_reviewer_project_url,
+        reconcile_finding_ledger, resolve_project_url, should_suppress_finding,
+        truncate_github_comment_body, FindingStatus, PendingFinding, ReviewMemory,
+        GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
     };
 
     fn test_user(login: &str) -> User {
@@ -2565,6 +3429,38 @@ mod tests {
         User {
             login: login.to_string(),
             account_type: Some("Bot".to_string()),
+        }
+    }
+
+    fn test_repo_ref(full_name: &str, owner: &str) -> RepoRef {
+        RepoRef {
+            full_name: full_name.to_string(),
+            fork: false,
+            owner: test_user(owner),
+        }
+    }
+
+    fn test_pull_request_with_body(body: Option<&str>) -> PullRequest {
+        PullRequest {
+            number: 15,
+            title: "archive review transcript".to_string(),
+            body: body.map(ToString::to_string),
+            draft: false,
+            state: "closed".to_string(),
+            user: test_user("contributor"),
+            head: PullRequestHead {
+                sha: "abc123".to_string(),
+                ref_name: "feature/archive".to_string(),
+                repo: Some(test_repo_ref("owner/repo", "owner")),
+            },
+            base: PullRequestBase {
+                ref_name: "main".to_string(),
+                repo: test_repo_ref("owner/repo", "owner"),
+            },
+            html_url: Some("https://github.com/owner/repo/pull/15".to_string()),
+            updated_at: Some("2026-04-13T00:00:00Z".to_string()),
+            closed_at: Some("2026-04-13T01:00:00Z".to_string()),
+            merged_at: Some("2026-04-13T01:00:00Z".to_string()),
         }
     }
 
@@ -2585,6 +3481,93 @@ mod tests {
             in_reply_to_id: in_reply_to,
             created_at: format!("2026-03-30T00:{:02}:00Z", id),
         }
+    }
+
+    fn stored_finding(status: &str, severity: &str, fingerprint: &str) -> ReviewFindingRecord {
+        ReviewFindingRecord {
+            repo: "owner/repo".to_string(),
+            pr_number: 15,
+            fingerprint: fingerprint.to_string(),
+            first_sha: "sha-1".to_string(),
+            last_seen_sha: "sha-1".to_string(),
+            status: status.to_string(),
+            severity: severity.to_string(),
+            finding_kind: "correctness".to_string(),
+            path: "src/task.rs".to_string(),
+            line: Some(42),
+            body: "task ownership is wrong here".to_string(),
+            evidence_note: None,
+            github_comment_id: None,
+            resolved_by_sha: None,
+            resolution_reason: None,
+            created_at: "2026-03-30T00:00:00Z".to_string(),
+            updated_at: "2026-03-30T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn final_review_transcript_includes_pr_description() {
+        let pr = test_pull_request_with_body(Some(
+            "## Goal
+Ship the archive feature safely.",
+        ));
+        let transcript =
+            build_final_review_transcript("owner/repo", &pr, "merged", &[], &[], &[], &[], &[]);
+
+        assert!(transcript.contains("## PR Description"));
+        assert!(transcript.contains("> ## Goal"));
+        assert!(transcript.contains("> Ship the archive feature safely."));
+    }
+
+    #[test]
+    fn final_review_summary_prompt_carries_pr_description_through_transcript() {
+        let pr = test_pull_request_with_body(Some("Summarize this context too."));
+        let transcript =
+            build_final_review_transcript("owner/repo", &pr, "merged", &[], &[], &[], &[], &[]);
+        let prompt = build_final_review_summary_prompt("owner/repo", &pr, "merged", &transcript);
+
+        assert!(prompt.contains("Transcript:"));
+        assert!(prompt.contains("## PR Description"));
+        assert!(prompt.contains("> Summarize this context too."));
+    }
+
+    #[test]
+    fn final_review_transcript_includes_finding_resolution_state() {
+        let pr = test_pull_request_with_body(None);
+        let findings = vec![stored_finding("likely_fixed", "blocking", "fp-1")];
+        let transcript = build_final_review_transcript(
+            "owner/repo",
+            &pr,
+            "merged",
+            &[],
+            &[],
+            &[],
+            &[],
+            &findings,
+        );
+
+        assert!(transcript.contains("## Finding Resolution State"));
+        assert!(transcript.contains("[likely_fixed / blocking / correctness]"));
+    }
+
+    #[test]
+    fn summary_output_ignores_stderr_when_stdout_is_empty() {
+        let normalized = normalize_summary_output("", "claude diagnostic: auth warning");
+
+        assert!(normalized.is_none());
+    }
+
+    #[test]
+    fn summary_output_strips_fenced_stdout() {
+        let normalized = normalize_summary_output(
+            "```markdown
+Reviewed the archive flow.
+```",
+            "ignored warning",
+        )
+        .expect("stdout should be normalized");
+
+        assert_eq!(normalized, "Reviewed the archive flow.");
     }
 
     #[test]
@@ -2900,6 +3883,7 @@ mod tests {
             body: "Blocking: task ownership is wrong here".to_string(),
             evidence_note: None,
             severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::Correctness,
         };
 
         assert!(should_suppress_finding(&comment, "src/task.rs", &memory));
@@ -2929,6 +3913,7 @@ mod tests {
                 "new trigger path at src/task.rs:50 now routes cross-agent writes".to_string(),
             ),
             severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::Correctness,
         };
 
         assert!(!should_suppress_finding(&comment, "src/task.rs", &memory));
@@ -2942,6 +3927,7 @@ mod tests {
             body: "Blocking: this might be a problem later.".to_string(),
             evidence_note: None,
             severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::Correctness,
         };
 
         assert!(!blocker_has_sufficient_evidence(
@@ -2949,6 +3935,78 @@ mod tests {
             "src/task.rs",
             ConfidenceLevel::Low
         ));
+    }
+
+    #[test]
+    fn scope_drift_without_artifact_or_secret_risk_is_downgraded() {
+        let mut comment = ParsedReviewComment {
+            file: "src/cli.rs".to_string(),
+            line: 10,
+            body: "PR description does not mention this related CLI flag.".to_string(),
+            evidence_note: None,
+            severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::ScopeDrift,
+        };
+
+        apply_scope_drift_policy(&mut comment);
+
+        assert_eq!(comment.severity, CommentSeverity::Warning);
+    }
+
+    #[test]
+    fn scope_drift_with_generated_artifact_risk_stays_blocking() {
+        let mut comment = ParsedReviewComment {
+            file: "packages/app/.svelte-kit/generated/client/nodes/1.js".to_string(),
+            line: 1,
+            body: "Generated build artifacts are committed in an unrelated PR.".to_string(),
+            evidence_note: None,
+            severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::ScopeDrift,
+        };
+
+        apply_scope_drift_policy(&mut comment);
+
+        assert_eq!(comment.severity, CommentSeverity::Blocking);
+    }
+
+    #[test]
+    fn reconcile_marks_repeated_blocker_as_still_blocking() {
+        let fingerprint = finding_key("src/task.rs", Some(42), "task ownership is wrong here");
+        let stored = vec![stored_finding("open", "blocking", &fingerprint)];
+        let current = vec![PendingFinding {
+            fingerprint: fingerprint.clone(),
+            path: "src/task.rs".to_string(),
+            line: Some(42),
+            body: "task ownership is wrong here".to_string(),
+            evidence_note: None,
+            severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::Correctness,
+        }];
+        let memory = ReviewMemory::default();
+
+        let (updates, delta) =
+            reconcile_finding_ledger("owner/repo", 15, "sha-2", &stored, &current, &memory);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, "still_blocking");
+        assert_eq!(delta.still_blocking, 1);
+        assert!(build_finding_delta_summary(&delta)
+            .unwrap()
+            .contains("Still blocking: 1"));
+    }
+
+    #[test]
+    fn reconcile_marks_missing_open_finding_as_likely_fixed() {
+        let stored = vec![stored_finding("open", "blocking", "fp-1")];
+        let memory = ReviewMemory::default();
+
+        let (updates, delta) =
+            reconcile_finding_ledger("owner/repo", 15, "sha-2", &stored, &[], &memory);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, "likely_fixed");
+        assert_eq!(updates[0].resolved_by_sha.as_deref(), Some("sha-2"));
+        assert_eq!(delta.likely_fixed, 1);
     }
 
     #[test]
@@ -2980,9 +4038,11 @@ mod tests {
         let comment = ParsedReviewComment {
             file: "src/engine.rs".to_string(),
             line: 100,
-            body: "This will panic when the input is empty because unwrap() is called on None".to_string(),
+            body: "This will panic when the input is empty because unwrap() is called on None"
+                .to_string(),
             evidence_note: None,
             severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::Correctness,
         };
 
         assert!(blocker_has_sufficient_evidence(
@@ -3001,6 +4061,7 @@ mod tests {
             body: "This function will need refactoring eventually for maintainability.".to_string(),
             evidence_note: None,
             severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::Correctness,
         };
 
         assert!(!blocker_has_sufficient_evidence(
@@ -3018,6 +4079,7 @@ mod tests {
             body: "The default in src/config.rs contradicts the documented behavior".to_string(),
             evidence_note: None,
             severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::Correctness,
         };
 
         assert!(blocker_has_sufficient_evidence(
@@ -3035,6 +4097,7 @@ mod tests {
             body: "something vague".to_string(),
             evidence_note: Some("line 10 assigns None then unwraps at line 12".to_string()),
             severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::Correctness,
         };
 
         assert!(blocker_has_sufficient_evidence(
@@ -3052,6 +4115,7 @@ mod tests {
             body: "User input is interpolated directly into the query, creating a sql injection vector".to_string(),
             evidence_note: None,
             severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::Correctness,
         };
 
         assert!(blocker_has_sufficient_evidence(
@@ -3069,6 +4133,7 @@ mod tests {
             body: "This will panic and crash and burn".to_string(),
             evidence_note: None,
             severity: CommentSeverity::Blocking,
+            finding_kind: FindingKind::Correctness,
         };
 
         assert!(!blocker_has_sufficient_evidence(
@@ -3104,7 +4169,10 @@ mod tests {
     fn bot_mention_guard_checks_alias() {
         let history = "- [2026-03-30] NicholaiVogel: @PR-Reviewer-Ant please look again";
         let reply = build_direct_pushback_reply(history, "pr-reviewer", Some("PR-Reviewer-Ant"));
-        assert!(reply.is_none(), "should bail when human mentions the bot alias");
+        assert!(
+            reply.is_none(),
+            "should bail when human mentions the bot alias"
+        );
     }
 
     #[test]
@@ -3112,7 +4180,10 @@ mod tests {
         let history = "- [2026-03-30] PR-Reviewer-Ant: reviewed by @PR-Reviewer-Ant\n\
                         - [2026-03-30] NicholaiVogel: nah, out of scope";
         let reply = build_direct_pushback_reply(history, "pr-reviewer", Some("PR-Reviewer-Ant"));
-        assert!(reply.is_some(), "bot's own alias mention should not trigger the guard");
+        assert!(
+            reply.is_some(),
+            "bot's own alias mention should not trigger the guard"
+        );
     }
 
     // --- Regression tests: status precedence in build_review_memory ---
@@ -3143,9 +4214,30 @@ mod tests {
         // Simulates: reply #1 has rationale rejection, reply #2 is a soft dismissal.
         // Final status must be RejectedWithRationale (stronger), not DismissedByHuman.
         let review_comments = vec![
-            review_comment(1, None, "pr-reviewer", "src/task.rs", Some(10), "Bug: wrong logic here"),
-            review_comment(2, Some(1), "NicholaiVogel", "src/task.rs", Some(10), "this is a false positive, the spec requires this behavior"),
-            review_comment(3, Some(1), "AnotherDev", "src/task.rs", Some(10), "yeah just leave it, it's fine"),
+            review_comment(
+                1,
+                None,
+                "pr-reviewer",
+                "src/task.rs",
+                Some(10),
+                "Bug: wrong logic here",
+            ),
+            review_comment(
+                2,
+                Some(1),
+                "NicholaiVogel",
+                "src/task.rs",
+                Some(10),
+                "this is a false positive, the spec requires this behavior",
+            ),
+            review_comment(
+                3,
+                Some(1),
+                "AnotherDev",
+                "src/task.rs",
+                Some(10),
+                "yeah just leave it, it's fine",
+            ),
         ];
 
         let memory = build_review_memory(
@@ -3170,9 +4262,14 @@ mod tests {
 
     #[test]
     fn finding_on_unchanged_file_is_likely_addressed() {
-        let review_comments = vec![
-            review_comment(1, None, "pr-reviewer", "src/old.rs", Some(10), "Bug found here"),
-        ];
+        let review_comments = vec![review_comment(
+            1,
+            None,
+            "pr-reviewer",
+            "src/old.rs",
+            Some(10),
+            "Bug found here",
+        )];
 
         let memory = build_review_memory(
             &[],
@@ -3210,6 +4307,7 @@ mod tests {
             body: "Bug found here".to_string(),
             evidence_note: None,
             severity: CommentSeverity::Warning,
+            finding_kind: FindingKind::Correctness,
         };
 
         assert!(should_suppress_finding(&comment, "src/old.rs", &memory));
@@ -3263,7 +4361,10 @@ mod tests {
             "pr-reviewer",
             None,
         );
-        assert!(reply.is_none(), "neutral comments should not trigger a canned reply");
+        assert!(
+            reply.is_none(),
+            "neutral comments should not trigger a canned reply"
+        );
     }
 
     // --- Multi-bot safeguard tests ---
@@ -3280,7 +4381,10 @@ mod tests {
             login: "someone".to_string(),
             account_type: None,
         };
-        assert!(!unknown.is_bot(), "None account_type should not be treated as bot");
+        assert!(
+            !unknown.is_bot(),
+            "None account_type should not be treated as bot"
+        );
     }
 
     #[test]
@@ -3340,7 +4444,10 @@ mod tests {
         let history = "- [2026-03-30] pr-reviewer (bot): see @pr-reviewer docs for details\n\
                         - [2026-03-30] NicholaiVogel: this is out of scope for this PR";
         let reply = build_direct_pushback_reply(history, "pr-reviewer", None);
-        assert!(reply.is_some(), "should produce a pushback reply despite bot's own @mention");
+        assert!(
+            reply.is_some(),
+            "should produce a pushback reply despite bot's own @mention"
+        );
     }
 
     #[test]

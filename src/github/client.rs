@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
-use reqwest::header::{HeaderMap, ACCEPT, ETAG, IF_NONE_MATCH, USER_AGENT};
+use reqwest::header::{HeaderMap, ACCEPT, ETAG, IF_NONE_MATCH, LINK, USER_AGENT};
 use reqwest::{Client, Method};
 
 use crate::github::types::{
@@ -25,8 +25,12 @@ pub enum ListPullsResult {
     Updated {
         prs: Vec<PullRequest>,
         etag: Option<String>,
+        complete: bool,
     },
 }
+
+const OPEN_PRS_PAGE_SIZE: u32 = 100;
+const OPEN_PRS_MAX_PAGES: u32 = 10;
 
 #[derive(Clone)]
 pub struct GitHubClient {
@@ -71,43 +75,71 @@ impl GitHubClient {
         repo: &str,
         etag: Option<&str>,
     ) -> Result<ListPullsResult> {
-        let path = format!(
-            "/repos/{owner}/{repo}/pulls?state=open&sort=updated&direction=desc&per_page=50"
-        );
-        let mut req = self.request(Method::GET, &path);
-        if let Some(tag) = etag {
-            req = req.header(IF_NONE_MATCH, tag);
+        let mut all_prs = Vec::new();
+        let mut new_etag = etag.map(ToString::to_string);
+        let mut page = 1u32;
+
+        loop {
+            let path = format!(
+                "/repos/{owner}/{repo}/pulls?state=open&sort=updated&direction=desc&per_page={OPEN_PRS_PAGE_SIZE}&page={page}"
+            );
+            let mut req = self.request(Method::GET, &path);
+            if page == 1 {
+                if let Some(tag) = etag {
+                    req = req.header(IF_NONE_MATCH, tag);
+                }
+            }
+
+            let resp = req.send().await.context("GitHub list PR request failed")?;
+            self.update_rate_state(resp.headers());
+
+            if page == 1 {
+                new_etag = resp
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(ToString::to_string)
+                    .or_else(|| etag.map(ToString::to_string));
+
+                if resp.status().as_u16() == 304 {
+                    return Ok(ListPullsResult::NotModified { etag: new_etag });
+                }
+            }
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("GitHub list PRs failed ({status}): {body}"));
+            }
+
+            let has_next = response_has_next_page(resp.headers());
+            let batch = resp
+                .json::<Vec<PullRequest>>()
+                .await
+                .context("failed to decode PR list")?;
+            let batch_empty = batch.is_empty();
+            all_prs.extend(batch);
+
+            let truncated = has_next && !batch_empty && page >= OPEN_PRS_MAX_PAGES;
+            if truncated {
+                tracing::warn!(
+                    owner = owner,
+                    repo = repo,
+                    pr_count = all_prs.len(),
+                    "open PR pagination hit page cap; open-set finalization checks will stay conservative"
+                );
+            }
+
+            if !has_next || batch_empty || page >= OPEN_PRS_MAX_PAGES {
+                return Ok(ListPullsResult::Updated {
+                    prs: all_prs,
+                    etag: new_etag,
+                    complete: !truncated,
+                });
+            }
+
+            page += 1;
         }
-
-        let resp = req.send().await.context("GitHub list PR request failed")?;
-        self.update_rate_state(resp.headers());
-
-        let new_etag = resp
-            .headers()
-            .get(ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(ToString::to_string)
-            .or_else(|| etag.map(ToString::to_string));
-
-        if resp.status().as_u16() == 304 {
-            return Ok(ListPullsResult::NotModified { etag: new_etag });
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("GitHub list PRs failed ({status}): {body}"));
-        }
-
-        let prs = resp
-            .json::<Vec<PullRequest>>()
-            .await
-            .context("failed to decode PR list")?;
-
-        Ok(ListPullsResult::Updated {
-            prs,
-            etag: new_etag,
-        })
     }
 
     pub async fn get_pull_request(
@@ -169,11 +201,7 @@ impl GitHubClient {
                 .context("GitHub get PR files failed")?;
             self.update_rate_state(resp.headers());
 
-            let has_next = resp
-                .headers()
-                .get("link")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.contains("rel=\"next\""));
+            let has_next = response_has_next_page(resp.headers());
 
             let batch: Vec<PrFile> = handle_json(resp).await?;
             let batch_empty = batch.is_empty();
@@ -373,11 +401,7 @@ impl GitHubClient {
                 .context("GitHub get existing reviews failed")?;
             self.update_rate_state(resp.headers());
 
-            let has_next = resp
-                .headers()
-                .get("link")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.contains("rel=\"next\""));
+            let has_next = response_has_next_page(resp.headers());
 
             let batch: Vec<PullRequestReview> = handle_json(resp).await?;
             let batch_empty = batch.is_empty();
@@ -415,11 +439,7 @@ impl GitHubClient {
                 .context("GitHub get review comments failed")?;
             self.update_rate_state(resp.headers());
 
-            let has_next = resp
-                .headers()
-                .get("link")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.contains("rel=\"next\""));
+            let has_next = response_has_next_page(resp.headers());
 
             let batch: Vec<ReviewComment> = handle_json(resp).await?;
             let batch_empty = batch.is_empty();
@@ -452,11 +472,7 @@ impl GitHubClient {
                 .context("GitHub get issue comments failed")?;
             self.update_rate_state(resp.headers());
 
-            let has_next = resp
-                .headers()
-                .get("link")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.contains("rel=\"next\""));
+            let has_next = response_has_next_page(resp.headers());
 
             let batch: Vec<IssueComment> = handle_json(resp).await?;
             let batch_empty = batch.is_empty();
@@ -556,6 +572,13 @@ pub fn synthesize_diff_from_files(files: &[PrFile]) -> String {
     out
 }
 
+fn response_has_next_page(headers: &HeaderMap) -> bool {
+    headers
+        .get(LINK)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("rel=\"next\""))
+}
+
 async fn handle_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
     if !resp.status().is_success() {
         let status = resp.status();
@@ -588,6 +611,32 @@ mod tests {
             patch: patch.map(|s| s.to_string()),
             previous_filename: previous_filename.map(|s| s.to_string()),
         }
+    }
+
+    #[test]
+    fn detects_next_page_link_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LINK,
+            r#"<https://api.github.com/repositories/1/pulls?page=2>; rel="next", <https://api.github.com/repositories/1/pulls?page=10>; rel="last""#
+                .parse()
+                .expect("valid link header"),
+        );
+
+        assert!(response_has_next_page(&headers));
+    }
+
+    #[test]
+    fn no_next_page_without_next_relation() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LINK,
+            r#"<https://api.github.com/repositories/1/pulls?page=1>; rel="prev""#
+                .parse()
+                .expect("valid link header"),
+        );
+
+        assert!(!response_has_next_page(&headers));
     }
 
     #[test]

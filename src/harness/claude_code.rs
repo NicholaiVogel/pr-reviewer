@@ -16,6 +16,10 @@ impl Harness for ClaudeCodeHarness {
         "claude-code"
     }
 
+    fn executable(&self) -> &'static str {
+        "claude"
+    }
+
     fn build_command(
         &self,
         _prompt: &str,

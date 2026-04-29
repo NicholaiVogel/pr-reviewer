@@ -16,6 +16,10 @@ impl Harness for OpencodeHarness {
         "opencode"
     }
 
+    fn executable(&self) -> &'static str {
+        "opencode"
+    }
+
     fn build_command(
         &self,
         prompt: &str,
