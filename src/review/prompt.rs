@@ -86,8 +86,12 @@ pub fn build_review_prompt(
     prompt.push_str("  - body: string (the finding)\n");
     prompt.push_str("  - evidence_note: optional string (required when re-raising a previously rebutted concern, briefly naming the new lines or changed path that justify reopening it)\n");
     prompt.push_str("  - severity: one of [\"blocking\", \"warning\", \"nitpick\"]\n");
+    prompt.push_str("  - finding_kind: one of [\"correctness\", \"security\", \"data_integrity\", \"race_condition\", \"breaking_change\", \"scope_drift\", \"generated_artifact\", \"secret_exposure\", \"local_environment_leak\", \"test_gap\", \"documentation\"]\n");
     prompt.push_str(
         "\nLine numbers must refer to changed lines in the current diff whenever possible.\n\n",
+    );
+    prompt.push_str(
+        "Scope/description drift is non-blocking by default. Mark it blocking only when it includes generated artifacts, secret names, local machine paths, unrelated production code, or security/data exposure.\n\n",
     );
 
     prompt.push_str("Example output:\n");
@@ -104,7 +108,7 @@ pub fn build_review_prompt(
     prompt.push_str("  },\n");
     prompt.push_str("  \"ui_screenshot_needed\": false,\n");
     prompt.push_str("  \"comments\": [\n");
-    prompt.push_str("    {\"file\": \"src/auth.rs\", \"line\": 41, \"body\": \"Potential SQL injection when interpolating user input into query string.\", \"severity\": \"blocking\"}\n");
+    prompt.push_str("    {\"file\": \"src/auth.rs\", \"line\": 41, \"body\": \"Potential SQL injection when interpolating user input into query string.\", \"severity\": \"blocking\", \"finding_kind\": \"security\"}\n");
     prompt.push_str("  ]\n");
     prompt.push_str("}\n");
     prompt.push_str("```\n\n");

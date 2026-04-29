@@ -73,6 +73,45 @@ pub struct ReviewAttemptRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct ReviewFindingRecord {
+    pub repo: String,
+    pub pr_number: i64,
+    pub fingerprint: String,
+    pub first_sha: String,
+    pub last_seen_sha: String,
+    pub status: String,
+    pub severity: String,
+    pub finding_kind: String,
+    pub path: String,
+    pub line: Option<i64>,
+    pub body: String,
+    pub evidence_note: Option<String>,
+    pub github_comment_id: Option<i64>,
+    pub resolved_by_sha: Option<String>,
+    pub resolution_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewFindingUpsert {
+    pub repo: String,
+    pub pr_number: i64,
+    pub fingerprint: String,
+    pub sha: String,
+    pub status: String,
+    pub severity: String,
+    pub finding_kind: String,
+    pub path: String,
+    pub line: Option<i64>,
+    pub body: String,
+    pub evidence_note: Option<String>,
+    pub github_comment_id: Option<i64>,
+    pub resolved_by_sha: Option<String>,
+    pub resolution_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct PendingFinalization {
     pub pr_number: i64,
     pub last_reviewed_sha: String,
@@ -228,6 +267,27 @@ impl Database {
                     PRIMARY KEY (repo, pr_number)
                 );
 
+                CREATE TABLE IF NOT EXISTS review_findings (
+                    repo TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    first_sha TEXT NOT NULL,
+                    last_seen_sha TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    finding_kind TEXT NOT NULL DEFAULT 'correctness',
+                    path TEXT NOT NULL,
+                    line INTEGER,
+                    body TEXT NOT NULL,
+                    evidence_note TEXT,
+                    github_comment_id INTEGER,
+                    resolved_by_sha TEXT,
+                    resolution_reason TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    PRIMARY KEY (repo, pr_number, fingerprint)
+                );
+
                 CREATE TABLE IF NOT EXISTS daemon_state (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     started_at TEXT,
@@ -255,6 +315,12 @@ impl Database {
             ensure_column_exists(conn, "daemon_state", "started_at", "TEXT")?;
             ensure_column_exists(conn, "daemon_state", "rate_limit_total", "INTEGER")?;
             ensure_column_exists(conn, "daemon_state", "rate_reset_epoch", "INTEGER")?;
+            ensure_column_exists(
+                conn,
+                "review_findings",
+                "finding_kind",
+                "TEXT NOT NULL DEFAULT 'correctness'",
+            )?;
 
             // Reply deduplication: prevents replying to the same comment twice
             conn.execute_batch(
@@ -471,6 +537,112 @@ impl Database {
         .await
     }
 
+    pub async fn list_review_findings(
+        &self,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<Vec<ReviewFindingRecord>> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT repo, pr_number, fingerprint, first_sha, last_seen_sha, status, severity,
+                       finding_kind, path, line, body, evidence_note, github_comment_id,
+                       resolved_by_sha, resolution_reason, created_at, updated_at
+                  FROM review_findings
+                 WHERE repo = ?1 AND pr_number = ?2
+                 ORDER BY updated_at ASC, rowid ASC
+                "#,
+            )?;
+            let rows = stmt.query_map(params![repo, pr_number], |row| {
+                Ok(ReviewFindingRecord {
+                    repo: row.get(0)?,
+                    pr_number: row.get(1)?,
+                    fingerprint: row.get(2)?,
+                    first_sha: row.get(3)?,
+                    last_seen_sha: row.get(4)?,
+                    status: row.get(5)?,
+                    severity: row.get(6)?,
+                    finding_kind: row.get(7)?,
+                    path: row.get(8)?,
+                    line: row.get(9)?,
+                    body: row.get(10)?,
+                    evidence_note: row.get(11)?,
+                    github_comment_id: row.get(12)?,
+                    resolved_by_sha: row.get(13)?,
+                    resolution_reason: row.get(14)?,
+                    created_at: row.get(15)?,
+                    updated_at: row.get(16)?,
+                })
+            })?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub async fn upsert_review_findings(&self, findings: Vec<ReviewFindingUpsert>) -> Result<()> {
+        self.run(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    r#"
+                    INSERT INTO review_findings (
+                        repo, pr_number, fingerprint, first_sha, last_seen_sha, status, severity,
+                        finding_kind, path, line, body, evidence_note, github_comment_id,
+                        resolved_by_sha, resolution_reason, created_at, updated_at
+                    )
+                    VALUES (
+                        ?1, ?2, ?3, ?4, ?4, ?5, ?6,
+                        ?7, ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14, datetime('now'), datetime('now')
+                    )
+                    ON CONFLICT(repo, pr_number, fingerprint) DO UPDATE SET
+                        last_seen_sha = excluded.last_seen_sha,
+                        status = excluded.status,
+                        severity = excluded.severity,
+                        finding_kind = excluded.finding_kind,
+                        path = excluded.path,
+                        line = excluded.line,
+                        body = excluded.body,
+                        evidence_note = excluded.evidence_note,
+                        github_comment_id = COALESCE(excluded.github_comment_id, review_findings.github_comment_id),
+                        resolved_by_sha = excluded.resolved_by_sha,
+                        resolution_reason = excluded.resolution_reason,
+                        updated_at = datetime('now')
+                    "#,
+                )?;
+
+                for finding in findings {
+                    stmt.execute(params![
+                        finding.repo,
+                        finding.pr_number,
+                        finding.fingerprint,
+                        finding.sha,
+                        finding.status,
+                        finding.severity,
+                        finding.finding_kind,
+                        finding.path,
+                        finding.line,
+                        finding.body,
+                        finding.evidence_note,
+                        finding.github_comment_id,
+                        finding.resolved_by_sha,
+                        finding.resolution_reason,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn get_pr_state(&self, repo: &str, pr_number: i64) -> Result<Option<PrState>> {
         let repo = repo.to_string();
 
@@ -552,12 +724,7 @@ impl Database {
 
     /// Attempt to claim a reply slot for a comment. Returns true if this is the
     /// first reply (inserted), false if we already replied (unique constraint).
-    pub async fn claim_reply(
-        &self,
-        repo: &str,
-        pr_number: i64,
-        comment_id: i64,
-    ) -> Result<bool> {
+    pub async fn claim_reply(&self, repo: &str, pr_number: i64, comment_id: i64) -> Result<bool> {
         let repo = repo.to_string();
         self.run(move |conn| {
             let result = conn.execute(
@@ -1097,6 +1264,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_findings_round_trip_and_update_resolution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        db.upsert_review_findings(vec![ReviewFindingUpsert {
+            repo: "o/r".to_string(),
+            pr_number: 7,
+            fingerprint: "fp-1".to_string(),
+            sha: "sha-1".to_string(),
+            status: "open".to_string(),
+            severity: "blocking".to_string(),
+            finding_kind: "data_integrity".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: Some(42),
+            body: "drops data".to_string(),
+            evidence_note: Some("line 42".to_string()),
+            github_comment_id: None,
+            resolved_by_sha: None,
+            resolution_reason: None,
+        }])
+        .await
+        .expect("insert finding");
+
+        db.upsert_review_findings(vec![ReviewFindingUpsert {
+            repo: "o/r".to_string(),
+            pr_number: 7,
+            fingerprint: "fp-1".to_string(),
+            sha: "sha-2".to_string(),
+            status: "likely_fixed".to_string(),
+            severity: "blocking".to_string(),
+            finding_kind: "data_integrity".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: Some(42),
+            body: "drops data".to_string(),
+            evidence_note: Some("line 42".to_string()),
+            github_comment_id: None,
+            resolved_by_sha: Some("sha-2".to_string()),
+            resolution_reason: Some("not re-emitted".to_string()),
+        }])
+        .await
+        .expect("update finding");
+
+        let findings = db
+            .list_review_findings("o/r", 7)
+            .await
+            .expect("list findings");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].first_sha, "sha-1");
+        assert_eq!(findings[0].last_seen_sha, "sha-2");
+        assert_eq!(findings[0].status, "likely_fixed");
+        assert_eq!(findings[0].resolved_by_sha.as_deref(), Some("sha-2"));
+    }
+
+    #[tokio::test]
     async fn pending_finalization_clears_once_review_archive_is_saved() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::new(dir.path().join("state.db"))
@@ -1218,9 +1441,19 @@ mod tests {
         };
 
         assert!(db.claim_review(first).await.expect("claim first"));
-        db.complete_review("attempt-1", 1, Some("COMMENT"), 1.5, 1, 10, None, None, None)
-            .await
-            .expect("complete first");
+        db.complete_review(
+            "attempt-1",
+            1,
+            Some("COMMENT"),
+            1.5,
+            1,
+            10,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("complete first");
         assert!(db.claim_review(second).await.expect("claim second"));
         db.fail_review("attempt-2", "timeout", 2.0)
             .await
@@ -1346,7 +1579,10 @@ mod tests {
             .expect("fail");
 
         // failed entries are terminal for the same PR/SHA/harness unless --force deletes them
-        assert!(!db.claim_review(claim.clone()).await.expect("blocked after failure"));
+        assert!(!db
+            .claim_review(claim.clone())
+            .await
+            .expect("blocked after failure"));
 
         let deleted = db
             .delete_review_claim("retry-after-fail")
@@ -1354,7 +1590,10 @@ mod tests {
             .expect("delete failed claim");
         assert_eq!(deleted.as_deref(), Some("failed"));
 
-        assert!(db.claim_review(claim).await.expect("reclaim after force delete"));
+        assert!(db
+            .claim_review(claim)
+            .await
+            .expect("reclaim after force delete"));
     }
 
     #[tokio::test]
@@ -1374,9 +1613,19 @@ mod tests {
         };
 
         assert!(db.claim_review(claim.clone()).await.expect("claim"));
-        db.complete_review("no-retry-completed", 2, Some("COMMENT"), 5.0, 2, 100, None, None, None)
-            .await
-            .expect("complete");
+        db.complete_review(
+            "no-retry-completed",
+            2,
+            Some("COMMENT"),
+            5.0,
+            2,
+            100,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("complete");
 
         // completed entries must not be reclaimed
         assert!(!db.claim_review(claim).await.expect("blocked by completed"));
