@@ -327,6 +327,7 @@ impl Database {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     repo TEXT NOT NULL,
                     fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'opened',
                     mode TEXT NOT NULL,
                     branch TEXT NOT NULL,
                     pr_url TEXT NOT NULL,
@@ -359,6 +360,12 @@ impl Database {
             )?;
             ensure_column_exists(conn, "review_findings", "author", "TEXT")?;
             ensure_column_exists(conn, "review_findings", "recurrence_fingerprint", "TEXT")?;
+            ensure_column_exists(
+                conn,
+                "instruction_suggestion_prs",
+                "status",
+                "TEXT NOT NULL DEFAULT 'opened'",
+            )?;
 
             // Reply deduplication: prevents replying to the same comment twice
             conn.execute_batch(
@@ -874,9 +881,10 @@ impl Database {
             conn.execute(
                 r#"
                 INSERT INTO instruction_suggestion_prs
-                  (repo, fingerprint, mode, branch, pr_url)
-                VALUES (?1, ?2, ?3, ?4, ?5)
+                  (repo, fingerprint, status, mode, branch, pr_url)
+                VALUES (?1, ?2, 'opened', ?3, ?4, ?5)
                 ON CONFLICT(repo, fingerprint) DO UPDATE SET
+                  status='opened',
                   mode=excluded.mode,
                   branch=excluded.branch,
                   pr_url=excluded.pr_url
@@ -902,13 +910,42 @@ impl Database {
             conn.execute(
                 r#"
                 INSERT INTO instruction_suggestion_prs
-                  (repo, fingerprint, mode, branch, pr_url)
-                VALUES (?1, ?2, ?3, '', '')
+                  (repo, fingerprint, status, mode, branch, pr_url)
+                VALUES (?1, ?2, 'claimed', ?3, '', '')
                 ON CONFLICT(repo, fingerprint) DO NOTHING
                 "#,
                 params![repo, fingerprint, mode],
             )?;
             Ok(conn.changes() > 0)
+        })
+        .await
+    }
+
+    pub async fn record_instruction_suggestion_already_present(
+        &self,
+        repo: &str,
+        fingerprint: &str,
+        mode: &str,
+    ) -> Result<()> {
+        let repo = repo.to_string();
+        let fingerprint = fingerprint.to_string();
+        let mode = mode.to_string();
+
+        self.run(move |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO instruction_suggestion_prs
+                  (repo, fingerprint, status, mode, branch, pr_url)
+                VALUES (?1, ?2, 'already_present', ?3, 'already-present', 'already-present')
+                ON CONFLICT(repo, fingerprint) DO UPDATE SET
+                  status='already_present',
+                  mode=excluded.mode,
+                  branch=excluded.branch,
+                  pr_url=excluded.pr_url
+                "#,
+                params![repo, fingerprint, mode],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -927,8 +964,7 @@ impl Database {
                 DELETE FROM instruction_suggestion_prs
                 WHERE repo = ?1
                   AND fingerprint = ?2
-                  AND branch = ''
-                  AND pr_url = ''
+                  AND status = 'claimed'
                 "#,
                 params![repo, fingerprint],
             )?;
@@ -1958,6 +1994,15 @@ mod tests {
             .claim_instruction_suggestion_pr("o/r", "panic-empty-input", "conservative")
             .await
             .expect("duplicate claim"));
+        let conn = open_conn(db.path()).expect("open db");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM instruction_suggestion_prs WHERE repo = ?1 AND fingerprint = ?2",
+                params!["o/r", "panic-empty-input"],
+                |row| row.get(0),
+            )
+            .expect("claim status");
+        assert_eq!(status, "claimed");
         assert!(db
             .recurring_finding_candidates("o/r", 2, 10)
             .await
@@ -1979,23 +2024,30 @@ mod tests {
             .claim_instruction_suggestion_pr("o/r", "panic-empty-input", "conservative")
             .await
             .expect("claim again"));
-        db.record_instruction_suggestion_pr(
+        db.record_instruction_suggestion_already_present(
             "o/r",
             "panic-empty-input",
             "conservative",
-            "pr-reviewer/recurring-guardrail",
-            "https://github.com/o/r/pull/3",
         )
         .await
-        .expect("record pr");
+        .expect("record already present");
         db.release_instruction_suggestion_claim("o/r", "panic-empty-input")
             .await
-            .expect("release completed record is a no-op");
+            .expect("release already-present is a no-op");
         assert!(db
             .recurring_finding_candidates("o/r", 2, 10)
             .await
-            .expect("candidate after record")
+            .expect("candidate after already-present record")
             .is_empty());
+        let conn = open_conn(db.path()).expect("open db");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM instruction_suggestion_prs WHERE repo = ?1 AND fingerprint = ?2",
+                params!["o/r", "panic-empty-input"],
+                |row| row.get(0),
+            )
+            .expect("already-present status");
+        assert_eq!(status, "already_present");
     }
 
     #[tokio::test]

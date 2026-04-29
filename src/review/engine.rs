@@ -1426,6 +1426,13 @@ impl ReviewEngine {
                     );
                 }
                 Ok(None) => {
+                    self.db
+                        .record_instruction_suggestion_already_present(
+                            &repo_name,
+                            &candidate.fingerprint,
+                            &config.mode.to_string(),
+                        )
+                        .await?;
                     tracing::info!(
                         repo = %repo_name,
                         fingerprint = %candidate.fingerprint,
