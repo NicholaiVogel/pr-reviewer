@@ -148,6 +148,29 @@ pr-reviewer config set defaults.max_prompt_bytes 307200   # 300KB
 
 ---
 
+## `[instruction_prs]`
+
+Controls whether pr-reviewer turns repeated review findings into AGENTS.md guardrail PRs. This is disabled by default.
+
+```toml
+[instruction_prs]
+enabled = false
+mode = "conservative" # conservative | broad
+min_distinct_prs = 2
+branch_prefix = "pr-reviewer/agents-guardrail"
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | If `true`, recurring reviewer findings can open a real PR against `AGENTS.md`. |
+| `mode` | `conservative` | `conservative` adds a small guardrail entry. `broad` writes a larger section entry that can cover documentation drift and stale repo guidance. |
+| `min_distinct_prs` | `2` | Minimum number of distinct PRs where the same finding must appear before a suggestion PR is opened. The same author across unrelated PRs still counts. |
+| `branch_prefix` | `pr-reviewer/agents-guardrail` | Prefix for generated suggestion branches. |
+
+Only pr-reviewer's own posted findings are tracked. Findings suppressed by prior-review memory, human pushback, or duplicate detection are not counted, and repeated examples inside a single PR do not trigger a suggestion by themselves.
+
+---
+
 ## `[[repos]]`
 
 Per-repo configuration. Each `[[repos]]` block in the TOML array adds one repo to the watch list. All fields except `owner` and `name` are optional and override the global defaults.

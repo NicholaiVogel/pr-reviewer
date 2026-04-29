@@ -6,8 +6,10 @@ use reqwest::header::{HeaderMap, ACCEPT, ETAG, IF_NONE_MATCH, LINK, USER_AGENT};
 use reqwest::{Client, Method};
 
 use crate::github::types::{
-    ContentResponse, CreateIssueCommentRequest, CreateReplyRequest, CreateReviewRequest,
-    IssueComment, PrFile, PullRequest, PullRequestReview, ReviewComment,
+    ContentResponse, CreateIssueCommentRequest, CreatePullRequestRequest,
+    CreatePullRequestResponse, CreateRefRequest, CreateReplyRequest, CreateReviewRequest,
+    GitRefResponse, IssueComment, PrFile, PullRequest, PullRequestReview, ReviewComment,
+    UpdateContentRequest,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -300,6 +302,173 @@ impl GitHubClient {
             .context("failed to decode base64 file payload")?;
         let text = String::from_utf8_lossy(&bytes).to_string();
         Ok(Some(text))
+    }
+
+    pub async fn get_file_content_with_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<Option<(String, String)>> {
+        let encoded_path = path
+            .split('/')
+            .map(urlencoding::encode)
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+        let endpoint = format!("/repos/{owner}/{repo}/contents/{encoded_path}?ref={reference}");
+        let resp = self
+            .request(Method::GET, &endpoint)
+            .send()
+            .await
+            .context("GitHub get file content failed")?;
+        self.update_rate_state(resp.headers());
+
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("GitHub get file content failed ({status}): {body}"));
+        }
+
+        let payload = resp
+            .json::<ContentResponse>()
+            .await
+            .context("invalid content payload")?;
+
+        if payload.encoding != "base64" {
+            return Ok(None);
+        }
+
+        let sha = payload
+            .sha
+            .ok_or_else(|| anyhow!("GitHub content payload missing sha for {path}"))?;
+        let cleaned = payload.content.replace('\n', "");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(cleaned)
+            .context("failed to decode base64 file payload")?;
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        Ok(Some((text, sha)))
+    }
+
+    pub async fn get_branch_head_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<String> {
+        let encoded_branch = urlencoding::encode(branch);
+        let path = format!("/repos/{owner}/{repo}/git/ref/heads/{encoded_branch}");
+        let resp = self
+            .request(Method::GET, &path)
+            .send()
+            .await
+            .context("GitHub get branch ref failed")?;
+        self.update_rate_state(resp.headers());
+        let payload: GitRefResponse = handle_json(resp).await?;
+        Ok(payload.object.sha)
+    }
+
+    pub async fn create_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        sha: &str,
+    ) -> Result<()> {
+        let path = format!("/repos/{owner}/{repo}/git/refs");
+        let payload = CreateRefRequest {
+            ref_name: format!("refs/heads/{branch}"),
+            sha: sha.to_string(),
+        };
+        let resp = self
+            .request(Method::POST, &path)
+            .json(&payload)
+            .send()
+            .await
+            .context("GitHub create branch failed")?;
+        self.update_rate_state(resp.headers());
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("GitHub create branch failed ({status}): {body}"));
+        }
+
+        Ok(())
+    }
+
+    pub async fn update_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        branch: &str,
+        message: &str,
+        content: &str,
+        sha: Option<&str>,
+    ) -> Result<()> {
+        let encoded_path = path
+            .split('/')
+            .map(urlencoding::encode)
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+        let endpoint = format!("/repos/{owner}/{repo}/contents/{encoded_path}");
+        let payload = UpdateContentRequest {
+            message: message.to_string(),
+            content: base64::engine::general_purpose::STANDARD.encode(content),
+            branch: branch.to_string(),
+            sha: sha.map(ToString::to_string),
+        };
+        let resp = self
+            .request(Method::PUT, &endpoint)
+            .json(&payload)
+            .send()
+            .await
+            .context("GitHub update file content failed")?;
+        self.update_rate_state(resp.headers());
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "GitHub update file content failed ({status}): {body}"
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub async fn create_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<String> {
+        let path = format!("/repos/{owner}/{repo}/pulls");
+        let payload = CreatePullRequestRequest {
+            title: title.to_string(),
+            body: body.to_string(),
+            head: head.to_string(),
+            base: base.to_string(),
+        };
+        let resp = self
+            .request(Method::POST, &path)
+            .json(&payload)
+            .send()
+            .await
+            .context("GitHub create pull request failed")?;
+        self.update_rate_state(resp.headers());
+        let payload: CreatePullRequestResponse = handle_json(resp).await?;
+        Ok(payload.html_url)
     }
 
     pub async fn create_review(
