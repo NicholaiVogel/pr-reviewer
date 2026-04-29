@@ -873,11 +873,64 @@ impl Database {
         self.run(move |conn| {
             conn.execute(
                 r#"
-                INSERT OR IGNORE INTO instruction_suggestion_prs
+                INSERT INTO instruction_suggestion_prs
                   (repo, fingerprint, mode, branch, pr_url)
                 VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(repo, fingerprint) DO UPDATE SET
+                  mode=excluded.mode,
+                  branch=excluded.branch,
+                  pr_url=excluded.pr_url
                 "#,
                 params![repo, fingerprint, mode, branch, pr_url],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn claim_instruction_suggestion_pr(
+        &self,
+        repo: &str,
+        fingerprint: &str,
+        mode: &str,
+    ) -> Result<bool> {
+        let repo = repo.to_string();
+        let fingerprint = fingerprint.to_string();
+        let mode = mode.to_string();
+
+        self.run(move |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO instruction_suggestion_prs
+                  (repo, fingerprint, mode, branch, pr_url)
+                VALUES (?1, ?2, ?3, '', '')
+                ON CONFLICT(repo, fingerprint) DO NOTHING
+                "#,
+                params![repo, fingerprint, mode],
+            )?;
+            Ok(conn.changes() > 0)
+        })
+        .await
+    }
+
+    pub async fn release_instruction_suggestion_claim(
+        &self,
+        repo: &str,
+        fingerprint: &str,
+    ) -> Result<()> {
+        let repo = repo.to_string();
+        let fingerprint = fingerprint.to_string();
+
+        self.run(move |conn| {
+            conn.execute(
+                r#"
+                DELETE FROM instruction_suggestion_prs
+                WHERE repo = ?1
+                  AND fingerprint = ?2
+                  AND branch = ''
+                  AND pr_url = ''
+                "#,
+                params![repo, fingerprint],
             )?;
             Ok(())
         })
@@ -1851,6 +1904,98 @@ mod tests {
             .expect("candidates");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].distinct_prs, 2);
+    }
+
+    #[tokio::test]
+    async fn instruction_suggestion_claim_blocks_duplicate_candidates_until_released() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let base = ReviewFindingUpsert {
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            author: Some("alice".to_string()),
+            fingerprint: "panic-empty-input-1".to_string(),
+            recurrence_fingerprint: Some("panic-empty-input".to_string()),
+            sha: "abc".to_string(),
+            status: "open".to_string(),
+            finding_kind: "correctness".to_string(),
+            body: "Empty input can panic".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: Some(10),
+            severity: "blocking".to_string(),
+            evidence_note: None,
+            github_comment_id: None,
+            resolved_by_sha: None,
+            resolution_reason: None,
+        };
+
+        db.upsert_review_findings(vec![
+            base.clone(),
+            ReviewFindingUpsert {
+                pr_number: 2,
+                fingerprint: "panic-empty-input-2".to_string(),
+                sha: "def".to_string(),
+                ..base
+            },
+        ])
+        .await
+        .expect("record recurring finding");
+
+        let candidates = db
+            .recurring_finding_candidates("o/r", 2, 10)
+            .await
+            .expect("candidate before claim");
+        assert_eq!(candidates.len(), 1);
+
+        assert!(db
+            .claim_instruction_suggestion_pr("o/r", "panic-empty-input", "conservative")
+            .await
+            .expect("claim"));
+        assert!(!db
+            .claim_instruction_suggestion_pr("o/r", "panic-empty-input", "conservative")
+            .await
+            .expect("duplicate claim"));
+        assert!(db
+            .recurring_finding_candidates("o/r", 2, 10)
+            .await
+            .expect("candidate after claim")
+            .is_empty());
+
+        db.release_instruction_suggestion_claim("o/r", "panic-empty-input")
+            .await
+            .expect("release");
+        assert_eq!(
+            db.recurring_finding_candidates("o/r", 2, 10)
+                .await
+                .expect("candidate after release")
+                .len(),
+            1
+        );
+
+        assert!(db
+            .claim_instruction_suggestion_pr("o/r", "panic-empty-input", "conservative")
+            .await
+            .expect("claim again"));
+        db.record_instruction_suggestion_pr(
+            "o/r",
+            "panic-empty-input",
+            "conservative",
+            "pr-reviewer/recurring-guardrail",
+            "https://github.com/o/r/pull/3",
+        )
+        .await
+        .expect("record pr");
+        db.release_instruction_suggestion_claim("o/r", "panic-empty-input")
+            .await
+            .expect("release completed record is a no-op");
+        assert!(db
+            .recurring_finding_candidates("o/r", 2, 10)
+            .await
+            .expect("candidate after record")
+            .is_empty());
     }
 
     #[tokio::test]

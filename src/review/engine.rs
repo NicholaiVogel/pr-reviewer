@@ -1381,6 +1381,23 @@ impl ReviewEngine {
             .await?;
 
         for candidate in candidates {
+            let claimed = self
+                .db
+                .claim_instruction_suggestion_pr(
+                    &repo_name,
+                    &candidate.fingerprint,
+                    &config.mode.to_string(),
+                )
+                .await?;
+            if !claimed {
+                tracing::info!(
+                    repo = %repo_name,
+                    fingerprint = %candidate.fingerprint,
+                    "recurring finding instruction PR already claimed"
+                );
+                continue;
+            }
+
             match open_instruction_pr(
                 &self.github,
                 repo_cfg,
@@ -1416,6 +1433,18 @@ impl ReviewEngine {
                     );
                 }
                 Err(err) => {
+                    if let Err(release_err) = self
+                        .db
+                        .release_instruction_suggestion_claim(&repo_name, &candidate.fingerprint)
+                        .await
+                    {
+                        tracing::warn!(
+                            repo = %repo_name,
+                            fingerprint = %candidate.fingerprint,
+                            error = %release_err,
+                            "failed to release recurring finding instruction PR claim"
+                        );
+                    }
                     tracing::warn!(
                         repo = %repo_name,
                         fingerprint = %candidate.fingerprint,
