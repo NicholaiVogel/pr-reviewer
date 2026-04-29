@@ -1085,7 +1085,7 @@ impl ReviewEngine {
             post_result
         };
 
-        let findings_visible_to_github = post_result.is_ok() || used_retry;
+        let findings_visible_to_github = post_result.is_ok();
         if let Err(err) = post_result {
             let fallback = truncate_github_comment_body(&format!(
                 "Review post failed; fallback summary posted.\n\nError: {err}\n\n{body}"
@@ -1098,6 +1098,20 @@ impl ReviewEngine {
                 &fallback,
             )
             .await?;
+        }
+
+        if findings_visible_to_github {
+            self.db
+                .mark_review_findings_posted(
+                    &repo_name,
+                    pr_data.number as i64,
+                    &pr_data.head.sha,
+                    pending_findings
+                        .iter()
+                        .map(|finding| finding.fingerprint.clone())
+                        .collect(),
+                )
+                .await?;
         }
 
         // When 422 retry posted comments in the body instead of inline, record 0 inline comments.

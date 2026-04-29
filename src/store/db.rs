@@ -306,6 +306,7 @@ impl Database {
                     body TEXT NOT NULL,
                     evidence_note TEXT,
                     github_comment_id INTEGER,
+                    posted_at TEXT,
                     resolved_by_sha TEXT,
                     resolution_reason TEXT,
                     created_at TEXT DEFAULT (datetime('now')),
@@ -360,6 +361,7 @@ impl Database {
             )?;
             ensure_column_exists(conn, "review_findings", "author", "TEXT")?;
             ensure_column_exists(conn, "review_findings", "recurrence_fingerprint", "TEXT")?;
+            ensure_column_exists(conn, "review_findings", "posted_at", "TEXT")?;
             ensure_column_exists(
                 conn,
                 "instruction_suggestion_prs",
@@ -697,6 +699,44 @@ impl Database {
         .await
     }
 
+    pub async fn mark_review_findings_posted(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        sha: &str,
+        fingerprints: Vec<String>,
+    ) -> Result<()> {
+        if fingerprints.is_empty() {
+            return Ok(());
+        }
+
+        let repo = repo.to_string();
+        let sha = sha.to_string();
+
+        self.run(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    r#"
+                    UPDATE review_findings
+                    SET posted_at = COALESCE(posted_at, datetime('now')),
+                        updated_at = datetime('now')
+                    WHERE repo = ?1
+                      AND pr_number = ?2
+                      AND last_seen_sha = ?3
+                      AND fingerprint = ?4
+                    "#,
+                )?;
+                for fingerprint in fingerprints {
+                    stmt.execute(params![repo, pr_number, sha, fingerprint])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn get_pr_state(&self, repo: &str, pr_number: i64) -> Result<Option<PrState>> {
         let repo = repo.to_string();
 
@@ -797,6 +837,7 @@ impl Database {
                 FROM review_findings f
                 WHERE f.repo = ?1
                   AND f.status IN ('open', 'still_blocking')
+                  AND f.posted_at IS NOT NULL
                   AND NOT EXISTS (
                     SELECT 1
                     FROM instruction_suggestion_prs p
@@ -829,6 +870,7 @@ impl Database {
                     WHERE repo = ?1
                       AND COALESCE(recurrence_fingerprint, fingerprint) = ?2
                       AND status IN ('open', 'still_blocking')
+                      AND posted_at IS NOT NULL
                     ORDER BY updated_at DESC
                     LIMIT 4
                     "#,
@@ -1921,6 +1963,9 @@ mod tests {
         ])
         .await
         .expect("record same pr twice");
+        db.mark_review_findings_posted("o/r", 1, "def", vec!["panic-empty-input".to_string()])
+            .await
+            .expect("mark same pr finding posted");
         assert!(db
             .recurring_finding_candidates("o/r", 2, 10)
             .await
@@ -1934,6 +1979,14 @@ mod tests {
         }])
         .await
         .expect("record second pr");
+        assert!(db
+            .recurring_finding_candidates("o/r", 2, 10)
+            .await
+            .expect("unposted second pr is ignored")
+            .is_empty());
+        db.mark_review_findings_posted("o/r", 2, "ghi", vec!["panic-empty-input".to_string()])
+            .await
+            .expect("mark second pr finding posted");
         let candidates = db
             .recurring_finding_candidates("o/r", 2, 10)
             .await
@@ -1979,6 +2032,12 @@ mod tests {
         ])
         .await
         .expect("record recurring finding");
+        db.mark_review_findings_posted("o/r", 1, "abc", vec!["panic-empty-input-1".to_string()])
+            .await
+            .expect("mark first finding posted");
+        db.mark_review_findings_posted("o/r", 2, "def", vec!["panic-empty-input-2".to_string()])
+            .await
+            .expect("mark second finding posted");
 
         let candidates = db
             .recurring_finding_candidates("o/r", 2, 10)
