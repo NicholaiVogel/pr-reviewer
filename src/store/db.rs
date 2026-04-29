@@ -39,6 +39,25 @@ pub struct ReviewClaim {
 }
 
 #[derive(Debug, Clone)]
+pub struct RecurringFindingExample {
+    pub pr_number: i64,
+    pub author: String,
+    pub path: String,
+    pub line: Option<i64>,
+    pub severity: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecurringFindingCandidate {
+    pub fingerprint: String,
+    pub summary: String,
+    pub distinct_prs: i64,
+    pub distinct_authors: i64,
+    pub examples: Vec<RecurringFindingExample>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReviewLogEntry {
     pub id: i64,
     pub repo: String,
@@ -76,7 +95,9 @@ pub struct ReviewAttemptRecord {
 pub struct ReviewFindingRecord {
     pub repo: String,
     pub pr_number: i64,
+    pub author: Option<String>,
     pub fingerprint: String,
+    pub recurrence_fingerprint: Option<String>,
     pub first_sha: String,
     pub last_seen_sha: String,
     pub status: String,
@@ -97,7 +118,9 @@ pub struct ReviewFindingRecord {
 pub struct ReviewFindingUpsert {
     pub repo: String,
     pub pr_number: i64,
+    pub author: Option<String>,
     pub fingerprint: String,
+    pub recurrence_fingerprint: Option<String>,
     pub sha: String,
     pub status: String,
     pub severity: String,
@@ -270,7 +293,9 @@ impl Database {
                 CREATE TABLE IF NOT EXISTS review_findings (
                     repo TEXT NOT NULL,
                     pr_number INTEGER NOT NULL,
+                    author TEXT,
                     fingerprint TEXT NOT NULL,
+                    recurrence_fingerprint TEXT,
                     first_sha TEXT NOT NULL,
                     last_seen_sha TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -297,6 +322,17 @@ impl Database {
                     rate_reset_epoch INTEGER,
                     active_reviews INTEGER DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS instruction_suggestion_prs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    pr_url TEXT NOT NULL,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(repo, fingerprint)
+                );
                 "#,
             )?;
 
@@ -321,6 +357,8 @@ impl Database {
                 "finding_kind",
                 "TEXT NOT NULL DEFAULT 'correctness'",
             )?;
+            ensure_column_exists(conn, "review_findings", "author", "TEXT")?;
+            ensure_column_exists(conn, "review_findings", "recurrence_fingerprint", "TEXT")?;
 
             // Reply deduplication: prevents replying to the same comment twice
             conn.execute_batch(
@@ -547,7 +585,8 @@ impl Database {
         self.run(move |conn| {
             let mut stmt = conn.prepare(
                 r#"
-                SELECT repo, pr_number, fingerprint, first_sha, last_seen_sha, status, severity,
+                SELECT repo, pr_number, author, fingerprint, recurrence_fingerprint,
+                       first_sha, last_seen_sha, status, severity,
                        finding_kind, path, line, body, evidence_note, github_comment_id,
                        resolved_by_sha, resolution_reason, created_at, updated_at
                   FROM review_findings
@@ -559,21 +598,23 @@ impl Database {
                 Ok(ReviewFindingRecord {
                     repo: row.get(0)?,
                     pr_number: row.get(1)?,
-                    fingerprint: row.get(2)?,
-                    first_sha: row.get(3)?,
-                    last_seen_sha: row.get(4)?,
-                    status: row.get(5)?,
-                    severity: row.get(6)?,
-                    finding_kind: row.get(7)?,
-                    path: row.get(8)?,
-                    line: row.get(9)?,
-                    body: row.get(10)?,
-                    evidence_note: row.get(11)?,
-                    github_comment_id: row.get(12)?,
-                    resolved_by_sha: row.get(13)?,
-                    resolution_reason: row.get(14)?,
-                    created_at: row.get(15)?,
-                    updated_at: row.get(16)?,
+                    author: row.get(2)?,
+                    fingerprint: row.get(3)?,
+                    recurrence_fingerprint: row.get(4)?,
+                    first_sha: row.get(5)?,
+                    last_seen_sha: row.get(6)?,
+                    status: row.get(7)?,
+                    severity: row.get(8)?,
+                    finding_kind: row.get(9)?,
+                    path: row.get(10)?,
+                    line: row.get(11)?,
+                    body: row.get(12)?,
+                    evidence_note: row.get(13)?,
+                    github_comment_id: row.get(14)?,
+                    resolved_by_sha: row.get(15)?,
+                    resolution_reason: row.get(16)?,
+                    created_at: row.get(17)?,
+                    updated_at: row.get(18)?,
                 })
             })?;
 
@@ -593,17 +634,21 @@ impl Database {
                 let mut stmt = tx.prepare(
                     r#"
                     INSERT INTO review_findings (
-                        repo, pr_number, fingerprint, first_sha, last_seen_sha, status, severity,
+                        repo, pr_number, author, fingerprint, recurrence_fingerprint,
+                        first_sha, last_seen_sha, status, severity,
                         finding_kind, path, line, body, evidence_note, github_comment_id,
                         resolved_by_sha, resolution_reason, created_at, updated_at
                     )
                     VALUES (
-                        ?1, ?2, ?3, ?4, ?4, ?5, ?6,
-                        ?7, ?8, ?9, ?10, ?11, ?12,
-                        ?13, ?14, datetime('now'), datetime('now')
+                        ?1, ?2, ?3, ?4, ?5,
+                        ?6, ?6, ?7, ?8,
+                        ?9, ?10, ?11, ?12, ?13, ?14,
+                        ?15, ?16, datetime('now'), datetime('now')
                     )
                     ON CONFLICT(repo, pr_number, fingerprint) DO UPDATE SET
                         last_seen_sha = excluded.last_seen_sha,
+                        author = COALESCE(excluded.author, review_findings.author),
+                        recurrence_fingerprint = COALESCE(excluded.recurrence_fingerprint, review_findings.recurrence_fingerprint),
                         status = excluded.status,
                         severity = excluded.severity,
                         finding_kind = excluded.finding_kind,
@@ -622,7 +667,9 @@ impl Database {
                     stmt.execute(params![
                         finding.repo,
                         finding.pr_number,
+                        finding.author,
                         finding.fingerprint,
+                        finding.recurrence_fingerprint,
                         finding.sha,
                         finding.status,
                         finding.severity,
@@ -716,6 +763,121 @@ impl Database {
                   last_comment_check=excluded.last_comment_check
                 "#,
                 params![repo, pr_number, last_comment_check],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn recurring_finding_candidates(
+        &self,
+        repo: &str,
+        min_distinct_prs: u32,
+        limit: usize,
+    ) -> Result<Vec<RecurringFindingCandidate>> {
+        let repo = repo.to_string();
+        let min_distinct_prs = i64::from(min_distinct_prs.max(2));
+        let limit = limit.max(1) as i64;
+
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT
+                  COALESCE(f.recurrence_fingerprint, f.fingerprint) AS recurrence_key,
+                  MIN(f.body),
+                  COUNT(DISTINCT f.pr_number) AS distinct_prs,
+                  COUNT(DISTINCT f.author) AS distinct_authors
+                FROM review_findings f
+                WHERE f.repo = ?1
+                  AND f.status IN ('open', 'still_blocking')
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM instruction_suggestion_prs p
+                    WHERE p.repo = f.repo
+                      AND p.fingerprint = COALESCE(f.recurrence_fingerprint, f.fingerprint)
+                  )
+                GROUP BY recurrence_key
+                HAVING COUNT(DISTINCT f.pr_number) >= ?2
+                ORDER BY MAX(f.updated_at) DESC
+                LIMIT ?3
+                "#,
+            )?;
+
+            let rows = stmt.query_map(params![repo, min_distinct_prs, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+
+            let mut candidates = Vec::new();
+            for row in rows {
+                let (recurrence_key, summary, distinct_prs, distinct_authors) = row?;
+                let mut examples_stmt = conn.prepare(
+                    r#"
+                    SELECT pr_number, COALESCE(author, 'unknown'), path, line, severity, body
+                    FROM review_findings
+                    WHERE repo = ?1
+                      AND COALESCE(recurrence_fingerprint, fingerprint) = ?2
+                      AND status IN ('open', 'still_blocking')
+                    ORDER BY updated_at DESC
+                    LIMIT 4
+                    "#,
+                )?;
+                let examples_rows =
+                    examples_stmt.query_map(params![repo, recurrence_key.as_str()], |row| {
+                        Ok(RecurringFindingExample {
+                            pr_number: row.get(0)?,
+                            author: row.get(1)?,
+                            path: row.get(2)?,
+                            line: row.get(3)?,
+                            severity: row.get(4)?,
+                            body: row.get(5)?,
+                        })
+                    })?;
+                let mut examples = Vec::new();
+                for example in examples_rows {
+                    examples.push(example?);
+                }
+
+                candidates.push(RecurringFindingCandidate {
+                    fingerprint: recurrence_key,
+                    summary,
+                    distinct_prs,
+                    distinct_authors,
+                    examples,
+                });
+            }
+
+            Ok(candidates)
+        })
+        .await
+    }
+
+    pub async fn record_instruction_suggestion_pr(
+        &self,
+        repo: &str,
+        fingerprint: &str,
+        mode: &str,
+        branch: &str,
+        pr_url: &str,
+    ) -> Result<()> {
+        let repo = repo.to_string();
+        let fingerprint = fingerprint.to_string();
+        let mode = mode.to_string();
+        let branch = branch.to_string();
+        let pr_url = pr_url.to_string();
+
+        self.run(move |conn| {
+            conn.execute(
+                r#"
+                INSERT OR IGNORE INTO instruction_suggestion_prs
+                  (repo, fingerprint, mode, branch, pr_url)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![repo, fingerprint, mode, branch, pr_url],
             )?;
             Ok(())
         })
@@ -1273,7 +1435,9 @@ mod tests {
         db.upsert_review_findings(vec![ReviewFindingUpsert {
             repo: "o/r".to_string(),
             pr_number: 7,
+            author: Some("alice".to_string()),
             fingerprint: "fp-1".to_string(),
+            recurrence_fingerprint: Some("recurrence-1".to_string()),
             sha: "sha-1".to_string(),
             status: "open".to_string(),
             severity: "blocking".to_string(),
@@ -1292,7 +1456,9 @@ mod tests {
         db.upsert_review_findings(vec![ReviewFindingUpsert {
             repo: "o/r".to_string(),
             pr_number: 7,
+            author: Some("alice".to_string()),
             fingerprint: "fp-1".to_string(),
+            recurrence_fingerprint: Some("recurrence-1".to_string()),
             sha: "sha-2".to_string(),
             status: "likely_fixed".to_string(),
             severity: "blocking".to_string(),
@@ -1629,6 +1795,62 @@ mod tests {
 
         // completed entries must not be reclaimed
         assert!(!db.claim_review(claim).await.expect("blocked by completed"));
+    }
+
+    #[tokio::test]
+    async fn recurring_candidates_require_distinct_prs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let base = ReviewFindingUpsert {
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            author: Some("alice".to_string()),
+            fingerprint: "panic-empty-input".to_string(),
+            recurrence_fingerprint: Some("panic-empty-input".to_string()),
+            sha: "abc".to_string(),
+            status: "open".to_string(),
+            finding_kind: "correctness".to_string(),
+            body: "Empty input can panic".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: Some(10),
+            severity: "blocking".to_string(),
+            evidence_note: None,
+            github_comment_id: None,
+            resolved_by_sha: None,
+            resolution_reason: None,
+        };
+
+        db.upsert_review_findings(vec![
+            base.clone(),
+            ReviewFindingUpsert {
+                sha: "def".to_string(),
+                ..base.clone()
+            },
+        ])
+        .await
+        .expect("record same pr twice");
+        assert!(db
+            .recurring_finding_candidates("o/r", 2, 10)
+            .await
+            .expect("candidates")
+            .is_empty());
+
+        db.upsert_review_findings(vec![ReviewFindingUpsert {
+            pr_number: 2,
+            sha: "ghi".to_string(),
+            ..base
+        }])
+        .await
+        .expect("record second pr");
+        let candidates = db
+            .recurring_finding_candidates("o/r", 2, 10)
+            .await
+            .expect("candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].distinct_prs, 2);
     }
 
     #[tokio::test]

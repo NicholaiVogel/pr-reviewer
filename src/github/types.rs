@@ -112,6 +112,8 @@ pub struct CreateReplyRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContentResponse {
+    #[serde(default)]
+    pub sha: Option<String>,
     pub content: String,
     pub encoding: String,
 }
@@ -132,4 +134,43 @@ pub struct PrFile {
 /// logic will simply skip the PR (no-op) rather than incorrectly archiving it.
 fn default_pr_state() -> String {
     "open".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitRefObject {
+    pub sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitRefResponse {
+    pub object: GitRefObject,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateRefRequest {
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+    pub sha: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateContentRequest {
+    pub message: String,
+    pub content: String,
+    pub branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreatePullRequestRequest {
+    pub title: String,
+    pub body: String,
+    pub head: String,
+    pub base: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreatePullRequestResponse {
+    pub html_url: String,
 }

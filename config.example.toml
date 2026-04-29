@@ -26,5 +26,11 @@ bot_name = "pr-reviewer"
 dry_run = false
 max_prompt_bytes = 204800
 
+[instruction_prs]
+enabled = false
+mode = "conservative" # conservative | broad
+min_distinct_prs = 2
+branch_prefix = "pr-reviewer/agents-guardrail"
+
 [serve]
 enabled = false

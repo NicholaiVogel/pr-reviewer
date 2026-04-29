@@ -18,6 +18,7 @@ use crate::github::types::{
 use crate::github::{client::GitHubClient, pr};
 use crate::harness;
 use crate::harness::spawn::{ensure_harness_available, run_harness, HarnessRunRequest};
+use crate::review::instructions::{open_instruction_pr, recurring_finding_fingerprint};
 use crate::review::parser::{
     parse_reply_output, parse_review_output, CommentSeverity, FindingKind, ParseOutcome,
     ReplyParseOutcome, ReviewComment as ParsedReviewComment, ReviewVerdict,
@@ -903,6 +904,7 @@ impl ReviewEngine {
             &repo_name,
             pr_data.number as i64,
             &pr_data.head.sha,
+            &pr_data.user.login,
             &stored_findings,
             &pending_findings,
             &review_memory,
@@ -1083,6 +1085,7 @@ impl ReviewEngine {
             post_result
         };
 
+        let findings_visible_to_github = post_result.is_ok() || used_retry;
         if let Err(err) = post_result {
             let fallback = truncate_github_comment_body(&format!(
                 "Review post failed; fallback summary posted.\n\nError: {err}\n\n{body}"
@@ -1119,6 +1122,20 @@ impl ReviewEngine {
                 gitnexus_hit_count,
             )
             .await?;
+
+        if findings_visible_to_github {
+            if let Err(err) = self
+                .handle_recurring_instruction_prs(repo_cfg, pr_data, &pending_findings)
+                .await
+            {
+                tracing::warn!(
+                    repo = %repo_cfg.full_name(),
+                    pr = pr_data.number,
+                    error = %err,
+                    "failed to process recurring finding instruction PR suggestions"
+                );
+            }
+        }
 
         Ok(ReviewRunResult {
             repo: repo_name,
@@ -1344,6 +1361,72 @@ impl ReviewEngine {
         let summary = normalize_summary_output(&output.stdout, &output.stderr)
             .ok_or_else(|| anyhow!("final review summary harness returned empty output"))?;
         Ok(summary)
+    }
+
+    async fn handle_recurring_instruction_prs(
+        &self,
+        repo_cfg: &RepoConfig,
+        pr_data: &PullRequest,
+        findings: &[PendingFinding],
+    ) -> Result<()> {
+        let config = &self.config.instruction_prs;
+        if !config.enabled || findings.is_empty() {
+            return Ok(());
+        }
+
+        let repo_name = repo_cfg.full_name();
+        let candidates = self
+            .db
+            .recurring_finding_candidates(&repo_name, config.min_distinct_prs, 1)
+            .await?;
+
+        for candidate in candidates {
+            match open_instruction_pr(
+                &self.github,
+                repo_cfg,
+                &pr_data.base.ref_name,
+                config,
+                &candidate,
+            )
+            .await
+            {
+                Ok(Some(outcome)) => {
+                    self.db
+                        .record_instruction_suggestion_pr(
+                            &repo_name,
+                            &candidate.fingerprint,
+                            &config.mode.to_string(),
+                            &outcome.branch,
+                            &outcome.pr_url,
+                        )
+                        .await?;
+                    tracing::info!(
+                        repo = %repo_name,
+                        fingerprint = %candidate.fingerprint,
+                        branch = %outcome.branch,
+                        pr_url = %outcome.pr_url,
+                        "opened recurring finding instruction PR"
+                    );
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        repo = %repo_name,
+                        fingerprint = %candidate.fingerprint,
+                        "recurring finding already present in AGENTS.md"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        repo = %repo_name,
+                        fingerprint = %candidate.fingerprint,
+                        error = %err,
+                        "failed to open recurring finding instruction PR"
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn reply_to_comment(
@@ -2015,6 +2098,7 @@ fn reconcile_finding_ledger(
     repo: &str,
     pr_number: i64,
     sha: &str,
+    author: &str,
     stored_findings: &[ReviewFindingRecord],
     current_findings: &[PendingFinding],
     review_memory: &ReviewMemory,
@@ -2048,7 +2132,9 @@ fn reconcile_finding_ledger(
         updates.push(ReviewFindingUpsert {
             repo: repo.to_string(),
             pr_number,
+            author: Some(author.to_string()),
             fingerprint: finding.fingerprint.clone(),
+            recurrence_fingerprint: Some(recurring_finding_fingerprint(&finding.body)),
             sha: sha.to_string(),
             status: status.to_string(),
             severity: severity_label(finding.severity).to_string(),
@@ -2092,7 +2178,9 @@ fn reconcile_finding_ledger(
         updates.push(ReviewFindingUpsert {
             repo: repo.to_string(),
             pr_number,
+            author: stored.author.clone(),
             fingerprint: stored.fingerprint.clone(),
+            recurrence_fingerprint: stored.recurrence_fingerprint.clone(),
             sha: sha.to_string(),
             status: status.to_string(),
             severity: stored.severity.clone(),
@@ -3487,7 +3575,9 @@ mod tests {
         ReviewFindingRecord {
             repo: "owner/repo".to_string(),
             pr_number: 15,
+            author: Some("alice".to_string()),
             fingerprint: fingerprint.to_string(),
+            recurrence_fingerprint: Some("task-ownership".to_string()),
             first_sha: "sha-1".to_string(),
             last_seen_sha: "sha-1".to_string(),
             status: status.to_string(),
@@ -3984,8 +4074,15 @@ Reviewed the archive flow.
         }];
         let memory = ReviewMemory::default();
 
-        let (updates, delta) =
-            reconcile_finding_ledger("owner/repo", 15, "sha-2", &stored, &current, &memory);
+        let (updates, delta) = reconcile_finding_ledger(
+            "owner/repo",
+            15,
+            "sha-2",
+            "alice",
+            &stored,
+            &current,
+            &memory,
+        );
 
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].status, "still_blocking");
@@ -4001,7 +4098,7 @@ Reviewed the archive flow.
         let memory = ReviewMemory::default();
 
         let (updates, delta) =
-            reconcile_finding_ledger("owner/repo", 15, "sha-2", &stored, &[], &memory);
+            reconcile_finding_ledger("owner/repo", 15, "sha-2", "alice", &stored, &[], &memory);
 
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].status, "likely_fixed");

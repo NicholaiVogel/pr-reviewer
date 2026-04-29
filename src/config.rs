@@ -262,12 +262,49 @@ pub struct AppConfig {
     pub repos: Vec<RepoConfig>,
     #[serde(default)]
     pub serve: ServeConfig,
+    #[serde(default)]
+    pub instruction_prs: InstructionPrConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServeConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum InstructionPrMode {
+    Conservative,
+    Broad,
+}
+
+impl Default for InstructionPrMode {
+    fn default() -> Self {
+        Self::Conservative
+    }
+}
+
+impl Display for InstructionPrMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            InstructionPrMode::Conservative => "conservative",
+            InstructionPrMode::Broad => "broad",
+        };
+        write!(f, "{value}")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstructionPrConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: InstructionPrMode,
+    #[serde(default = "default_instruction_pr_min_distinct_prs")]
+    pub min_distinct_prs: u32,
+    #[serde(default = "default_instruction_pr_branch_prefix")]
+    pub branch_prefix: String,
 }
 
 fn default_harness() -> HarnessKind {
@@ -330,6 +367,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_instruction_pr_min_distinct_prs() -> u32 {
+    2
+}
+
+fn default_instruction_pr_branch_prefix() -> String {
+    "pr-reviewer/agents-guardrail".to_string()
+}
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
@@ -378,6 +423,18 @@ impl Default for AppConfig {
             defaults: DefaultsConfig::default(),
             repos: Vec::new(),
             serve: ServeConfig::default(),
+            instruction_prs: InstructionPrConfig::default(),
+        }
+    }
+}
+
+impl Default for InstructionPrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: InstructionPrMode::default(),
+            min_distinct_prs: default_instruction_pr_min_distinct_prs(),
+            branch_prefix: default_instruction_pr_branch_prefix(),
         }
     }
 }
