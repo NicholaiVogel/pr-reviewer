@@ -527,7 +527,8 @@ impl ReviewEngine {
                     // Fetch latest for managed clones so GitNexus index is fresh
                     if repo_cfg.is_managed() {
                         if let Err(err) =
-                            crate::repo_manager::fetch_latest(&local, self.github.token()).await
+                            crate::repo_manager::fetch_latest_managed(&local, self.github.token())
+                                .await
                         {
                             tracing::warn!(
                                 repo = %repo_cfg.full_name(),

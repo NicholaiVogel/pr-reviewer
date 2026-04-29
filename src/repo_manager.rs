@@ -107,15 +107,207 @@ pub async fn ensure_cloned(owner: &str, name: &str, token: &str) -> Result<PathB
     Ok(path)
 }
 
-/// Fetches latest from origin and resets working tree to match.
-/// Safe to call on managed clones (never user-edited).
+/// Fetches latest from origin and resets tracked files to match.
+/// Does not remove untracked or ignored files, so it is safe for configured
+/// user-managed local paths.
 pub async fn fetch_latest(repo_path: &Path, token: &str) -> Result<()> {
+    fetch_latest_inner(repo_path, token, false).await
+}
+
+/// Fetches latest for managed clones and removes untracked/ignored byproducts.
+/// Only use this for bot-owned clone directories.
+pub async fn fetch_latest_managed(repo_path: &Path, token: &str) -> Result<()> {
+    fetch_latest_inner(repo_path, token, true).await
+}
+
+async fn fetch_latest_inner(repo_path: &Path, token: &str, clean_untracked: bool) -> Result<()> {
     if !repo_path.join(".git").exists() {
         return Err(anyhow!("not a git repository: {}", repo_path.display()));
     }
 
-    let fetch = Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null", "fetch", "origin"])
+    if let Err(err) = run_git_with_auth(
+        repo_path,
+        token,
+        &["-c", "core.hooksPath=/dev/null", "fetch", "origin"],
+    )
+    .await
+    {
+        tracing::warn!(path = %repo_path.display(), "git fetch failed: {err}");
+        return Err(err);
+    }
+
+    // Determine default branch
+    let target = git_stdout(
+        repo_path,
+        &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
+    )
+    .await
+    .unwrap_or_else(|_| "origin/HEAD".to_string());
+
+    run_git(repo_path, &["reset", "--hard", &target]).await?;
+    if clean_untracked {
+        clean_worktree(repo_path).await?;
+    }
+    Ok(())
+}
+
+pub async fn checkout_origin_branch(
+    repo_path: &Path,
+    local_branch: &str,
+    origin_branch: &str,
+) -> Result<()> {
+    run_git(
+        repo_path,
+        &[
+            "checkout",
+            "-B",
+            local_branch,
+            &format!("origin/{origin_branch}"),
+        ],
+    )
+    .await
+}
+
+pub async fn hard_reset_to_origin(repo_path: &Path, origin_branch: &str) -> Result<()> {
+    run_git(
+        repo_path,
+        &["reset", "--hard", &format!("origin/{origin_branch}")],
+    )
+    .await?;
+    clean_worktree(repo_path).await
+}
+
+pub async fn clean_ignored_worktree(repo_path: &Path) -> Result<()> {
+    run_git(repo_path, &["clean", "-fdX"]).await
+}
+
+async fn clean_worktree(repo_path: &Path) -> Result<()> {
+    run_git(repo_path, &["clean", "-fdx"]).await
+}
+
+pub async fn current_head_sha(repo_path: &Path) -> Result<String> {
+    git_stdout(repo_path, &["rev-parse", "HEAD"]).await
+}
+
+pub async fn changed_file_paths(repo_path: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "-z"])
+        .current_dir(repo_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .context("failed to run git status --porcelain=v1 -z")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git status --porcelain=v1 -z failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(parse_status_paths(&output.stdout))
+}
+
+pub async fn commit_paths(repo_path: &Path, paths: &[String], message: &str) -> Result<()> {
+    if paths.is_empty() {
+        return Err(anyhow!("cannot commit empty path set"));
+    }
+
+    let mut add = Command::new("git");
+    add.arg("add").arg("--").args(paths).current_dir(repo_path);
+    let output = add
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .context("failed to run git add")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    commit_staged(repo_path, message).await
+}
+
+async fn commit_staged(repo_path: &Path, message: &str) -> Result<()> {
+    run_git(
+        repo_path,
+        &[
+            "-c",
+            "user.name=pr-reviewer",
+            "-c",
+            "user.email=pr-reviewer@users.noreply.github.com",
+            "commit",
+            "-m",
+            message,
+        ],
+    )
+    .await
+}
+
+fn parse_status_paths(status: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut records = status
+        .split(|byte| *byte == b'\0')
+        .filter(|record| !record.is_empty());
+
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+
+        let status = &record[..2];
+        paths.push(String::from_utf8_lossy(&record[3..]).into_owned());
+
+        if status[0] == b'R' || status[0] == b'C' || status[1] == b'R' || status[1] == b'C' {
+            let _old_path = records.next();
+        }
+    }
+
+    paths
+}
+
+pub async fn push_head(repo_path: &Path, token: &str, branch: &str) -> Result<()> {
+    run_git_with_auth(
+        repo_path,
+        token,
+        &[
+            "push",
+            "--force-with-lease",
+            "origin",
+            &format!("HEAD:{branch}"),
+        ],
+    )
+    .await
+}
+
+async fn run_git(repo_path: &Path, args: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+async fn run_git_with_auth(repo_path: &Path, token: &str, args: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .args(args)
         .current_dir(repo_path)
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "http.extraHeader")
@@ -127,45 +319,37 @@ pub async fn fetch_latest(repo_path: &Path, token: &str) -> Result<()> {
         .stderr(std::process::Stdio::piped())
         .output()
         .await
-        .context("failed to run git fetch")?;
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
 
-    if !fetch.status.success() {
-        let stderr = String::from_utf8_lossy(&fetch.stderr);
-        tracing::warn!(path = %repo_path.display(), "git fetch failed: {}", stderr.trim());
-        return Err(anyhow!("git fetch failed: {}", stderr.trim()));
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
+    Ok(())
+}
 
-    // Determine default branch
-    let head_ref = Command::new("git")
-        .args(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
-        .current_dir(repo_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await;
-
-    let target = match head_ref {
-        Ok(ref out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
-        _ => "origin/HEAD".to_string(),
-    };
-
-    let reset = Command::new("git")
-        .args(["reset", "--hard", &target])
+async fn git_stdout(repo_path: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
         .current_dir(repo_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
         .await
-        .context("failed to run git reset")?;
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
 
-    if !reset.status.success() {
-        let stderr = String::from_utf8_lossy(&reset.stderr);
-        return Err(anyhow!("git reset --hard failed: {}", stderr.trim()));
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
 
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Delete a managed clone directory.
@@ -238,4 +422,206 @@ pub async fn cleanup(active_repos: &[RepoConfig]) -> Result<Vec<String>> {
     }
 
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        changed_file_paths, clean_worktree, fetch_latest, fetch_latest_managed, parse_status_paths,
+    };
+    use std::fs;
+    use std::path::Path;
+    use tokio::process::Command;
+
+    #[tokio::test]
+    async fn clean_worktree_removes_untracked_and_ignored_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        run_git(dir.path(), &["init"]).await;
+
+        fs::write(dir.path().join(".gitignore"), "*.log\n").expect("write gitignore");
+        fs::write(dir.path().join("tracked.txt"), "tracked").expect("write tracked");
+        run_git(dir.path(), &["add", ".gitignore", "tracked.txt"]).await;
+        run_git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=pr-reviewer",
+                "-c",
+                "user.email=pr-reviewer@users.noreply.github.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .await;
+
+        fs::write(dir.path().join("untracked.txt"), "stale").expect("write untracked");
+        fs::write(dir.path().join("ignored.log"), "stale").expect("write ignored");
+
+        clean_worktree(dir.path()).await.expect("clean worktree");
+
+        assert!(!dir.path().join("untracked.txt").exists());
+        assert!(!dir.path().join("ignored.log").exists());
+        assert!(dir.path().join("tracked.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_preserves_local_untracked_and_ignored_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = create_remote_backed_repo(dir.path()).await;
+
+        fs::write(repo.join("untracked.txt"), "local").expect("write untracked");
+        fs::write(repo.join("ignored.log"), "local").expect("write ignored");
+
+        fetch_latest(&repo, "").await.expect("fetch latest");
+
+        assert!(repo.join("untracked.txt").exists());
+        assert!(repo.join("ignored.log").exists());
+        assert_eq!(
+            fs::read_to_string(repo.join("tracked.txt")).expect("read tracked"),
+            "updated"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_managed_removes_untracked_and_ignored_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = create_remote_backed_repo(dir.path()).await;
+
+        fs::write(repo.join("untracked.txt"), "local").expect("write untracked");
+        fs::write(repo.join("ignored.log"), "local").expect("write ignored");
+
+        fetch_latest_managed(&repo, "")
+            .await
+            .expect("fetch latest managed");
+
+        assert!(!repo.join("untracked.txt").exists());
+        assert!(!repo.join("ignored.log").exists());
+        assert_eq!(
+            fs::read_to_string(repo.join("tracked.txt")).expect("read tracked"),
+            "updated"
+        );
+    }
+
+    #[test]
+    fn parse_status_paths_handles_nul_delimited_paths() {
+        let paths = parse_status_paths(
+            b" M src/file with spaces.rs\0?? weird\"quote.rs\0A  path\\with\\slashes.txt\0",
+        );
+
+        assert_eq!(
+            paths,
+            vec![
+                "src/file with spaces.rs",
+                "weird\"quote.rs",
+                "path\\with\\slashes.txt"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_status_paths_keeps_rename_destination() {
+        let paths =
+            parse_status_paths(b"R  new path.rs\0old path.rs\0C  copy path.rs\0source path.rs\0");
+
+        assert_eq!(paths, vec!["new path.rs", "copy path.rs"]);
+    }
+
+    #[tokio::test]
+    async fn changed_file_paths_handles_special_untracked_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        run_git(dir.path(), &["init"]).await;
+
+        fs::write(dir.path().join("file with spaces.txt"), "spaces").expect("write spaces");
+        fs::write(dir.path().join("quote\"name.txt"), "quote").expect("write quote");
+
+        let mut paths = changed_file_paths(dir.path()).await.expect("changed paths");
+        paths.sort();
+
+        assert_eq!(paths, vec!["file with spaces.txt", "quote\"name.txt"]);
+    }
+
+    async fn create_remote_backed_repo(root: &Path) -> std::path::PathBuf {
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let work = root.join("work");
+
+        run_cmd(
+            root,
+            &["init", "--bare", remote.to_str().expect("remote path")],
+        )
+        .await;
+        fs::create_dir_all(&seed).expect("create seed");
+        run_git(&seed, &["init"]).await;
+        fs::write(seed.join(".gitignore"), "*.log\n").expect("write gitignore");
+        fs::write(seed.join("tracked.txt"), "initial").expect("write tracked");
+        run_git(&seed, &["add", ".gitignore", "tracked.txt"]).await;
+        commit_all(&seed, "initial").await;
+        run_git(&seed, &["branch", "-M", "main"]).await;
+        run_git(
+            &seed,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        )
+        .await;
+        run_git(&seed, &["push", "-u", "origin", "main"]).await;
+        run_cmd(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]).await;
+
+        run_cmd(
+            root,
+            &[
+                "clone",
+                remote.to_str().expect("remote path"),
+                work.to_str().expect("work path"),
+            ],
+        )
+        .await;
+
+        fs::write(seed.join("tracked.txt"), "updated").expect("update tracked");
+        run_git(&seed, &["add", "tracked.txt"]).await;
+        commit_all(&seed, "update tracked").await;
+        run_git(&seed, &["push", "origin", "main"]).await;
+
+        work
+    }
+
+    async fn commit_all(repo_path: &Path, message: &str) {
+        run_git(
+            repo_path,
+            &[
+                "-c",
+                "user.name=pr-reviewer",
+                "-c",
+                "user.email=pr-reviewer@users.noreply.github.com",
+                "commit",
+                "-m",
+                message,
+            ],
+        )
+        .await;
+    }
+
+    async fn run_git(repo_path: &Path, args: &[&str]) {
+        run_cmd(repo_path, args).await;
+    }
+
+    async fn run_cmd(repo_path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .await
+            .expect("run git");
+
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

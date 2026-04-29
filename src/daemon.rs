@@ -11,7 +11,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use rand::Rng;
 use serde::Serialize;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::config::AppConfig;
@@ -49,7 +49,8 @@ pub async fn start(
 
     let mut engine = ReviewEngine::new(Arc::new(config.clone()), github.clone(), db.clone());
     engine.init().await;
-    let semaphore = Arc::new(Semaphore::new(config.daemon.max_concurrent_reviews));
+    let worker_limit = config.daemon.max_concurrent_reviews.max(1);
+    let semaphore = Arc::new(Semaphore::new(worker_limit));
     let mut workers: JoinSet<()> = JoinSet::new();
     let bot_mention = format!("@{}", config.defaults.bot_name);
 
@@ -67,13 +68,15 @@ pub async fn start(
     // any `Ok(true)` set by a worker that completed during the previous cycle
     // (or during the current one before we evaluate backoff) is captured once.
     let finalization_detected = Arc::new(AtomicBool::new(false));
+    let auto_fix_detected = Arc::new(AtomicBool::new(false));
 
     loop {
         while workers.try_join_next().is_some() {}
 
         // Seed changes_detected from confirmed finalizations that workers
         // completed since the last time we evaluated backoff.
-        let mut changes_detected = finalization_detected.swap(false, Ordering::Acquire);
+        let mut changes_detected = finalization_detected.swap(false, Ordering::Acquire)
+            || auto_fix_detected.swap(false, Ordering::Acquire);
         let rate_state = github.rate_state();
         let rate_limit_budget = rate_state.limit.unwrap_or(RATE_LIMIT_TOTAL);
         let remaining = rate_state.remaining;
@@ -94,6 +97,53 @@ pub async fn start(
 
         for repo_cfg in config.repos.clone() {
             let repo_name = repo_cfg.full_name();
+            if repo_cfg.auto_fix.enabled {
+                if let Some(permit) = try_acquire_worker_permit(&semaphore) {
+                    let config_for_auto_fix = config.clone();
+                    let repo_for_auto_fix = repo_cfg.clone();
+                    let github_for_auto_fix = github.clone();
+                    let db_for_auto_fix = db.clone();
+                    let auto_fix_detected = auto_fix_detected.clone();
+                    let auto_fix_repo_name = repo_name.clone();
+                    workers.spawn(async move {
+                        let _permit = permit;
+                        match crate::auto_fix::scan_and_open_pr(
+                            &config_for_auto_fix,
+                            &repo_for_auto_fix,
+                            &github_for_auto_fix,
+                            &db_for_auto_fix,
+                        )
+                        .await
+                        {
+                            Ok(Some(outcome)) => {
+                                auto_fix_detected.store(true, Ordering::Release);
+                                tracing::info!(
+                                    repo = %auto_fix_repo_name,
+                                    sha = %outcome.scanned_sha,
+                                    pr = ?outcome.pr_number,
+                                    changed_files = outcome.changed_files,
+                                    duration_secs = outcome.duration_secs,
+                                    "auto-fix scan completed"
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                tracing::warn!(
+                                    repo = %auto_fix_repo_name,
+                                    error = %err,
+                                    "auto-fix scan failed"
+                                );
+                            }
+                        }
+                    });
+                } else {
+                    tracing::debug!(
+                        repo = %repo_name,
+                        "auto-fix scan deferred because worker pool is saturated"
+                    );
+                }
+            }
+
             let etag = db.get_repo_etag(&repo_name).await?;
             let pulls = github
                 .list_open_prs(&repo_cfg.owner, &repo_cfg.name, etag.as_deref())
@@ -448,6 +498,10 @@ pub async fn collect_status(db: &Database, config: &AppConfig) -> Result<DaemonS
     })
 }
 
+fn try_acquire_worker_permit(semaphore: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    semaphore.clone().try_acquire_owned().ok()
+}
+
 pub fn format_status(snapshot: &DaemonSnapshot) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "pr-reviewer {}", env!("CARGO_PKG_VERSION"));
@@ -593,6 +647,14 @@ mod tests {
         assert!(out.contains("claimed: 5"));
         assert!(out.contains("remaining: 4321 / 5000"));
         assert!(out.contains("owner/repo"));
+    }
+
+    #[test]
+    fn auto_fix_permit_acquisition_is_non_blocking_when_saturated() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let _held = try_acquire_worker_permit(&semaphore).expect("first permit");
+
+        assert!(try_acquire_worker_permit(&semaphore).is_none());
     }
 }
 

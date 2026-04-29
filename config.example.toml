@@ -34,3 +34,15 @@ branch_prefix = "pr-reviewer/agents-guardrail"
 
 [serve]
 enabled = false
+
+# Example per-repo opt-in:
+# [[repos]]
+# owner = "your-org"
+# name = "your-repo"
+#
+# [repos.auto_fix]
+# enabled = false
+# base_branch = "main"
+# branch_prefix = "pr-reviewer/auto-fix"
+# draft_pr = true
+# max_changed_files = 20
