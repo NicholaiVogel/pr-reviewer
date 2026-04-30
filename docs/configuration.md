@@ -187,6 +187,13 @@ trusted_authors = ["dependabot[bot]", "renovate[bot]"]
 ignore_paths = ["*.lock", "dist/**", "vendor/**"]
 custom_instructions = "This project uses a custom ORM. Watch for N+1 queries."
 gitnexus = true
+
+[repos.auto_fix]
+enabled = false
+base_branch = "main"
+branch_prefix = "pr-reviewer/auto-fix"
+draft_pr = true
+max_changed_files = 20
 ```
 
 | Field | Description |
@@ -201,6 +208,18 @@ gitnexus = true
 | `ignore_paths` | Glob patterns for files to exclude from context |
 | `custom_instructions` | Free-text hints appended to the review prompt |
 | `gitnexus` | Whether to include GitNexus impact analysis in context. Default: `true` (best-effort; gracefully skipped if unavailable) |
+
+### `[repos.auto_fix]`
+
+Opt-in autonomous fixing for managed clones. When enabled, the daemon scans each new `base_branch` SHA, asks the configured harness to make a small bug/security fix if it finds one, pushes a `branch_prefix/<sha>` branch, and opens a PR. Repos with `local_path` are skipped so the daemon never resets a user-managed checkout.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Enable release-branch bug/security scans and PR creation. |
+| `base_branch` | `"main"` | Branch to scan after it advances. |
+| `branch_prefix` | `"pr-reviewer/auto-fix"` | Prefix for pushed bot branches. |
+| `draft_pr` | `true` | Open generated PRs as drafts. |
+| `max_changed_files` | `20` | Abort and reset if the harness changes too many files. |
 
 When enabled, pr-reviewer enriches context with:
 - ranked GitNexus processes related to changed files
@@ -243,27 +262,21 @@ trusted_authors = ["dependabot[bot]", "known-external-contributor"]
 
 ## Confidence scoring
 
-The review output includes 13 confidence dimensions, each rated 1–10 by the model:
+Review output includes a simple confidence object:
 
-| Dimension | Description |
-|-----------|-------------|
-| `style_maintainability` | Readability and future maintainability |
-| `repo_convention_adherence` | Follows established project patterns |
-| `merge_conflict_detection` | Risk of conflicts with concurrent changes |
-| `security_vulnerability_detection` | Known vulnerability patterns |
-| `injection_risk_detection` | SQL, command, and template injection |
-| `attack_surface_risk_assessment` | New attack vectors introduced |
-| `future_hardening_guidance` | Opportunities for future hardening |
-| `scope_alignment` | Changes match stated PR intent |
-| `duplication_awareness` | Reuse of existing utilities vs reinvention |
-| `tooling_pattern_leverage` | Correct use of established tooling |
-| `functional_completeness` | All cases handled, no obvious gaps |
-| `pattern_correctness` | Correct application of design patterns |
-| `documentation_coverage` | Docs match implementation |
+- `level`: `high`, `medium`, or `low`
+- `reasons`: short machine-readable reason labels
+- `justification`: a concrete explanation of what evidence is present or missing
 
-These are averaged to a global confidence score. **If the average falls below 5, an `APPROVE` verdict is automatically downgraded to `COMMENT`.** The review still posts with its full analysis — the downgrade only affects the verdict type.
+The confidence level is shown in the posted review body. Low-confidence blocking
+findings are downgraded unless they include concrete evidence, which prevents
+speculative `REQUEST_CHANGES` reviews. GitHub self-review restrictions are handled
+separately: when the authenticated user authored the PR, verdicts are posted as
+`COMMENT` because GitHub rejects self-approval and self-request-changes reviews.
 
-This is not configurable per-repo today. If a repo routinely triggers low-confidence reviews (e.g., highly domain-specific code), use `custom_instructions` to give the model more context about the domain.
+Confidence scoring is not configurable per repo today. If a repo routinely
+triggers low-confidence reviews, use `custom_instructions` to give the model more
+context about the domain, expected invariants, and validation patterns.
 
 ---
 

@@ -110,6 +110,22 @@ pub struct CreateReplyRequest {
     pub body: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CreatePullRequestRequest {
+    pub title: String,
+    pub body: String,
+    pub head: String,
+    pub base: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub draft: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreatePullRequestResponse {
+    pub number: u64,
+    pub html_url: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContentResponse {
     #[serde(default)]
@@ -162,15 +178,6 @@ pub struct UpdateContentRequest {
     pub sha: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct CreatePullRequestRequest {
-    pub title: String,
-    pub body: String,
-    pub head: String,
-    pub base: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CreatePullRequestResponse {
-    pub html_url: String,
+fn is_false(value: &bool) -> bool {
+    !*value
 }

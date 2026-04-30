@@ -253,7 +253,9 @@ impl Database {
 
                 CREATE TABLE IF NOT EXISTS repo_state (
                     repo TEXT PRIMARY KEY,
-                    etag TEXT
+                    etag TEXT,
+                    last_auto_fix_sha TEXT,
+                    last_auto_fix_pr INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS review_log (
@@ -368,6 +370,8 @@ impl Database {
                 "status",
                 "TEXT NOT NULL DEFAULT 'opened'",
             )?;
+            ensure_column_exists(conn, "repo_state", "last_auto_fix_sha", "TEXT")?;
+            ensure_column_exists(conn, "repo_state", "last_auto_fix_pr", "INTEGER")?;
 
             // Reply deduplication: prevents replying to the same comment twice
             conn.execute_batch(
@@ -1079,6 +1083,43 @@ impl Database {
         .await
     }
 
+    pub async fn get_last_auto_fix_sha(&self, repo: &str) -> Result<Option<String>> {
+        let repo = repo.to_string();
+
+        self.run(move |conn| {
+            let sha = conn
+                .query_row(
+                    "SELECT last_auto_fix_sha FROM repo_state WHERE repo=?1",
+                    params![repo],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            Ok(sha)
+        })
+        .await
+    }
+
+    pub async fn set_last_auto_fix_scan(
+        &self,
+        repo: &str,
+        sha: &str,
+        pr_number: Option<u64>,
+    ) -> Result<()> {
+        let repo = repo.to_string();
+        let sha = sha.to_string();
+        let pr_number = pr_number.map(|n| n as i64);
+
+        self.run(move |conn| {
+            conn.execute(
+                "INSERT INTO repo_state(repo, last_auto_fix_sha, last_auto_fix_pr) VALUES (?1, ?2, ?3) ON CONFLICT(repo) DO UPDATE SET last_auto_fix_sha=excluded.last_auto_fix_sha, last_auto_fix_pr=excluded.last_auto_fix_pr",
+                params![repo, sha, pr_number],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn sweep_stale_claims(&self, max_age_secs: u64) -> Result<u64> {
         self.run(move |conn| {
             let changed = conn.execute(
@@ -1474,7 +1515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrate_adds_gitnexus_columns_for_existing_db() {
+    async fn migrate_adds_missing_columns_for_existing_db() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.db");
 
@@ -1502,6 +1543,11 @@ mod tests {
                     error_message TEXT,
                     created_at TEXT DEFAULT (datetime('now')),
                     completed_at TEXT
+                );
+
+                CREATE TABLE repo_state (
+                    repo TEXT PRIMARY KEY,
+                    etag TEXT
                 );
                 "#,
             )
@@ -1533,6 +1579,39 @@ mod tests {
         assert!(daemon_columns.contains(&"started_at".to_string()));
         assert!(daemon_columns.contains(&"rate_limit_total".to_string()));
         assert!(daemon_columns.contains(&"rate_reset_epoch".to_string()));
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(repo_state)")
+            .expect("prepare repo pragma");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("query repo table_info");
+        let repo_columns: Vec<String> = rows.map(|r| r.expect("col")).collect();
+
+        assert!(repo_columns.contains(&"last_auto_fix_sha".to_string()));
+        assert!(repo_columns.contains(&"last_auto_fix_pr".to_string()));
+    }
+
+    #[tokio::test]
+    async fn auto_fix_scan_state_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        assert_eq!(
+            db.get_last_auto_fix_sha("o/r").await.expect("initial"),
+            None
+        );
+
+        db.set_last_auto_fix_scan("o/r", "abc123", Some(42))
+            .await
+            .expect("set");
+
+        assert_eq!(
+            db.get_last_auto_fix_sha("o/r").await.expect("stored"),
+            Some("abc123".to_string())
+        );
     }
 
     #[tokio::test]

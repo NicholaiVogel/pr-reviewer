@@ -453,21 +453,16 @@ impl GitHubClient {
         head: &str,
         base: &str,
     ) -> Result<String> {
-        let path = format!("/repos/{owner}/{repo}/pulls");
         let payload = CreatePullRequestRequest {
             title: title.to_string(),
             body: body.to_string(),
             head: head.to_string(),
             base: base.to_string(),
+            draft: false,
         };
-        let resp = self
-            .request(Method::POST, &path)
-            .json(&payload)
-            .send()
-            .await
-            .context("GitHub create pull request failed")?;
-        self.update_rate_state(resp.headers());
-        let payload: CreatePullRequestResponse = handle_json(resp).await?;
+        let payload = self
+            .create_pull_request_with_options(owner, repo, &payload)
+            .await?;
         Ok(payload.html_url)
     }
 
@@ -522,6 +517,23 @@ impl GitHubClient {
         }
 
         Ok(())
+    }
+
+    pub async fn create_pull_request_with_options(
+        &self,
+        owner: &str,
+        repo: &str,
+        request: &CreatePullRequestRequest,
+    ) -> Result<CreatePullRequestResponse> {
+        let path = format!("/repos/{owner}/{repo}/pulls");
+        let resp = self
+            .request(Method::POST, &path)
+            .json(request)
+            .send()
+            .await
+            .context("GitHub create pull request failed")?;
+        self.update_rate_state(resp.headers());
+        handle_json(resp).await
     }
 
     pub async fn reply_to_review_comment(

@@ -246,6 +246,23 @@ pub struct RepoConfig {
     /// each enabled step in order instead of the single-step legacy behaviour.
     #[serde(default)]
     pub workflow: Vec<WorkflowStep>,
+    #[serde(default)]
+    pub auto_fix: AutoFixConfig,
+}
+
+/// Autonomous bug/security scan that can patch the managed clone and open a PR.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoFixConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_auto_fix_base_branch")]
+    pub base_branch: String,
+    #[serde(default = "default_auto_fix_branch_prefix")]
+    pub branch_prefix: String,
+    #[serde(default = "default_true")]
+    pub draft_pr: bool,
+    #[serde(default = "default_auto_fix_max_changed_files")]
+    pub max_changed_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -373,6 +390,30 @@ fn default_instruction_pr_min_distinct_prs() -> u32 {
 
 fn default_instruction_pr_branch_prefix() -> String {
     "pr-reviewer/agents-guardrail".to_string()
+}
+
+fn default_auto_fix_base_branch() -> String {
+    "main".to_string()
+}
+
+fn default_auto_fix_branch_prefix() -> String {
+    "pr-reviewer/auto-fix".to_string()
+}
+
+fn default_auto_fix_max_changed_files() -> usize {
+    20
+}
+
+impl Default for AutoFixConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_branch: default_auto_fix_base_branch(),
+            branch_prefix: default_auto_fix_branch_prefix(),
+            draft_pr: true,
+            max_changed_files: default_auto_fix_max_changed_files(),
+        }
+    }
 }
 
 impl Default for HarnessConfig {

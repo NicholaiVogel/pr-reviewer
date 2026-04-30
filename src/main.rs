@@ -1,3 +1,4 @@
+mod auto_fix;
 mod config;
 mod context;
 mod daemon;
@@ -218,6 +219,7 @@ async fn main() -> Result<()> {
                 custom_instructions: None,
                 gitnexus: true,
                 workflow: vec![],
+                auto_fix: Default::default(),
             };
             let repo_name = repo_cfg.full_name();
             cfg.add_repo(repo_cfg.clone())?;
@@ -621,6 +623,7 @@ fn add_scanned_repos(cfg: &mut AppConfig, scan_dir: &Path) -> Result<()> {
             custom_instructions: None,
             gitnexus: true,
             workflow: vec![],
+            auto_fix: Default::default(),
         };
 
         if cfg

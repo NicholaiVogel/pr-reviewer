@@ -23,7 +23,7 @@ See `pr-reviewer config token-status` to confirm which source is active and what
 The token is present but rejected. Likely causes:
 
 - The token has expired (fine-grained PATs expire)
-- The token is missing required scopes — needs `pull_requests:read+write` and `contents:read` (fine-grained), or `repo` (classic)
+- The token is missing required scopes — needs `pull_requests:read+write` and `contents:read` (fine-grained), or `repo` (classic). If `repos.auto_fix.enabled = true`, it also needs `contents:write` so it can push fix branches.
 - The token was revoked
 
 Generate a new PAT and re-run `pr-reviewer config set-token --passphrase`.
