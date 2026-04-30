@@ -37,6 +37,7 @@ const GITHUB_COMMENT_TRUNCATION_NOTE: &str =
     "\n\n[truncated by pr-reviewer to fit GitHub's comment length limit]";
 const SCREENSHOT_NOTE_TEXT: &str =
     "> **Note:** This PR touches UI files but no screenshots were referenced in the description. Consider adding visual previews for reviewers.";
+const DURABLE_REVIEW_MARKER_PREFIX: &str = "<!-- pr-reviewer-review";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FindingStatus {
@@ -91,6 +92,7 @@ pub struct ReviewOptions {
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub force: bool,
+    pub rerun_completed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +229,22 @@ impl ReviewEngine {
                 }
             }
         }
+        if options.rerun_completed {
+            match self.db.delete_completed_review_claim(&dedupe).await? {
+                Some(_) => {
+                    tracing::warn!(
+                        dedupe_key = %dedupe,
+                        "rerun-completed deleted a completed review claim for this exact mode"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        dedupe_key = %dedupe,
+                        "--rerun-completed had no effect: no completed claim found for this exact mode"
+                    );
+                }
+            }
+        }
 
         if !self.db.claim_review(claim).await? {
             return Ok(ReviewRunResult {
@@ -305,20 +323,16 @@ impl ReviewEngine {
                             false,
                         )
                         .await;
-                    if let Err(err) = comments::create_issue_comment(
-                        &self.github,
-                        &repo_cfg.owner,
-                        &repo_cfg.name,
-                        pr_data.number,
-                        &in_progress,
-                    )
-                    .await
+                    let durable_body = build_durable_in_progress_comment(pr_data, &in_progress);
+                    if let Err(err) = self
+                        .sync_durable_review_comment(repo_cfg, pr_data, &durable_body)
+                        .await
                     {
                         tracing::warn!(
                             repo = %repo_cfg.full_name(),
                             pr = pr_data.number,
                             error = %err,
-                            "failed to post in-progress review comment"
+                            "failed to sync durable in-progress review comment"
                         );
                     }
                 }
@@ -333,7 +347,7 @@ impl ReviewEngine {
                 &model,
                 reasoning_effort,
                 dry_run,
-                options.force,
+                options.force || options.rerun_completed,
                 existing_reviews,
             )
             .await;
@@ -360,6 +374,47 @@ impl ReviewEngine {
                 Err(err)
             }
         }
+    }
+
+    async fn sync_durable_review_comment(
+        &self,
+        repo_cfg: &RepoConfig,
+        pr_data: &PullRequest,
+        body: &str,
+    ) -> Result<()> {
+        let issue_comments = comments::get_issue_comments(
+            &self.github,
+            &repo_cfg.owner,
+            &repo_cfg.name,
+            pr_data.number,
+        )
+        .await
+        .unwrap_or_default();
+        if let Some(existing) = find_durable_review_comment(
+            &issue_comments,
+            pr_data.number,
+            self.config.defaults.bot_name.as_str(),
+            self.authenticated_user.as_deref(),
+        ) {
+            comments::update_issue_comment(
+                &self.github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                existing.id,
+                body,
+            )
+            .await?;
+        } else {
+            comments::create_issue_comment(
+                &self.github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                pr_data.number,
+                body,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn compose_in_progress_comment(
@@ -784,12 +839,10 @@ impl ReviewEngine {
         let mut pending_findings: Vec<PendingFinding> = Vec::new();
         let has_structured_findings: bool;
 
-        // Prepend bot identity header on every review
-        body.push_str(&format!(
-            "> Automated review by [pr-reviewer]({}) | model: {} | commit: `{}`\n\n",
-            pr_reviewer_project_url(),
+        // Keep provenance available without putting review mechanics above the finding.
+        body.push_str(&build_review_metadata_block(
             model,
-            short_sha(&pr_data.head.sha),
+            &short_sha(&pr_data.head.sha),
         ));
 
         match parse_outcome {
@@ -1101,6 +1154,40 @@ impl ReviewEngine {
             .await?;
         }
 
+        // When 422 retry posted comments in the body instead of inline, record 0 inline comments.
+        // Also store the actual posted event (which may differ from the LLM verdict after
+        // self-review downgrade or 422 retry).
+        let posted_inline = if used_retry {
+            0
+        } else {
+            inline_comments.len() as i64
+        };
+        let actual_event = if used_retry { "COMMENT" } else { event };
+        let has_blocking_findings = pending_findings
+            .iter()
+            .any(|finding| finding.severity == CommentSeverity::Blocking);
+        let durable_body = build_durable_review_comment(
+            pr_data,
+            model,
+            verdict,
+            actual_event,
+            posted_inline,
+            findings_visible_to_github,
+            has_blocking_findings,
+            &body,
+        );
+        if let Err(err) = self
+            .sync_durable_review_comment(repo_cfg, pr_data, &durable_body)
+            .await
+        {
+            tracing::warn!(
+                repo = %repo_cfg.full_name(),
+                pr = pr_data.number,
+                error = %err,
+                "failed to sync durable completed review comment"
+            );
+        }
+
         if findings_visible_to_github {
             self.db
                 .mark_review_findings_posted(
@@ -1115,15 +1202,6 @@ impl ReviewEngine {
                 .await?;
         }
 
-        // When 422 retry posted comments in the body instead of inline, record 0 inline comments.
-        // Also store the actual posted event (which may differ from the LLM verdict after
-        // self-review downgrade or 422 retry).
-        let posted_inline = if used_retry {
-            0
-        } else {
-            inline_comments.len() as i64
-        };
-        let actual_event = if used_retry { "COMMENT" } else { event };
         self.db
             .complete_review(
                 &dedupe,
@@ -1621,6 +1699,116 @@ impl ReviewEngine {
             pr_data.number,
             comment.id,
             &reply,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn respond_to_maintainer_command(
+        &self,
+        repo_cfg: &RepoConfig,
+        pr_data: &PullRequest,
+        command: &str,
+        source_comment_id: u64,
+        source_author: &str,
+        source_body: &str,
+        orchestration_note: Option<&str>,
+        last_reviewed_sha: Option<&str>,
+    ) -> Result<()> {
+        let harness_kind = repo_cfg.resolved_harness(&self.config);
+        let model = repo_cfg.resolved_model(&self.config).to_string();
+        let reasoning_effort = repo_cfg.resolved_reasoning_effort(&self.config);
+        let repo_name = repo_cfg.full_name();
+        let review_state = if last_reviewed_sha == Some(pr_data.head.sha.as_str()) {
+            "reviewed_current_head"
+        } else if last_reviewed_sha.is_some() {
+            "new_head_pending_review"
+        } else {
+            "not_reviewed_yet"
+        };
+        let attempts = self
+            .db
+            .list_pr_review_attempts(&repo_name, pr_data.number as i64)
+            .await
+            .unwrap_or_default();
+
+        let mut prompt = String::new();
+        prompt.push_str("You are pr-reviewer, a persistent repository maintainer agent.\n");
+        prompt.push_str("A maintainer addressed you in a pull request issue comment. Respond as the maintainer agent, using the operational state below. Do not invent facts. Keep the reply concise and useful.\n");
+        prompt.push_str("Output JSON in a fenced block tagged exactly `pr-review-reply-json` with this schema:\n");
+        prompt.push_str("{\"reply\": string}\n\n");
+        prompt.push_str(&format!("Repository: {repo_name}\n"));
+        prompt.push_str(&format!("Pull request: #{}\n", pr_data.number));
+        prompt.push_str(&format!("PR title: {}\n", pr_data.title));
+        prompt.push_str(&format!("Current head SHA: {}\n", pr_data.head.sha));
+        prompt.push_str(&format!("Review state: {review_state}\n"));
+        prompt.push_str(&format!("Command: {command}\n"));
+        if let Some(note) = orchestration_note {
+            prompt.push_str(&format!("Daemon orchestration result: {note}\n"));
+        }
+        prompt.push_str(&format!("Source comment id: {source_comment_id}\n"));
+        prompt.push_str(&format!("Source author: {source_author}\n"));
+        prompt.push_str("\nSource comment:\n");
+        prompt.push_str(source_body);
+        prompt.push_str("\n\nRecent review attempts:\n");
+        if attempts.is_empty() {
+            prompt.push_str("- none\n");
+        } else {
+            for attempt in attempts.iter().rev().take(6).rev() {
+                prompt.push_str(&format!(
+                    "- sha={} status={} verdict={} comments={} completed={}\n",
+                    short_sha(&attempt.sha),
+                    attempt.status,
+                    attempt.verdict.as_deref().unwrap_or("unknown"),
+                    attempt
+                        .comments_posted
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    attempt.completed_at.as_deref().unwrap_or("not completed"),
+                ));
+            }
+        }
+        if let Some(instructions) = repo_cfg.custom_instructions.as_deref() {
+            prompt.push_str("\nRepository instructions:\n");
+            prompt.push_str(instructions);
+            prompt.push('\n');
+        }
+
+        let temp = tempdir().context("failed to create temp dir for command response")?;
+        let harness_impl = harness::for_kind(harness_kind);
+        let output = run_harness(
+            harness_impl.as_ref(),
+            HarnessRunRequest {
+                prompt,
+                model,
+                reasoning_effort,
+                working_dir: temp.path().to_path_buf(),
+                timeout_secs: self.config.harness.timeout_secs,
+            },
+        )
+        .await?;
+
+        let reply = match parse_reply_output(&output.stdout, &output.stderr)? {
+            ReplyParseOutcome::Structured(update) => update.reply,
+            ReplyParseOutcome::Raw(raw) => raw,
+            ReplyParseOutcome::Empty => String::new(),
+        };
+        let reply = reply.trim();
+        if reply.is_empty() {
+            return Err(anyhow!("harness returned empty command response"));
+        }
+
+        let marker = format!(
+            "<!-- pr-reviewer-command-response command={} pr={} source_comment={} sha={} -->",
+            command, pr_data.number, source_comment_id, pr_data.head.sha
+        );
+        comments::create_issue_comment(
+            &self.github,
+            &repo_cfg.owner,
+            &repo_cfg.name,
+            pr_data.number,
+            &format!("{marker}\n\n{reply}"),
         )
         .await?;
 
@@ -3204,6 +3392,13 @@ fn build_retry_review_body(body: &str, inline_comments: &[CreateReviewComment]) 
     retry_body
 }
 
+fn build_review_metadata_block(model: &str, short_sha: &str) -> String {
+    format!(
+        "<details>\n<summary>Review metadata</summary>\n\n- Reviewer: [pr-reviewer]({})\n- Model: `{model}`\n- Commit: `{short_sha}`\n\n</details>\n\n",
+        pr_reviewer_project_url(),
+    )
+}
+
 fn looks_like_reintroduction(comment: &str) -> bool {
     let lower = comment.to_ascii_lowercase();
     lower.contains("pr-reviewing agent")
@@ -3524,6 +3719,101 @@ fn has_screenshot_references(pr_body: Option<&str>) -> bool {
         || lower.contains("screenshot")
 }
 
+fn build_durable_in_progress_comment(pr_data: &PullRequest, status_comment: &str) -> String {
+    let mut body = String::new();
+    body.push_str(&durable_review_marker(pr_data.number));
+    body.push('\n');
+    body.push_str(&format!(
+        "<!-- pr-reviewer-status:in-progress pr={} sha={} -->\n\n",
+        pr_data.number, pr_data.head.sha
+    ));
+    body.push_str(status_comment.trim());
+    body.push_str("\n\n_This comment is updated in place by pr-reviewer._");
+    truncate_github_comment_body(&body)
+}
+
+fn build_durable_review_comment(
+    pr_data: &PullRequest,
+    model: &str,
+    verdict: ReviewVerdict,
+    actual_event: &str,
+    posted_inline: i64,
+    findings_visible_to_github: bool,
+    has_blocking_findings: bool,
+    review_body: &str,
+) -> String {
+    let mut body = String::new();
+    body.push_str(&durable_review_marker(pr_data.number));
+    body.push('\n');
+    body.push_str(&durable_verdict_marker(
+        pr_data.number,
+        &pr_data.head.sha,
+        verdict,
+        actual_event,
+    ));
+    body.push('\n');
+    if findings_visible_to_github
+        && has_blocking_findings
+        && verdict == ReviewVerdict::RequestChanges
+    {
+        body.push_str(&format!(
+            "<!-- pr-reviewer-action:fix-required pr={} sha={} finding=review-feedback -->\n",
+            pr_data.number, pr_data.head.sha
+        ));
+    }
+    body.push('\n');
+    if !findings_visible_to_github {
+        body.push_str(
+            "GitHub could not attach the structured review, so the findings are included here.\n\n",
+        );
+    }
+    body.push_str(review_body.trim());
+    body.push_str(&format!(
+        "\n\n<!-- pr-reviewer-meta model={model} event={actual_event} posted_inline={posted_inline} -->\n"
+    ));
+    truncate_github_comment_body(&body)
+}
+
+fn durable_review_marker(pr_number: u64) -> String {
+    format!("{DURABLE_REVIEW_MARKER_PREFIX} pr={pr_number} -->")
+}
+
+fn durable_verdict_marker(
+    pr_number: u64,
+    sha: &str,
+    verdict: ReviewVerdict,
+    actual_event: &str,
+) -> String {
+    format!(
+        "<!-- pr-reviewer-verdict:{} pr={} sha={} event={} -->",
+        durable_verdict_slug(verdict),
+        pr_number,
+        sha,
+        actual_event
+    )
+}
+
+fn durable_verdict_slug(verdict: ReviewVerdict) -> &'static str {
+    match verdict {
+        ReviewVerdict::RequestChanges => "needs-changes",
+        ReviewVerdict::NoIssues | ReviewVerdict::Approve => "no-issues",
+        ReviewVerdict::Comment => "comment",
+    }
+}
+
+fn find_durable_review_comment<'a>(
+    issue_comments: &'a [IssueComment],
+    pr_number: u64,
+    bot_name: &str,
+    authenticated_user: Option<&str>,
+) -> Option<&'a IssueComment> {
+    let marker = durable_review_marker(pr_number);
+    issue_comments.iter().rev().find(|comment| {
+        comment.body.contains(&marker)
+            && login_matches_bot(&comment.user.login, bot_name, authenticated_user)
+    })
+}
+
 fn verdict_label(verdict: ReviewVerdict) -> &'static str {
     match verdict {
         ReviewVerdict::NoIssues | ReviewVerdict::Approve => "NO_ISSUES",
@@ -3535,20 +3825,23 @@ fn verdict_label(verdict: ReviewVerdict) -> &'static str {
 #[cfg(test)]
 mod tests {
     use crate::github::types::{
-        CreateReviewComment, PullRequest, PullRequestBase, PullRequestHead, PullRequestReview,
-        RepoRef, ReviewComment, User,
+        CreateReviewComment, IssueComment, PullRequest, PullRequestBase, PullRequestHead,
+        PullRequestReview, RepoRef, ReviewComment, User,
     };
     use crate::review::parser::{
         CommentSeverity, ConfidenceLevel, FindingKind, ReviewComment as ParsedReviewComment,
+        ReviewVerdict,
     };
     use crate::store::db::ReviewFindingRecord;
 
     use super::{
         apply_scope_drift_policy, blocker_has_sufficient_evidence, build_direct_pushback_reply,
+        build_durable_in_progress_comment, build_durable_review_comment,
         build_final_review_summary_prompt, build_final_review_transcript,
         build_finding_delta_summary, build_in_progress_comment_fallback,
         build_prior_reviews_context, build_retry_review_body, build_review_memory,
-        build_thread_history, extract_in_progress_comment, finding_key, infer_pr_focus,
+        build_review_metadata_block, build_thread_history, durable_review_marker,
+        extract_in_progress_comment, find_durable_review_comment, finding_key, infer_pr_focus,
         line_is_authored_by_bot, login_matches_bot, looks_like_harness_error_output,
         looks_like_harness_transport_output, looks_like_reintroduction,
         normalize_in_progress_comment, normalize_summary_output, pr_reviewer_project_url,
@@ -3622,6 +3915,16 @@ mod tests {
         }
     }
 
+    fn issue_comment(id: u64, login: &str, body: &str) -> IssueComment {
+        IssueComment {
+            id,
+            body: body.to_string(),
+            user: test_user(login),
+            author_association: None,
+            created_at: format!("2026-03-30T00:{:02}:00Z", id),
+        }
+    }
+
     fn stored_finding(status: &str, severity: &str, fingerprint: &str) -> ReviewFindingRecord {
         ReviewFindingRecord {
             repo: "owner/repo".to_string(),
@@ -3670,6 +3973,75 @@ Ship the archive feature safely.",
         assert!(prompt.contains("Transcript:"));
         assert!(prompt.contains("## PR Description"));
         assert!(prompt.contains("> Summarize this context too."));
+    }
+
+    #[test]
+    fn durable_in_progress_comment_includes_stable_marker() {
+        let pr = test_pull_request_with_body(Some("Review me."));
+        let body = build_durable_in_progress_comment(&pr, "Taking a look.");
+
+        assert!(body.contains("<!-- pr-reviewer-review pr=15 -->"));
+        assert!(body.contains("<!-- pr-reviewer-status:in-progress pr=15 sha=abc123 -->"));
+        assert!(body.contains("Taking a look."));
+    }
+
+    #[test]
+    fn durable_review_comment_emits_fix_marker_for_blocking_changes() {
+        let pr = test_pull_request_with_body(Some("Review me."));
+        let body = build_durable_review_comment(
+            &pr,
+            "gpt-5.4",
+            ReviewVerdict::RequestChanges,
+            "REQUEST_CHANGES",
+            2,
+            true,
+            true,
+            "summary",
+        );
+
+        assert!(body.contains("<!-- pr-reviewer-review pr=15 -->"));
+        assert!(body.contains(
+            "<!-- pr-reviewer-verdict:needs-changes pr=15 sha=abc123 event=REQUEST_CHANGES -->"
+        ));
+        assert!(body.contains(
+            "<!-- pr-reviewer-action:fix-required pr=15 sha=abc123 finding=review-feedback -->"
+        ));
+        assert!(body.contains("\n\nsummary\n\n<!-- pr-reviewer-meta"));
+        assert!(body.contains(
+            "<!-- pr-reviewer-meta model=gpt-5.4 event=REQUEST_CHANGES posted_inline=2 -->"
+        ));
+        assert!(!body.contains("Review result"));
+        assert!(!body.contains("Commit:"));
+        assert!(!body.contains("inline finding"));
+        assert!(!body.contains("I posted"));
+        assert!(!body.contains("Updated in place"));
+    }
+
+    #[test]
+    fn review_metadata_block_is_collapsed() {
+        let body = build_review_metadata_block("gpt-5.3-codex", "e6f9a1e8");
+
+        assert!(body.starts_with("<details>\n<summary>Review metadata</summary>"));
+        assert!(body.contains("- Reviewer: [pr-reviewer]("));
+        assert!(body.contains("- Model: `gpt-5.3-codex`"));
+        assert!(body.contains("- Commit: `e6f9a1e8`"));
+        assert!(!body.contains("> Automated review by"));
+        assert!(body.ends_with("</details>\n\n"));
+    }
+
+    #[test]
+    fn durable_comment_lookup_prefers_latest_bot_marker() {
+        let marker = durable_review_marker(15);
+        let comments = vec![
+            issue_comment(1, "contributor", &marker),
+            issue_comment(2, "pr-reviewer", &marker),
+            issue_comment(3, "pr-reviewer", &marker),
+        ];
+
+        let found = find_durable_review_comment(&comments, 15, "pr-reviewer", None)
+            .expect("bot marker comment");
+
+        assert_eq!(found.id, 3);
     }
 
     #[test]

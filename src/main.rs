@@ -21,7 +21,8 @@ use config::{
 };
 use github::client::GitHubClient;
 use review::engine::{ReviewEngine, ReviewOptions};
-use store::db::{format_stats, Database, LogsFilter};
+use serde::Serialize;
+use store::db::{format_stats, Database, LogsFilter, WorkQueueEntry};
 
 #[derive(Parser, Debug)]
 #[command(name = "pr-reviewer", version, about = "Self-hosted PR review daemon")]
@@ -65,10 +66,18 @@ enum Commands {
         /// Has no effect on completed reviews — those entries are preserved.
         #[arg(long)]
         force: bool,
+        /// Intentionally rerun this exact PR/SHA/harness mode even if it already completed.
+        /// Also bypasses the GitHub already-posted guard for operator dogfooding.
+        #[arg(long)]
+        rerun_completed: bool,
     },
     Status {
         #[arg(long)]
         json: bool,
+    },
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
     },
     Logs {
         #[arg(long)]
@@ -145,6 +154,31 @@ enum ConfigCommand {
     RemoveToken,
     /// Show which token source is active
     TokenStatus,
+}
+
+#[derive(Subcommand, Debug)]
+enum QueueCommand {
+    List {
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        id: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    Retry {
+        id: i64,
+    },
+    Cancel {
+        id: i64,
+    },
 }
 
 #[tokio::main]
@@ -335,6 +369,7 @@ async fn main() -> Result<()> {
             model,
             reasoning_effort,
             force,
+            rerun_completed,
         } => {
             let cfg = Arc::new(AppConfig::load_or_default()?);
             let db = Database::new(AppConfig::db_file()?).await?;
@@ -358,6 +393,7 @@ async fn main() -> Result<()> {
                         model,
                         reasoning_effort,
                         force,
+                        rerun_completed,
                     },
                 )
                 .await?;
@@ -379,6 +415,61 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
                 println!("{}", daemon::format_status(&status));
+            }
+        }
+        Commands::Queue { command } => {
+            let db = Database::new(AppConfig::db_file()?).await?;
+            match command {
+                QueueCommand::List {
+                    repo,
+                    status,
+                    limit,
+                    json,
+                } => {
+                    let entries = db
+                        .list_work_queue(repo.as_deref(), status.as_deref(), limit)
+                        .await?;
+                    if json {
+                        let output = entries
+                            .iter()
+                            .map(QueueEntryOutput::from)
+                            .collect::<Vec<_>>();
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                    } else if entries.is_empty() {
+                        println!("no queued work found");
+                    } else {
+                        for entry in entries {
+                            println!("{}", format_queue_entry_line(&entry));
+                        }
+                    }
+                }
+                QueueCommand::Show { id, json } => {
+                    let Some(entry) = db.get_work_item(id).await? else {
+                        return Err(anyhow!("work item not found: {id}"));
+                    };
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&QueueEntryOutput::from(&entry))?
+                        );
+                    } else {
+                        println!("{}", format_queue_entry_detail(&entry));
+                    }
+                }
+                QueueCommand::Retry { id } => {
+                    if db.retry_work_item(id).await? {
+                        println!("requeued work item #{id}");
+                    } else {
+                        println!("work item #{id} was not retryable");
+                    }
+                }
+                QueueCommand::Cancel { id } => {
+                    if db.cancel_work_item(id).await? {
+                        println!("canceled work item #{id}");
+                    } else {
+                        println!("work item #{id} was not cancelable");
+                    }
+                }
             }
         }
         Commands::Logs {
@@ -584,6 +675,110 @@ fn parse_fork_policy(raw: &str) -> Result<ForkPolicy> {
         "full" => Ok(ForkPolicy::Full),
         _ => Err(anyhow!("invalid fork policy: {raw}")),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct QueueEntryOutput<'a> {
+    id: i64,
+    repo: &'a str,
+    pr_number: i64,
+    head_sha: &'a str,
+    task_kind: &'a str,
+    dedupe_key: &'a str,
+    source_comment_id: Option<i64>,
+    status: &'a str,
+    attempts: i64,
+    error_message: Option<&'a str>,
+    created_at: &'a str,
+    claimed_at: Option<&'a str>,
+    completed_at: Option<&'a str>,
+    payload: &'a str,
+}
+
+impl<'a> From<&'a WorkQueueEntry> for QueueEntryOutput<'a> {
+    fn from(entry: &'a WorkQueueEntry) -> Self {
+        Self {
+            id: entry.id,
+            repo: &entry.repo,
+            pr_number: entry.pr_number,
+            head_sha: &entry.head_sha,
+            task_kind: &entry.task_kind,
+            dedupe_key: &entry.dedupe_key,
+            source_comment_id: entry.source_comment_id,
+            status: &entry.status,
+            attempts: entry.attempts,
+            error_message: entry.error_message.as_deref(),
+            created_at: &entry.created_at,
+            claimed_at: entry.claimed_at.as_deref(),
+            completed_at: entry.completed_at.as_deref(),
+            payload: &entry.payload,
+        }
+    }
+}
+
+fn format_queue_entry_line(entry: &WorkQueueEntry) -> String {
+    let source = entry
+        .source_comment_id
+        .map(|id| format!(" comment={id}"))
+        .unwrap_or_default();
+    let error = entry
+        .error_message
+        .as_deref()
+        .map(|msg| format!(" error={}", truncate_one_line(msg, 80)))
+        .unwrap_or_default();
+    format!(
+        "#{id} {status} {task} {repo}#{pr} sha={sha} attempts={attempts}{source}{error}",
+        id = entry.id,
+        status = entry.status,
+        task = entry.task_kind,
+        repo = entry.repo,
+        pr = entry.pr_number,
+        sha = short_sha(&entry.head_sha),
+        attempts = entry.attempts,
+    )
+}
+
+fn format_queue_entry_detail(entry: &WorkQueueEntry) -> String {
+    let mut out = String::new();
+    out.push_str(&format_queue_entry_line(entry));
+    out.push('\n');
+    out.push_str(&format!("  dedupe: {}\n", entry.dedupe_key));
+    out.push_str(&format!("  created: {}\n", entry.created_at));
+    if let Some(claimed_at) = entry.claimed_at.as_deref() {
+        out.push_str(&format!("  claimed: {claimed_at}\n"));
+    }
+    if let Some(completed_at) = entry.completed_at.as_deref() {
+        out.push_str(&format!("  completed: {completed_at}\n"));
+    }
+    if let Some(error) = entry.error_message.as_deref() {
+        out.push_str(&format!("  error: {error}\n"));
+    }
+    out.push_str("  payload:\n");
+    out.push_str(&indent_lines(&entry.payload, "    "));
+    out
+}
+
+fn truncate_one_line(value: &str, max_chars: usize) -> String {
+    let mut out = value.replace(['\n', '\r'], " ");
+    if out.len() > max_chars {
+        out.truncate(max_chars.saturating_sub(3));
+        out.push_str("...");
+    }
+    out
+}
+
+fn indent_lines(value: &str, prefix: &str) -> String {
+    let mut out = String::new();
+    for line in value.lines() {
+        out.push_str(prefix);
+        out.push_str(line);
+        out.push('\n');
+    }
+    if out.is_empty() {
+        out.push_str(prefix);
+        out.push('\n');
+    }
+    out
 }
 
 async fn github_client_from_config(config: &AppConfig) -> Result<GitHubClient> {

@@ -255,6 +255,8 @@ pub struct RepoConfig {
 pub struct AutoFixConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub scan_default_branch: bool,
     #[serde(default = "default_auto_fix_base_branch")]
     pub base_branch: String,
     #[serde(default = "default_auto_fix_branch_prefix")]
@@ -263,6 +265,10 @@ pub struct AutoFixConfig {
     pub draft_pr: bool,
     #[serde(default = "default_auto_fix_max_changed_files")]
     pub max_changed_files: usize,
+    #[serde(default = "default_auto_fix_max_repairs_per_pr")]
+    pub max_repairs_per_pr: u32,
+    #[serde(default = "default_auto_fix_max_repairs_per_head")]
+    pub max_repairs_per_head: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,14 +410,25 @@ fn default_auto_fix_max_changed_files() -> usize {
     20
 }
 
+fn default_auto_fix_max_repairs_per_pr() -> u32 {
+    10
+}
+
+fn default_auto_fix_max_repairs_per_head() -> u32 {
+    1
+}
+
 impl Default for AutoFixConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            scan_default_branch: false,
             base_branch: default_auto_fix_base_branch(),
             branch_prefix: default_auto_fix_branch_prefix(),
             draft_pr: true,
             max_changed_files: default_auto_fix_max_changed_files(),
+            max_repairs_per_pr: default_auto_fix_max_repairs_per_pr(),
+            max_repairs_per_head: default_auto_fix_max_repairs_per_head(),
         }
     }
 }

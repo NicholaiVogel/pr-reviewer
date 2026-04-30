@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::config::{AppConfig, RepoConfig};
 use crate::github::client::{GitHubClient, ListPullsResult};
-use crate::github::types::{CreatePullRequestRequest, PullRequest};
+use crate::github::types::{CreatePullRequestRequest, IssueComment, PullRequest};
 use crate::harness;
 use crate::harness::spawn::{run_harness, HarnessRunRequest};
 use crate::repo_manager;
@@ -24,7 +24,7 @@ pub async fn scan_and_open_pr(
     github: &GitHubClient,
     db: &Database,
 ) -> Result<Option<AutoFixOutcome>> {
-    if !repo_cfg.auto_fix.enabled {
+    if !repo_cfg.auto_fix.enabled || !repo_cfg.auto_fix.scan_default_branch {
         return Ok(None);
     }
 
@@ -178,6 +178,178 @@ pub async fn scan_and_open_pr(
     }))
 }
 
+pub async fn repair_marked_pr(
+    config: &AppConfig,
+    repo_cfg: &RepoConfig,
+    github: &GitHubClient,
+    db: &Database,
+    pr_data: &PullRequest,
+    issue_comments: &[IssueComment],
+    authenticated_user: Option<&str>,
+    command_request_body: Option<&str>,
+) -> Result<Option<AutoFixOutcome>> {
+    if !repo_cfg.auto_fix.enabled {
+        return Ok(None);
+    }
+
+    let repair_context = if let Some(marker) = matching_repair_marker(
+        pr_data,
+        issue_comments,
+        config.defaults.bot_name.as_str(),
+        authenticated_user,
+    ) {
+        marker.comment_body
+    } else if let Some(body) = command_request_body {
+        format!("Maintainer requested repair with `@pr-reviewer fix`.\n\nCommand comment:\n{body}")
+    } else {
+        return Ok(None);
+    };
+
+    if !repo_cfg.is_managed() {
+        tracing::warn!(
+            repo = %repo_cfg.full_name(),
+            pr = pr_data.number,
+            "auto-fix PR repair is only supported for managed clones; skipping local_path repo"
+        );
+        return Ok(None);
+    }
+
+    if !is_same_repo_pr(repo_cfg, pr_data) {
+        tracing::info!(
+            repo = %repo_cfg.full_name(),
+            pr = pr_data.number,
+            head_repo = ?pr_data.head.repo.as_ref().map(|repo| repo.full_name.as_str()),
+            "auto-fix PR repair only mutates same-repo PR branches"
+        );
+        return Ok(None);
+    }
+
+    let claimed = db
+        .claim_auto_fix_repair(
+            &repo_cfg.full_name(),
+            pr_data.number as i64,
+            &pr_data.head.sha,
+            repo_cfg.auto_fix.max_repairs_per_pr,
+            repo_cfg.auto_fix.max_repairs_per_head,
+        )
+        .await?;
+    if !claimed {
+        tracing::debug!(
+            repo = %repo_cfg.full_name(),
+            pr = pr_data.number,
+            sha = %pr_data.head.sha,
+            "auto-fix repair skipped by iteration limits"
+        );
+        return Ok(None);
+    }
+
+    let start = Instant::now();
+    let repo_path = repo_cfg.effective_local_path()?;
+    repo_manager::fetch_latest_managed(&repo_path, github.token()).await?;
+    repo_manager::checkout_origin_branch(
+        &repo_path,
+        &pr_data.head.ref_name,
+        &pr_data.head.ref_name,
+    )
+    .await?;
+
+    let checked_out_sha = repo_manager::current_head_sha(&repo_path).await?;
+    if checked_out_sha != pr_data.head.sha {
+        repo_manager::hard_reset_to_origin(&repo_path, &pr_data.head.ref_name).await?;
+        return Err(anyhow!(
+            "auto-fix repair marker targeted {}, but checked out {} for {}#{}",
+            pr_data.head.sha,
+            checked_out_sha,
+            repo_cfg.full_name(),
+            pr_data.number
+        ));
+    }
+
+    let harness_kind = repo_cfg.resolved_harness(config);
+    let harness = harness::for_kind(harness_kind);
+    let prompt = build_pr_repair_prompt(repo_cfg, pr_data, &repair_context);
+    let output = run_harness(
+        harness.as_ref(),
+        HarnessRunRequest {
+            prompt,
+            model: repo_cfg.resolved_model(config).to_string(),
+            reasoning_effort: repo_cfg.resolved_reasoning_effort(config),
+            working_dir: repo_path.clone(),
+            timeout_secs: config.harness.timeout_secs,
+        },
+    )
+    .await
+    .context("auto-fix PR repair harness failed")?;
+
+    cleanup_harness_artifacts(&repo_path).await;
+    repo_manager::clean_ignored_worktree(&repo_path).await?;
+
+    if output.exit_code.is_some_and(|code| code != 0) {
+        repo_manager::hard_reset_to_origin(&repo_path, &pr_data.head.ref_name).await?;
+        return Err(anyhow!(
+            "auto-fix PR repair harness exited with {:?}: {}",
+            output.exit_code,
+            output.stderr.trim()
+        ));
+    }
+
+    let changed_paths = repo_manager::changed_file_paths(&repo_path).await?;
+    if changed_paths.is_empty() {
+        repo_manager::hard_reset_to_origin(&repo_path, &pr_data.head.ref_name).await?;
+        return Ok(Some(AutoFixOutcome {
+            scanned_sha: pr_data.head.sha.clone(),
+            pr_number: Some(pr_data.number),
+            changed_files: 0,
+            duration_secs: start.elapsed().as_secs_f64(),
+        }));
+    }
+
+    let changed_files = changed_paths.len();
+    if changed_files > repo_cfg.auto_fix.max_changed_files {
+        repo_manager::hard_reset_to_origin(&repo_path, &pr_data.head.ref_name).await?;
+        return Err(anyhow!(
+            "auto-fix PR repair changed {changed_files} files, exceeding max_changed_files={}",
+            repo_cfg.auto_fix.max_changed_files
+        ));
+    }
+
+    let (committable_paths, rejected_paths) = split_reviewable_auto_fix_paths(changed_paths);
+    if !rejected_paths.is_empty() {
+        repo_manager::hard_reset_to_origin(&repo_path, &pr_data.head.ref_name).await?;
+        return Err(anyhow!(
+            "auto-fix PR repair produced non-reviewable byproduct paths: {}",
+            rejected_paths.join(", ")
+        ));
+    }
+
+    repo_manager::commit_paths(
+        &repo_path,
+        &committable_paths,
+        &format!(
+            "fix: address pr-reviewer findings for {}",
+            &pr_data.head.sha[..12.min(pr_data.head.sha.len())]
+        ),
+    )
+    .await?;
+    repo_manager::push_head(&repo_path, github.token(), &pr_data.head.ref_name).await?;
+
+    Ok(Some(AutoFixOutcome {
+        scanned_sha: pr_data.head.sha.clone(),
+        pr_number: Some(pr_data.number),
+        changed_files,
+        duration_secs: start.elapsed().as_secs_f64(),
+    }))
+}
+
+pub fn has_matching_repair_marker(
+    pr_data: &PullRequest,
+    issue_comments: &[IssueComment],
+    bot_name: &str,
+    authenticated_user: Option<&str>,
+) -> bool {
+    matching_repair_marker(pr_data, issue_comments, bot_name, authenticated_user).is_some()
+}
+
 fn should_scan_base_sha(already_scanned: Option<&str>, base_sha: &str) -> bool {
     already_scanned != Some(base_sha)
 }
@@ -196,6 +368,72 @@ fn find_existing_auto_fix_pr(
                 .repo
                 .as_ref()
                 .is_some_and(|repo| repo.full_name.eq_ignore_ascii_case(head_repo))
+    })
+}
+
+#[derive(Debug, Clone)]
+struct RepairMarker {
+    comment_body: String,
+}
+
+fn matching_repair_marker(
+    pr_data: &PullRequest,
+    issue_comments: &[IssueComment],
+    bot_name: &str,
+    authenticated_user: Option<&str>,
+) -> Option<RepairMarker> {
+    issue_comments.iter().rev().find_map(|comment| {
+        if !login_matches_bot(&comment.user.login, bot_name, authenticated_user) {
+            return None;
+        }
+        let marker = parse_repair_marker(&comment.body)?;
+        if marker.pr_number == pr_data.number && marker.sha == pr_data.head.sha {
+            return Some(RepairMarker {
+                comment_body: comment.body.clone(),
+            });
+        }
+        None
+    })
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ParsedRepairMarker {
+    pr_number: u64,
+    sha: String,
+}
+
+fn parse_repair_marker(body: &str) -> Option<ParsedRepairMarker> {
+    let marker_start = "<!-- pr-reviewer-action:fix-required";
+    let start = body.find(marker_start)?;
+    let after_start = &body[start + marker_start.len()..];
+    let end = after_start.find("-->")?;
+    let marker_body = &after_start[..end];
+    let mut pr_number = None;
+    let mut sha = None;
+    for token in marker_body.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        match key {
+            "pr" => pr_number = value.parse::<u64>().ok(),
+            "sha" => sha = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Some(ParsedRepairMarker {
+        pr_number: pr_number?,
+        sha: sha?,
+    })
+}
+
+fn login_matches_bot(login: &str, bot_name: &str, authenticated_user: Option<&str>) -> bool {
+    login.eq_ignore_ascii_case(bot_name)
+        || authenticated_user.is_some_and(|user| login.eq_ignore_ascii_case(user))
+}
+
+fn is_same_repo_pr(repo_cfg: &RepoConfig, pr_data: &PullRequest) -> bool {
+    pr_data.head.repo.as_ref().is_some_and(|repo| {
+        !repo.fork && repo.full_name.eq_ignore_ascii_case(&repo_cfg.full_name())
     })
 }
 
@@ -310,6 +548,31 @@ fn build_auto_fix_prompt(repo_cfg: &RepoConfig, base_sha: &str) -> String {
     prompt
 }
 
+fn build_pr_repair_prompt(
+    repo_cfg: &RepoConfig,
+    pr_data: &PullRequest,
+    durable_review_comment: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("You are running inside a managed repository clone for pr-reviewer.\n");
+    prompt.push_str("The checkout is the exact pull request head that pr-reviewer already reviewed. Apply a small, focused patch that addresses the blocking pr-reviewer findings only.\n");
+    prompt.push_str("Do not broaden scope, reformat unrelated files, upgrade dependencies, or change behavior that was not called out by the review. Prefer focused tests when practical.\n");
+    prompt.push_str("If the review finding is wrong, stale, already fixed, security-sensitive, or cannot be repaired safely in this checkout, leave the working tree unchanged.\n\n");
+    prompt.push_str(&format!("Repository: {}\n", repo_cfg.full_name()));
+    prompt.push_str(&format!("Pull request: #{}\n", pr_data.number));
+    prompt.push_str(&format!("Reviewed head SHA: {}\n", pr_data.head.sha));
+    prompt.push_str(&format!("Branch: {}\n", pr_data.head.ref_name));
+    if let Some(instructions) = repo_cfg.custom_instructions.as_deref() {
+        prompt.push_str("\nRepository instructions:\n");
+        prompt.push_str(instructions);
+        prompt.push('\n');
+    }
+    prompt.push_str("\nDurable pr-reviewer comment:\n");
+    prompt.push_str(durable_review_comment);
+    prompt.push('\n');
+    prompt
+}
+
 fn build_pr_body(base_sha: &str) -> String {
     let mut body = String::new();
     body.push_str("Automated bug/security scan from `pr-reviewer`.\n\n");
@@ -325,10 +588,14 @@ async fn cleanup_harness_artifacts(repo_path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pr_body, find_existing_auto_fix_pr, is_reviewable_auto_fix_path,
-        should_scan_base_sha, split_reviewable_auto_fix_paths,
+        build_pr_body, build_pr_repair_prompt, find_existing_auto_fix_pr,
+        has_matching_repair_marker, is_reviewable_auto_fix_path, is_same_repo_pr,
+        parse_repair_marker, should_scan_base_sha, split_reviewable_auto_fix_paths,
     };
-    use crate::github::types::{PullRequest, PullRequestBase, PullRequestHead, RepoRef, User};
+    use crate::config::RepoConfig;
+    use crate::github::types::{
+        IssueComment, PullRequest, PullRequestBase, PullRequestHead, RepoRef, User,
+    };
 
     #[test]
     fn pr_body_does_not_include_harness_output() {
@@ -415,6 +682,100 @@ mod tests {
         assert!(is_reviewable_auto_fix_path("scripts/fix.sh"));
     }
 
+    #[test]
+    fn parses_repair_marker() {
+        let parsed = parse_repair_marker(
+            "<!-- pr-reviewer-action:fix-required pr=42 sha=abc123 finding=review-feedback -->",
+        )
+        .expect("marker");
+
+        assert_eq!(parsed.pr_number, 42);
+        assert_eq!(parsed.sha, "abc123");
+    }
+
+    #[test]
+    fn matching_repair_marker_requires_bot_and_live_sha() {
+        let pr = test_pr(42, "feature/fix", "main");
+        let comments = vec![
+            issue_comment(
+                1,
+                "contributor",
+                "<!-- pr-reviewer-action:fix-required pr=42 sha=abc123 finding=review-feedback -->",
+            ),
+            issue_comment(
+                2,
+                "pr-reviewer",
+                "<!-- pr-reviewer-action:fix-required pr=42 sha=old finding=review-feedback -->",
+            ),
+            issue_comment(
+                3,
+                "pr-reviewer",
+                "<!-- pr-reviewer-action:fix-required pr=42 sha=abc123 finding=review-feedback -->",
+            ),
+        ];
+
+        assert!(has_matching_repair_marker(
+            &pr,
+            &comments,
+            "pr-reviewer",
+            None
+        ));
+    }
+
+    #[test]
+    fn same_repo_pr_rejects_forks() {
+        let cfg = RepoConfig {
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+            local_path: None,
+            harness: None,
+            model: None,
+            reasoning_effort: None,
+            fork_policy: Default::default(),
+            trusted_authors: vec![],
+            ignore_paths: vec![],
+            custom_instructions: None,
+            gitnexus: false,
+            workflow: vec![],
+            auto_fix: Default::default(),
+        };
+        let same_repo = test_pr(42, "feature/fix", "main");
+        let fork = test_pr_with_head_repo(43, "feature/fix", "main", "fork/repo");
+
+        assert!(is_same_repo_pr(&cfg, &same_repo));
+        assert!(!is_same_repo_pr(&cfg, &fork));
+    }
+
+    #[test]
+    fn pr_repair_prompt_includes_review_marker_without_harness_output_contract() {
+        let cfg = RepoConfig {
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+            local_path: None,
+            harness: None,
+            model: None,
+            reasoning_effort: None,
+            fork_policy: Default::default(),
+            trusted_authors: vec![],
+            ignore_paths: vec![],
+            custom_instructions: None,
+            gitnexus: false,
+            workflow: vec![],
+            auto_fix: Default::default(),
+        };
+        let pr = test_pr(42, "feature/fix", "main");
+        let prompt = build_pr_repair_prompt(
+            &cfg,
+            &pr,
+            "<!-- pr-reviewer-action:fix-required pr=42 sha=abc123 -->\nReview body",
+        );
+
+        assert!(prompt.contains("Pull request: #42"));
+        assert!(prompt.contains("Reviewed head SHA: abc123"));
+        assert!(prompt.contains("Review body"));
+        assert!(prompt.contains("leave the working tree unchanged"));
+    }
+
     fn test_pr(number: u64, head_branch: &str, base_branch: &str) -> PullRequest {
         test_pr_with_head_repo(number, head_branch, base_branch, "owner/repo")
     }
@@ -453,6 +814,16 @@ mod tests {
             full_name: full_name.to_string(),
             fork: false,
             owner: test_user(owner),
+        }
+    }
+
+    fn issue_comment(id: u64, login: &str, body: &str) -> IssueComment {
+        IssueComment {
+            id,
+            body: body.to_string(),
+            user: test_user(login),
+            author_association: None,
+            created_at: format!("2026-04-29T00:{id:02}:00Z"),
         }
     }
 

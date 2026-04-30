@@ -238,8 +238,11 @@ pr-reviewer review <owner/repo>#<pr_number> \
   [--dry-run] \
   [--harness claude-code|opencode|codex] \
   [--model <model>] \
-  [--reasoning-effort none|low|medium|high|xhigh]
+  [--reasoning-effort none|low|medium|high|xhigh] \
+  [--force] \
+  [--rerun-completed]
 ```
+`--force` clears stale or failed local claims for the exact review mode. `--rerun-completed` is the operator escape hatch for dogfooding: it clears a completed local claim for the exact PR/SHA/harness/dry-run mode and bypasses the GitHub already-posted guard.
 
 ### `start`
 ```bash
@@ -258,6 +261,17 @@ pr-reviewer stop
 pr-reviewer status
 ```
 Shows daemon/process state and recent polling metadata.
+
+### `queue`
+```bash
+pr-reviewer queue list [--repo <owner/repo>] [--status pending|claimed|failed|completed|canceled] [--limit <n>] [--json]
+pr-reviewer queue show <id> [--json]
+pr-reviewer queue retry <id>
+pr-reviewer queue cancel <id>
+```
+Inspects and operates the persistent maintainer work queue. New PR heads, maintainer commands, and repair markers land here before the daemon invokes the configured agent.
+
+Maintainers can also operate the queue from PR issue comments with `@pr-reviewer fix`, `@pr-reviewer retry [id]`, and `@pr-reviewer cancel [id]`. `status`, `explain`, and queue-control acknowledgements are posted through the configured agent response path.
 
 ### `logs`
 ```bash

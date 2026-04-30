@@ -42,7 +42,10 @@ enabled = false
 #
 # [repos.auto_fix]
 # enabled = false
+# scan_default_branch = false
 # base_branch = "main"
 # branch_prefix = "pr-reviewer/auto-fix"
 # draft_pr = true
 # max_changed_files = 20
+# max_repairs_per_pr = 10
+# max_repairs_per_head = 1

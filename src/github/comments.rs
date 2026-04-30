@@ -19,8 +19,20 @@ pub async fn create_issue_comment(
     repo: &str,
     number: u64,
     body: &str,
-) -> Result<()> {
+) -> Result<IssueComment> {
     client.create_issue_comment(owner, repo, number, body).await
+}
+
+pub async fn update_issue_comment(
+    client: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    comment_id: u64,
+    body: &str,
+) -> Result<IssueComment> {
+    client
+        .update_issue_comment(owner, repo, comment_id, body)
+        .await
 }
 
 pub async fn get_existing_reviews(

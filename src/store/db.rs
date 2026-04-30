@@ -140,6 +140,55 @@ pub struct PendingFinalization {
     pub last_reviewed_sha: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkItemInsert {
+    pub repo: String,
+    pub pr_number: i64,
+    pub head_sha: String,
+    pub task_kind: String,
+    pub dedupe_key: String,
+    pub payload: String,
+    pub source_comment_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkItem {
+    pub id: i64,
+    pub repo: String,
+    pub pr_number: i64,
+    pub head_sha: String,
+    pub task_kind: String,
+    pub dedupe_key: String,
+    pub payload: String,
+    pub source_comment_id: Option<i64>,
+    pub attempts: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkQueueEntry {
+    pub id: i64,
+    pub repo: String,
+    pub pr_number: i64,
+    pub head_sha: String,
+    pub task_kind: String,
+    pub dedupe_key: String,
+    pub payload: String,
+    pub source_comment_id: Option<i64>,
+    pub status: String,
+    pub attempts: i64,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub claimed_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkQueueCounts {
+    pub pending: i64,
+    pub claimed: i64,
+    pub failed: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LogsFilter {
     pub repo: Option<String>,
@@ -337,6 +386,33 @@ impl Database {
                     created_at TEXT DEFAULT (datetime('now')),
                     UNIQUE(repo, fingerprint)
                 );
+
+                CREATE TABLE IF NOT EXISTS auto_fix_runs (
+                    repo TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    repair_count INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    PRIMARY KEY (repo, pr_number, head_sha)
+                );
+
+                CREATE TABLE IF NOT EXISTS work_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    task_kind TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    payload TEXT NOT NULL DEFAULT '{}',
+                    source_comment_id INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    claimed_at TEXT,
+                    completed_at TEXT
+                );
                 "#,
             )?;
 
@@ -372,6 +448,12 @@ impl Database {
             )?;
             ensure_column_exists(conn, "repo_state", "last_auto_fix_sha", "TEXT")?;
             ensure_column_exists(conn, "repo_state", "last_auto_fix_pr", "INTEGER")?;
+            ensure_column_exists(conn, "work_queue", "payload", "TEXT NOT NULL DEFAULT '{}'")?;
+            ensure_column_exists(conn, "work_queue", "source_comment_id", "INTEGER")?;
+            ensure_column_exists(conn, "work_queue", "attempts", "INTEGER NOT NULL DEFAULT 0")?;
+            ensure_column_exists(conn, "work_queue", "error_message", "TEXT")?;
+            ensure_column_exists(conn, "work_queue", "claimed_at", "TEXT")?;
+            ensure_column_exists(conn, "work_queue", "completed_at", "TEXT")?;
 
             // Reply deduplication: prevents replying to the same comment twice
             conn.execute_batch(
@@ -416,6 +498,31 @@ impl Database {
 
             let deletable = matches!(status.as_deref(), Some("claimed") | Some("failed"));
             if deletable {
+                conn.execute("DELETE FROM review_log WHERE dedupe_key = ?1", params![key])?;
+                Ok(status)
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    }
+
+    /// Deletes a completed review claim for the exact dedupe key so an operator
+    /// can intentionally rerun the same PR/SHA/harness mode. This is separate
+    /// from `delete_review_claim` so `--force` keeps preserving audit history by
+    /// default.
+    pub async fn delete_completed_review_claim(&self, dedupe_key: &str) -> Result<Option<String>> {
+        let key = dedupe_key.to_string();
+        self.run(move |conn| {
+            let status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM review_log WHERE dedupe_key = ?1",
+                    params![key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+
+            if status.as_deref() == Some("completed") {
                 conn.execute("DELETE FROM review_log WHERE dedupe_key = ?1", params![key])?;
                 Ok(status)
             } else {
@@ -1053,6 +1160,377 @@ impl Database {
         .await
     }
 
+    pub async fn claim_auto_fix_repair(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        head_sha: &str,
+        max_repairs_per_pr: u32,
+        max_repairs_per_head: u32,
+    ) -> Result<bool> {
+        let repo = repo.to_string();
+        let head_sha = head_sha.to_string();
+        self.run(move |conn| {
+            let total_for_pr: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(repair_count), 0) FROM auto_fix_runs WHERE repo = ?1 AND pr_number = ?2",
+                params![repo, pr_number],
+                |row| row.get(0),
+            )?;
+            if total_for_pr >= i64::from(max_repairs_per_pr) {
+                return Ok(false);
+            }
+
+            let total_for_head: i64 = conn
+                .query_row(
+                    "SELECT repair_count FROM auto_fix_runs WHERE repo = ?1 AND pr_number = ?2 AND head_sha = ?3",
+                    params![repo, pr_number, head_sha],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if total_for_head >= i64::from(max_repairs_per_head) {
+                return Ok(false);
+            }
+
+            conn.execute(
+                r#"
+                INSERT INTO auto_fix_runs (repo, pr_number, head_sha, repair_count)
+                VALUES (?1, ?2, ?3, 1)
+                ON CONFLICT(repo, pr_number, head_sha)
+                DO UPDATE SET
+                    repair_count = repair_count + 1,
+                    updated_at = datetime('now')
+                "#,
+                params![repo, pr_number, head_sha],
+            )?;
+            Ok(true)
+        })
+        .await
+    }
+
+    pub async fn enqueue_work_item(&self, item: WorkItemInsert) -> Result<bool> {
+        self.run(move |conn| {
+            let changed = conn.execute(
+                r#"
+                INSERT INTO work_queue (
+                    repo, pr_number, head_sha, task_kind, dedupe_key, payload, source_comment_id
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(dedupe_key) DO NOTHING
+                "#,
+                params![
+                    item.repo,
+                    item.pr_number,
+                    item.head_sha,
+                    item.task_kind,
+                    item.dedupe_key,
+                    item.payload,
+                    item.source_comment_id,
+                ],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn claim_pending_work_items(&self, limit: usize) -> Result<Vec<WorkItem>> {
+        let limit = limit.max(1) as i64;
+        self.run(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let ids: Vec<i64> = {
+                let mut stmt = tx.prepare(
+                    r#"
+                    SELECT id
+                      FROM work_queue
+                     WHERE status = 'pending'
+                     ORDER BY created_at ASC, id ASC
+                     LIMIT ?1
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![limit], |row| row.get(0))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                out
+            };
+
+            let mut claimed = Vec::new();
+            for id in ids {
+                let changed = tx.execute(
+                    r#"
+                    UPDATE work_queue
+                       SET status = 'claimed',
+                           attempts = attempts + 1,
+                           claimed_at = datetime('now'),
+                           error_message = NULL
+                     WHERE id = ?1
+                       AND status = 'pending'
+                    "#,
+                    params![id],
+                )?;
+                if changed == 0 {
+                    continue;
+                }
+
+                let item = tx.query_row(
+                    r#"
+                    SELECT id, repo, pr_number, head_sha, task_kind, dedupe_key,
+                           payload, source_comment_id, attempts
+                      FROM work_queue
+                     WHERE id = ?1
+                    "#,
+                    params![id],
+                    |row| {
+                        Ok(WorkItem {
+                            id: row.get(0)?,
+                            repo: row.get(1)?,
+                            pr_number: row.get(2)?,
+                            head_sha: row.get(3)?,
+                            task_kind: row.get(4)?,
+                            dedupe_key: row.get(5)?,
+                            payload: row.get(6)?,
+                            source_comment_id: row.get(7)?,
+                            attempts: row.get(8)?,
+                        })
+                    },
+                )?;
+                claimed.push(item);
+            }
+            tx.commit()?;
+            Ok(claimed)
+        })
+        .await
+    }
+
+    pub async fn complete_work_item(&self, id: i64) -> Result<()> {
+        self.run(move |conn| {
+            conn.execute(
+                "UPDATE work_queue SET status = 'completed', completed_at = datetime('now') WHERE id = ?1",
+                params![id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn fail_work_item(&self, id: i64, error_message: &str) -> Result<()> {
+        let message = error_message.to_string();
+        self.run(move |conn| {
+            conn.execute(
+                "UPDATE work_queue SET status = 'failed', error_message = ?2, completed_at = datetime('now') WHERE id = ?1",
+                params![id, message],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn retry_work_item(&self, id: i64) -> Result<bool> {
+        self.run(move |conn| {
+            let changed = conn.execute(
+                r#"
+                UPDATE work_queue
+                   SET status = 'pending',
+                       error_message = NULL,
+                       claimed_at = NULL,
+                       completed_at = NULL
+                 WHERE id = ?1
+                   AND status IN ('failed', 'canceled')
+                "#,
+                params![id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn retry_latest_failed_work_item_for_pr(
+        &self,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<Option<i64>> {
+        let repo = repo.to_string();
+        self.run(move |conn| {
+            let id: Option<i64> = conn
+                .query_row(
+                    r#"
+                    SELECT id
+                      FROM work_queue
+                     WHERE repo = ?1
+                       AND pr_number = ?2
+                       AND status = 'failed'
+                     ORDER BY completed_at DESC, id DESC
+                     LIMIT 1
+                    "#,
+                    params![repo, pr_number],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            let Some(id) = id else {
+                return Ok(None);
+            };
+
+            conn.execute(
+                r#"
+                UPDATE work_queue
+                   SET status = 'pending',
+                       error_message = NULL,
+                       claimed_at = NULL,
+                       completed_at = NULL
+                 WHERE id = ?1
+                "#,
+                params![id],
+            )?;
+            Ok(Some(id))
+        })
+        .await
+    }
+
+    pub async fn cancel_work_item(&self, id: i64) -> Result<bool> {
+        self.run(move |conn| {
+            let changed = conn.execute(
+                r#"
+                UPDATE work_queue
+                   SET status = 'canceled',
+                       completed_at = datetime('now')
+                 WHERE id = ?1
+                   AND status IN ('pending', 'failed')
+                "#,
+                params![id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn cancel_work_items_for_pr(&self, repo: &str, pr_number: i64) -> Result<usize> {
+        let repo = repo.to_string();
+        self.run(move |conn| {
+            let changed = conn.execute(
+                r#"
+                UPDATE work_queue
+                   SET status = 'canceled',
+                       completed_at = datetime('now')
+                 WHERE repo = ?1
+                   AND pr_number = ?2
+                   AND status IN ('pending', 'failed')
+                "#,
+                params![repo, pr_number],
+            )?;
+            Ok(changed)
+        })
+        .await
+    }
+
+    pub async fn sweep_stale_work_items(&self, stale_age_secs: u64) -> Result<usize> {
+        self.run(move |conn| {
+            let changed = conn.execute(
+                r#"
+                UPDATE work_queue
+                   SET status = 'pending',
+                       error_message = 'requeued after stale claimed state',
+                       claimed_at = NULL
+                 WHERE status = 'claimed'
+                   AND claimed_at IS NOT NULL
+                   AND claimed_at < datetime('now', ?1)
+                "#,
+                params![format!("-{stale_age_secs} seconds")],
+            )?;
+            Ok(changed)
+        })
+        .await
+    }
+
+    pub async fn list_work_queue(
+        &self,
+        repo: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<WorkQueueEntry>> {
+        let repo = repo.map(ToString::to_string);
+        let status = status.map(ToString::to_string);
+        let limit = limit.max(1) as i64;
+        self.run(move |conn| {
+            let mut sql = String::from(
+                r#"
+                SELECT id, repo, pr_number, head_sha, task_kind, dedupe_key,
+                       payload, source_comment_id, status, attempts, error_message,
+                       created_at, claimed_at, completed_at
+                  FROM work_queue
+                "#,
+            );
+            let mut clauses = Vec::new();
+            if repo.is_some() {
+                clauses.push("repo = ?1");
+            }
+            if status.is_some() {
+                clauses.push(if repo.is_some() {
+                    "status = ?2"
+                } else {
+                    "status = ?1"
+                });
+            }
+            if !clauses.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&clauses.join(" AND "));
+            }
+            sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ");
+            sql.push_str(&limit.to_string());
+
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = match (repo.as_deref(), status.as_deref()) {
+                (Some(repo), Some(status)) => {
+                    stmt.query_map(params![repo, status], map_work_queue_entry)?
+                }
+                (Some(repo), None) => stmt.query_map(params![repo], map_work_queue_entry)?,
+                (None, Some(status)) => stmt.query_map(params![status], map_work_queue_entry)?,
+                (None, None) => stmt.query_map([], map_work_queue_entry)?,
+            };
+
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub async fn get_work_item(&self, id: i64) -> Result<Option<WorkQueueEntry>> {
+        self.run(move |conn| {
+            conn.query_row(
+                r#"
+                SELECT id, repo, pr_number, head_sha, task_kind, dedupe_key,
+                       payload, source_comment_id, status, attempts, error_message,
+                       created_at, claimed_at, completed_at
+                  FROM work_queue
+                 WHERE id = ?1
+                "#,
+                params![id],
+                map_work_queue_entry,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+    }
+
+    pub async fn get_work_queue_counts(&self) -> Result<WorkQueueCounts> {
+        self.run(move |conn| {
+            let pending = work_queue_count(conn, "pending")?;
+            let claimed = work_queue_count(conn, "claimed")?;
+            let failed = work_queue_count(conn, "failed")?;
+            Ok(WorkQueueCounts {
+                pending,
+                claimed,
+                failed,
+            })
+        })
+        .await
+    }
+
     pub async fn set_repo_etag(&self, repo: &str, etag: Option<&str>) -> Result<()> {
         let repo = repo.to_string();
         let etag = etag.map(ToString::to_string);
@@ -1381,6 +1859,34 @@ fn open_conn(path: &PathBuf) -> Result<Connection> {
     Ok(conn)
 }
 
+fn work_queue_count(conn: &Connection, status: &str) -> Result<i64> {
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM work_queue WHERE status = ?1",
+        params![status],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+fn map_work_queue_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkQueueEntry> {
+    Ok(WorkQueueEntry {
+        id: row.get(0)?,
+        repo: row.get(1)?,
+        pr_number: row.get(2)?,
+        head_sha: row.get(3)?,
+        task_kind: row.get(4)?,
+        dedupe_key: row.get(5)?,
+        payload: row.get(6)?,
+        source_comment_id: row.get(7)?,
+        status: row.get(8)?,
+        attempts: row.get(9)?,
+        error_message: row.get(10)?,
+        created_at: row.get(11)?,
+        claimed_at: row.get(12)?,
+        completed_at: row.get(13)?,
+    })
+}
+
 pub fn dedupe_key(repo: &str, pr_number: u64, sha: &str, harness: &str, dry_run: bool) -> String {
     use sha2::{Digest, Sha256};
 
@@ -1590,6 +2096,16 @@ mod tests {
 
         assert!(repo_columns.contains(&"last_auto_fix_sha".to_string()));
         assert!(repo_columns.contains(&"last_auto_fix_pr".to_string()));
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(auto_fix_runs)")
+            .expect("prepare auto_fix_runs pragma");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("query auto_fix_runs table_info");
+        let auto_fix_columns: Vec<String> = rows.map(|r| r.expect("col")).collect();
+
+        assert!(auto_fix_columns.contains(&"repair_count".to_string()));
     }
 
     #[tokio::test]
@@ -1611,6 +2127,35 @@ mod tests {
         assert_eq!(
             db.get_last_auto_fix_sha("o/r").await.expect("stored"),
             Some("abc123".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_fix_repair_claim_respects_pr_and_head_limits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        assert!(db
+            .claim_auto_fix_repair("o/r", 1, "sha1", 2, 1)
+            .await
+            .expect("first claim"));
+        assert!(
+            !db.claim_auto_fix_repair("o/r", 1, "sha1", 2, 1)
+                .await
+                .expect("same head blocked"),
+            "same head should respect per-head limit"
+        );
+        assert!(db
+            .claim_auto_fix_repair("o/r", 1, "sha2", 2, 1)
+            .await
+            .expect("second head claim"));
+        assert!(
+            !db.claim_auto_fix_repair("o/r", 1, "sha3", 2, 1)
+                .await
+                .expect("third pr claim blocked"),
+            "third repair should respect per-PR limit"
         );
     }
 
@@ -1920,6 +2465,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_completed_review_claim_allows_explicit_rerun() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let claim = ReviewClaim {
+            dedupe_key: "rerun-completed".to_string(),
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            sha: "abc".to_string(),
+            harness: "codex".to_string(),
+            model: None,
+        };
+
+        assert!(db.claim_review(claim.clone()).await.expect("claim"));
+        db.complete_review(
+            "rerun-completed",
+            0,
+            Some("COMMENT"),
+            1.0,
+            1,
+            10,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("complete");
+
+        assert_eq!(
+            db.delete_completed_review_claim("rerun-completed")
+                .await
+                .expect("delete completed")
+                .as_deref(),
+            Some("completed")
+        );
+        assert!(db.claim_review(claim).await.expect("reclaim"));
+    }
+
+    #[tokio::test]
     async fn delete_review_claim_returns_none_for_missing_key() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::new(dir.path().join("state.db"))
@@ -2206,6 +2792,175 @@ mod tests {
 
         assert!(db.claim_review(claim).await.expect("claim"));
         assert_eq!(db.get_claimed_reviews().await.expect("depth"), 1);
+    }
+
+    #[tokio::test]
+    async fn work_queue_dedupes_and_claims_pending_items() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let item = WorkItemInsert {
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            head_sha: "abc".to_string(),
+            task_kind: "review_pr".to_string(),
+            dedupe_key: "review:o/r:1:abc".to_string(),
+            payload: "{}".to_string(),
+            source_comment_id: None,
+        };
+
+        assert!(db
+            .enqueue_work_item(item.clone())
+            .await
+            .expect("first enqueue"));
+        assert!(!db.enqueue_work_item(item).await.expect("duplicate enqueue"));
+        let counts = db.get_work_queue_counts().await.expect("counts");
+        assert_eq!(counts.pending, 1);
+        assert_eq!(counts.claimed, 0);
+
+        let claimed = db.claim_pending_work_items(10).await.expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].task_kind, "review_pr");
+        assert_eq!(claimed[0].attempts, 1);
+        let counts = db
+            .get_work_queue_counts()
+            .await
+            .expect("counts after claim");
+        assert_eq!(counts.pending, 0);
+        assert_eq!(counts.claimed, 1);
+        assert!(db
+            .claim_pending_work_items(10)
+            .await
+            .expect("second claim")
+            .is_empty());
+
+        db.complete_work_item(claimed[0].id)
+            .await
+            .expect("complete");
+        let conn = open_conn(db.path()).expect("open db");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM work_queue WHERE id = ?1",
+                params![claimed[0].id],
+                |row| row.get(0),
+            )
+            .expect("status");
+        assert_eq!(status, "completed");
+    }
+
+    #[tokio::test]
+    async fn work_queue_supports_fail_retry_cancel_and_stale_sweep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        let item = WorkItemInsert {
+            repo: "o/r".to_string(),
+            pr_number: 1,
+            head_sha: "abc".to_string(),
+            task_kind: "repair_pr".to_string(),
+            dedupe_key: "repair:o/r:1:abc".to_string(),
+            payload: "{}".to_string(),
+            source_comment_id: Some(99),
+        };
+        assert!(db.enqueue_work_item(item).await.expect("enqueue"));
+        let claimed = db.claim_pending_work_items(1).await.expect("claim");
+        let id = claimed[0].id;
+
+        db.fail_work_item(id, "boom").await.expect("fail");
+        let failed = db.get_work_item(id).await.expect("get").expect("item");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.error_message.as_deref(), Some("boom"));
+
+        assert!(db.retry_work_item(id).await.expect("retry"));
+        let retried = db.get_work_item(id).await.expect("get").expect("item");
+        assert_eq!(retried.status, "pending");
+        assert!(retried.error_message.is_none());
+
+        let claimed = db.claim_pending_work_items(1).await.expect("claim again");
+        assert_eq!(claimed[0].attempts, 2);
+        {
+            let conn = open_conn(db.path()).expect("open db");
+            conn.execute(
+                "UPDATE work_queue SET claimed_at = datetime('now', '-2 hours') WHERE id = ?1",
+                params![id],
+            )
+            .expect("backdate claim");
+        }
+        assert_eq!(db.sweep_stale_work_items(60).await.expect("sweep"), 1);
+        let swept = db.get_work_item(id).await.expect("get").expect("item");
+        assert_eq!(swept.status, "pending");
+
+        assert!(db.cancel_work_item(id).await.expect("cancel"));
+        let canceled = db.get_work_item(id).await.expect("get").expect("item");
+        assert_eq!(canceled.status, "canceled");
+
+        let listed = db
+            .list_work_queue(Some("o/r"), Some("canceled"), 10)
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn work_queue_supports_pr_scoped_retry_and_cancel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::new(dir.path().join("state.db"))
+            .await
+            .expect("db");
+
+        for (dedupe, kind) in [
+            ("review:o/r:1:abc", "review_pr"),
+            ("repair:o/r:1:abc", "repair_pr"),
+        ] {
+            assert!(db
+                .enqueue_work_item(WorkItemInsert {
+                    repo: "o/r".to_string(),
+                    pr_number: 1,
+                    head_sha: "abc".to_string(),
+                    task_kind: kind.to_string(),
+                    dedupe_key: dedupe.to_string(),
+                    payload: "{}".to_string(),
+                    source_comment_id: None,
+                })
+                .await
+                .expect("enqueue"));
+        }
+
+        let claimed = db.claim_pending_work_items(1).await.expect("claim");
+        let failed_id = claimed[0].id;
+        db.fail_work_item(failed_id, "boom").await.expect("fail");
+
+        assert_eq!(
+            db.retry_latest_failed_work_item_for_pr("o/r", 1)
+                .await
+                .expect("retry latest"),
+            Some(failed_id)
+        );
+        assert_eq!(
+            db.get_work_item(failed_id)
+                .await
+                .expect("get")
+                .expect("item")
+                .status,
+            "pending"
+        );
+
+        assert_eq!(
+            db.cancel_work_items_for_pr("o/r", 1)
+                .await
+                .expect("cancel pr"),
+            2
+        );
+        let canceled = db
+            .list_work_queue(Some("o/r"), Some("canceled"), 10)
+            .await
+            .expect("list canceled");
+        assert_eq!(canceled.len(), 2);
     }
 
     #[tokio::test]

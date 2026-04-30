@@ -9,7 +9,7 @@ use crate::github::types::{
     ContentResponse, CreateIssueCommentRequest, CreatePullRequestRequest,
     CreatePullRequestResponse, CreateRefRequest, CreateReplyRequest, CreateReviewRequest,
     GitRefResponse, IssueComment, PrFile, PullRequest, PullRequestReview, ReviewComment,
-    UpdateContentRequest,
+    UpdateContentRequest, UpdateIssueCommentRequest,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -497,7 +497,7 @@ impl GitHubClient {
         repo: &str,
         pr_number: u64,
         body: &str,
-    ) -> Result<()> {
+    ) -> Result<IssueComment> {
         let path = format!("/repos/{owner}/{repo}/issues/{pr_number}/comments");
         let payload = CreateIssueCommentRequest {
             body: body.to_string(),
@@ -510,13 +510,28 @@ impl GitHubClient {
             .context("GitHub create issue comment failed")?;
         self.update_rate_state(resp.headers());
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("GitHub issue comment failed ({status}): {text}"));
-        }
+        handle_json(resp).await
+    }
 
-        Ok(())
+    pub async fn update_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<IssueComment> {
+        let path = format!("/repos/{owner}/{repo}/issues/comments/{comment_id}");
+        let payload = UpdateIssueCommentRequest {
+            body: body.to_string(),
+        };
+        let resp = self
+            .request(Method::PATCH, &path)
+            .json(&payload)
+            .send()
+            .await
+            .context("GitHub update issue comment failed")?;
+        self.update_rate_state(resp.headers());
+        handle_json(resp).await
     }
 
     pub async fn create_pull_request_with_options(

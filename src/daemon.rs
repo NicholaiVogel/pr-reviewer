@@ -10,16 +10,21 @@ use anyhow::{anyhow, Context, Result};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use rand::Rng;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, RepoConfig};
 use crate::github::client::{GitHubClient, ListPullsResult};
+use crate::github::pr;
+use crate::github::types::{IssueComment, PullRequest};
 use crate::review::engine::{ReviewEngine, ReviewOptions};
-use crate::store::db::Database;
+use crate::store::db::{Database, WorkItem, WorkItemInsert};
 
 const RATE_LIMIT_TOTAL: u32 = 5000;
+const WORK_KIND_REVIEW_PR: &str = "review_pr";
+const WORK_KIND_RESPOND_TO_COMMAND: &str = "respond_to_command";
+const WORK_KIND_REPAIR_PR: &str = "repair_pr";
 
 pub async fn start(
     config: AppConfig,
@@ -61,6 +66,14 @@ pub async fn start(
 
     let stale_age = config.harness.timeout_secs + 30;
     let _ = db.sweep_stale_claims(stale_age).await?;
+    let stale_work = db.sweep_stale_work_items(stale_age).await?;
+    if stale_work > 0 {
+        tracing::warn!(
+            count = stale_work,
+            stale_age_secs = stale_age,
+            "requeued stale claimed work items"
+        );
+    }
 
     // Shared flag so finalization workers can signal that a PR was actually
     // archived (i.e. confirmed closed/merged) back to the main poll loop.
@@ -97,7 +110,7 @@ pub async fn start(
 
         for repo_cfg in config.repos.clone() {
             let repo_name = repo_cfg.full_name();
-            if repo_cfg.auto_fix.enabled {
+            if repo_cfg.auto_fix.enabled && repo_cfg.auto_fix.scan_default_branch {
                 if let Some(permit) = try_acquire_worker_permit(&semaphore) {
                     let config_for_auto_fix = config.clone();
                     let repo_for_auto_fix = repo_cfg.clone();
@@ -177,25 +190,8 @@ pub async fn start(
                         let state = db.get_pr_state(&repo_name, pr.number as i64).await?;
                         let already = state.as_ref().and_then(|s| s.last_reviewed_sha.clone());
                         if already.as_deref() != Some(pr.head.sha.as_str()) {
-                            changes_detected = true;
-
-                            let permit = semaphore.clone().acquire_owned().await?;
-                            let engine = engine.clone();
-                            let repo_cfg = repo_cfg.clone();
-                            let pr_for_review = pr.clone();
-                            workers.spawn(async move {
-                                let _permit = permit;
-                                let res = engine
-                                    .review_existing_pr(
-                                        &repo_cfg,
-                                        &pr_for_review,
-                                        ReviewOptions::default(),
-                                    )
-                                    .await;
-                                if let Err(err) = res {
-                                    tracing::error!(repo = %repo_cfg.full_name(), pr = pr_for_review.number, error = %err, "review failed");
-                                }
-                            });
+                            changes_detected |=
+                                enqueue_review_work_item(&db, &repo_name, &pr).await?;
                         }
 
                         let last_comment_check =
@@ -297,6 +293,71 @@ pub async fn start(
                             }
                         }
 
+                        if let Ok(issue_comments) = github
+                            .get_issue_comments(&repo_cfg.owner, &repo_cfg.name, pr.number)
+                            .await
+                        {
+                            if repo_cfg.auto_fix.enabled
+                                && crate::auto_fix::has_matching_repair_marker(
+                                    &pr,
+                                    &issue_comments,
+                                    config.defaults.bot_name.as_str(),
+                                    engine.authenticated_user(),
+                                )
+                            {
+                                changes_detected |=
+                                    enqueue_repair_work_item(&db, &repo_name, &pr, None).await?;
+                            }
+
+                            for comment in issue_comments {
+                                if should_skip_command_comment(
+                                    &comment,
+                                    config.defaults.bot_name.as_str(),
+                                    engine.authenticated_user(),
+                                ) {
+                                    continue;
+                                }
+                                let Some(command) = parse_pr_reviewer_command(
+                                    &comment.body,
+                                    &config.defaults.bot_name,
+                                ) else {
+                                    continue;
+                                };
+                                if !is_maintainer_comment(&comment) {
+                                    tracing::info!(
+                                        repo = %repo_name,
+                                        pr = pr.number,
+                                        comment_id = comment.id,
+                                        login = %comment.user.login,
+                                        association = ?comment.author_association,
+                                        "ignoring pr-reviewer command from non-maintainer"
+                                    );
+                                    continue;
+                                }
+                                let claimed = db
+                                    .claim_reply(&repo_name, pr.number as i64, comment.id as i64)
+                                    .await?;
+                                if !claimed {
+                                    continue;
+                                }
+
+                                let outcome = apply_maintainer_command(
+                                    &db, &repo_cfg, &repo_name, &pr, &comment, command,
+                                )
+                                .await?;
+                                changes_detected |= outcome.changed;
+                                changes_detected |= enqueue_command_work_item(
+                                    &db,
+                                    &repo_name,
+                                    &pr,
+                                    &comment,
+                                    command,
+                                    outcome.orchestration_note,
+                                )
+                                .await?;
+                            }
+                        }
+
                         // Only update comment check timestamp here. The review worker
                         // updates last_reviewed_sha when the review completes — doing it
                         // here would race with in-flight workers and cause spurious
@@ -370,6 +431,17 @@ pub async fn start(
                 }
             }
         }
+
+        spawn_pending_work_items(
+            &config,
+            &db,
+            &github,
+            &engine,
+            &semaphore,
+            &mut workers,
+            &auto_fix_detected,
+        )
+        .await?;
 
         while workers.try_join_next().is_some() {}
 
@@ -445,6 +517,9 @@ pub struct DaemonSnapshot {
     pub last_heartbeat_at: Option<String>,
     pub heartbeat_age_secs: Option<i64>,
     pub active_workers: i64,
+    pub pending_work: i64,
+    pub claimed_work: i64,
+    pub failed_work: i64,
     pub claimed_reviews: i64,
     pub watched_repos: Vec<String>,
     pub rate_limit: RateLimitSnapshot,
@@ -457,6 +532,7 @@ pub async fn collect_status(db: &Database, config: &AppConfig) -> Result<DaemonS
 
     let daemon = db.get_daemon_status().await?;
     let claimed_reviews = db.get_claimed_reviews().await?;
+    let work_queue = db.get_work_queue_counts().await?;
     let now = chrono::Utc::now();
 
     let uptime_secs = if running {
@@ -488,6 +564,9 @@ pub async fn collect_status(db: &Database, config: &AppConfig) -> Result<DaemonS
         last_heartbeat_at: daemon.last_poll_at,
         heartbeat_age_secs,
         active_workers: daemon.active_reviews,
+        pending_work: work_queue.pending,
+        claimed_work: work_queue.claimed,
+        failed_work: work_queue.failed,
         claimed_reviews,
         watched_repos: config.repos.iter().map(|repo| repo.full_name()).collect(),
         rate_limit: RateLimitSnapshot {
@@ -542,6 +621,9 @@ pub fn format_status(snapshot: &DaemonSnapshot) -> String {
 
     let _ = writeln!(out);
     let _ = writeln!(out, "Queue");
+    let _ = writeln!(out, "  pending work: {}", snapshot.pending_work);
+    let _ = writeln!(out, "  claimed work: {}", snapshot.claimed_work);
+    let _ = writeln!(out, "  failed work: {}", snapshot.failed_work);
     let _ = writeln!(out, "  claimed: {}", snapshot.claimed_reviews);
     let _ = writeln!(out, "  active workers: {}", snapshot.active_workers);
 
@@ -614,9 +696,494 @@ fn format_duration(secs: i64) -> String {
     }
 }
 
+async fn enqueue_review_work_item(
+    db: &Database,
+    repo_name: &str,
+    pr: &PullRequest,
+) -> Result<bool> {
+    db.enqueue_work_item(WorkItemInsert {
+        repo: repo_name.to_string(),
+        pr_number: pr.number as i64,
+        head_sha: pr.head.sha.clone(),
+        task_kind: WORK_KIND_REVIEW_PR.to_string(),
+        dedupe_key: format!("review:{repo_name}:{}:{}", pr.number, pr.head.sha),
+        payload: "{}".to_string(),
+        source_comment_id: None,
+    })
+    .await
+}
+
+async fn enqueue_repair_work_item(
+    db: &Database,
+    repo_name: &str,
+    pr: &PullRequest,
+    payload: Option<String>,
+) -> Result<bool> {
+    db.enqueue_work_item(WorkItemInsert {
+        repo: repo_name.to_string(),
+        pr_number: pr.number as i64,
+        head_sha: pr.head.sha.clone(),
+        task_kind: WORK_KIND_REPAIR_PR.to_string(),
+        dedupe_key: format!("repair:{repo_name}:{}:{}", pr.number, pr.head.sha),
+        payload: payload.unwrap_or_else(|| "{}".to_string()),
+        source_comment_id: None,
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommandWorkPayload {
+    command: String,
+    source_comment_id: u64,
+    source_author: String,
+    source_body: String,
+    source_created_at: String,
+    author_association: Option<String>,
+    orchestration_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepairWorkPayload {
+    source: String,
+    source_comment_id: Option<u64>,
+    source_author: Option<String>,
+    source_body: Option<String>,
+}
+
+async fn enqueue_command_work_item(
+    db: &Database,
+    repo_name: &str,
+    pr: &PullRequest,
+    comment: &IssueComment,
+    command: MaintainerCommand,
+    orchestration_note: Option<String>,
+) -> Result<bool> {
+    let payload = serde_json::to_string(&CommandWorkPayload {
+        command: command.as_str().to_string(),
+        source_comment_id: comment.id,
+        source_author: comment.user.login.clone(),
+        source_body: comment.body.clone(),
+        source_created_at: comment.created_at.clone(),
+        author_association: comment.author_association.clone(),
+        orchestration_note,
+    })?;
+
+    db.enqueue_work_item(WorkItemInsert {
+        repo: repo_name.to_string(),
+        pr_number: pr.number as i64,
+        head_sha: pr.head.sha.clone(),
+        task_kind: WORK_KIND_RESPOND_TO_COMMAND.to_string(),
+        dedupe_key: format!("command:{repo_name}:{}:{}", pr.number, comment.id),
+        payload,
+        source_comment_id: Some(comment.id as i64),
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Default)]
+struct CommandActionOutcome {
+    changed: bool,
+    orchestration_note: Option<String>,
+}
+
+async fn apply_maintainer_command(
+    db: &Database,
+    repo_cfg: &RepoConfig,
+    repo_name: &str,
+    pr: &PullRequest,
+    comment: &IssueComment,
+    command: MaintainerCommand,
+) -> Result<CommandActionOutcome> {
+    match command {
+        MaintainerCommand::Status | MaintainerCommand::Explain => {
+            Ok(CommandActionOutcome::default())
+        }
+        MaintainerCommand::Fix => {
+            if !repo_cfg.auto_fix.enabled {
+                return Ok(CommandActionOutcome {
+                    changed: false,
+                    orchestration_note: Some(
+                        "Repair was requested, but auto_fix.enabled is false for this repository."
+                            .to_string(),
+                    ),
+                });
+            }
+
+            let payload = serde_json::to_string(&RepairWorkPayload {
+                source: "maintainer_command".to_string(),
+                source_comment_id: Some(comment.id),
+                source_author: Some(comment.user.login.clone()),
+                source_body: Some(comment.body.clone()),
+            })?;
+            let queued = enqueue_repair_work_item(db, repo_name, pr, Some(payload)).await?;
+            let note = if queued {
+                format!(
+                    "Queued repair_pr for {repo_name}#{} at {} from maintainer command comment {}.",
+                    pr.number,
+                    short_sha(&pr.head.sha),
+                    comment.id
+                )
+            } else {
+                format!(
+                    "A repair_pr task already exists for {repo_name}#{} at {}.",
+                    pr.number,
+                    short_sha(&pr.head.sha)
+                )
+            };
+            Ok(CommandActionOutcome {
+                changed: queued,
+                orchestration_note: Some(note),
+            })
+        }
+        MaintainerCommand::Retry { id } => {
+            let retried = if let Some(id) = id {
+                match db.get_work_item(id).await? {
+                    Some(item)
+                        if item.repo.eq_ignore_ascii_case(repo_name)
+                            && item.pr_number == pr.number as i64 =>
+                    {
+                        if db.retry_work_item(id).await? {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                db.retry_latest_failed_work_item_for_pr(repo_name, pr.number as i64)
+                    .await?
+            };
+
+            let note = retried
+                .map(|id| format!("Requeued failed work item #{id}."))
+                .unwrap_or_else(|| {
+                    "No matching failed work item was available to retry.".to_string()
+                });
+            Ok(CommandActionOutcome {
+                changed: retried.is_some(),
+                orchestration_note: Some(note),
+            })
+        }
+        MaintainerCommand::Cancel { id } => {
+            let canceled = if let Some(id) = id {
+                match db.get_work_item(id).await? {
+                    Some(item)
+                        if item.repo.eq_ignore_ascii_case(repo_name)
+                            && item.pr_number == pr.number as i64 =>
+                    {
+                        if db.cancel_work_item(id).await? {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    _ => 0,
+                }
+            } else {
+                db.cancel_work_items_for_pr(repo_name, pr.number as i64)
+                    .await?
+            };
+            let note = if canceled > 0 {
+                format!("Canceled {canceled} pending or failed work item(s) for this PR.")
+            } else {
+                "No cancelable pending or failed work items matched this PR.".to_string()
+            };
+            Ok(CommandActionOutcome {
+                changed: canceled > 0,
+                orchestration_note: Some(note),
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkItemOutcome {
+    auto_fix_changed: bool,
+}
+
+async fn spawn_pending_work_items(
+    config: &AppConfig,
+    db: &Database,
+    github: &GitHubClient,
+    engine: &ReviewEngine,
+    semaphore: &Arc<Semaphore>,
+    workers: &mut JoinSet<()>,
+    auto_fix_detected: &Arc<AtomicBool>,
+) -> Result<()> {
+    loop {
+        let Some(permit) = try_acquire_worker_permit(semaphore) else {
+            break;
+        };
+        let mut items = db.claim_pending_work_items(1).await?;
+        let Some(item) = items.pop() else {
+            drop(permit);
+            break;
+        };
+
+        let config = config.clone();
+        let db = db.clone();
+        let github = github.clone();
+        let engine = engine.clone();
+        let auto_fix_detected = auto_fix_detected.clone();
+        workers.spawn(async move {
+            let _permit = permit;
+            let item_id = item.id;
+            let repo = item.repo.clone();
+            let pr_number = item.pr_number;
+            let task_kind = item.task_kind.clone();
+            let result = process_work_item(&config, &db, &github, &engine, item).await;
+            match result {
+                Ok(outcome) => {
+                    if outcome.auto_fix_changed {
+                        auto_fix_detected.store(true, Ordering::Release);
+                    }
+                    if let Err(err) = db.complete_work_item(item_id).await {
+                        tracing::warn!(
+                            repo = %repo,
+                            pr = pr_number,
+                            task_kind = %task_kind,
+                            error = %err,
+                            "failed to mark work item completed"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        repo = %repo,
+                        pr = pr_number,
+                        task_kind = %task_kind,
+                        error = %err,
+                        "work item failed"
+                    );
+                    let _ = db.fail_work_item(item_id, &format!("{err:#}")).await;
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn process_work_item(
+    config: &AppConfig,
+    db: &Database,
+    github: &GitHubClient,
+    engine: &ReviewEngine,
+    item: WorkItem,
+) -> Result<WorkItemOutcome> {
+    let repo_cfg = config
+        .repos
+        .iter()
+        .find(|repo| repo.full_name().eq_ignore_ascii_case(&item.repo))
+        .cloned()
+        .ok_or_else(|| anyhow!("work item repo {} is no longer configured", item.repo))?;
+
+    match item.task_kind.as_str() {
+        WORK_KIND_REVIEW_PR => {
+            let pr_data = pr::get_pull_request(
+                github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                item.pr_number as u64,
+            )
+            .await?;
+            if pr_data.head.sha != item.head_sha {
+                tracing::debug!(
+                    repo = %item.repo,
+                    pr = item.pr_number,
+                    queued_sha = %item.head_sha,
+                    current_sha = %pr_data.head.sha,
+                    "skipping stale review work item"
+                );
+                return Ok(WorkItemOutcome::default());
+            }
+            engine
+                .review_existing_pr(&repo_cfg, &pr_data, ReviewOptions::default())
+                .await?;
+            Ok(WorkItemOutcome::default())
+        }
+        WORK_KIND_RESPOND_TO_COMMAND => {
+            let payload: CommandWorkPayload = serde_json::from_str(&item.payload)
+                .with_context(|| format!("invalid command work payload for item {}", item.id))?;
+            let pr_data = pr::get_pull_request(
+                github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                item.pr_number as u64,
+            )
+            .await?;
+            let last_reviewed_sha = db
+                .get_pr_state(&item.repo, item.pr_number)
+                .await?
+                .and_then(|state| state.last_reviewed_sha);
+            engine
+                .respond_to_maintainer_command(
+                    &repo_cfg,
+                    &pr_data,
+                    &payload.command,
+                    payload.source_comment_id,
+                    &payload.source_author,
+                    &payload.source_body,
+                    payload.orchestration_note.as_deref(),
+                    last_reviewed_sha.as_deref(),
+                )
+                .await?;
+            Ok(WorkItemOutcome::default())
+        }
+        WORK_KIND_REPAIR_PR => {
+            let repair_payload = serde_json::from_str::<RepairWorkPayload>(&item.payload).ok();
+            let pr_data = pr::get_pull_request(
+                github,
+                &repo_cfg.owner,
+                &repo_cfg.name,
+                item.pr_number as u64,
+            )
+            .await?;
+            let issue_comments = github
+                .get_issue_comments(&repo_cfg.owner, &repo_cfg.name, pr_data.number)
+                .await?;
+            let outcome = crate::auto_fix::repair_marked_pr(
+                config,
+                &repo_cfg,
+                github,
+                db,
+                &pr_data,
+                &issue_comments,
+                engine.authenticated_user(),
+                repair_payload
+                    .as_ref()
+                    .and_then(|payload| payload.source_body.as_deref()),
+            )
+            .await?;
+            Ok(WorkItemOutcome {
+                auto_fix_changed: outcome.is_some(),
+            })
+        }
+        _ => Err(anyhow!("unknown work item kind {}", item.task_kind)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MaintainerCommand {
+    Status,
+    Explain,
+    Fix,
+    Retry { id: Option<i64> },
+    Cancel { id: Option<i64> },
+}
+
+fn should_skip_command_comment(
+    comment: &IssueComment,
+    bot_name: &str,
+    authenticated_user: Option<&str>,
+) -> bool {
+    if comment.user.login.eq_ignore_ascii_case(bot_name) {
+        return true;
+    }
+    if authenticated_user.is_some_and(|login| comment.user.login.eq_ignore_ascii_case(login)) {
+        return true;
+    }
+    comment.user.is_bot()
+}
+
+fn is_maintainer_comment(comment: &IssueComment) -> bool {
+    matches!(
+        comment
+            .author_association
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_uppercase()
+            .as_str(),
+        "OWNER" | "MEMBER" | "COLLABORATOR"
+    )
+}
+
+fn parse_pr_reviewer_command(body: &str, bot_name: &str) -> Option<MaintainerCommand> {
+    let mention = format!("@{}", bot_name.to_ascii_lowercase());
+    let bot_suffix = format!("{mention}[bot]");
+    for line in body.lines() {
+        let lower = line.to_ascii_lowercase();
+        let Some(index) = lower.find(&mention) else {
+            continue;
+        };
+        let after_mention = &lower[index..];
+        let command_text = if let Some(rest) = after_mention.strip_prefix(&bot_suffix) {
+            rest
+        } else if let Some(rest) = after_mention.strip_prefix(&mention) {
+            rest
+        } else {
+            continue;
+        };
+        let command = command_text
+            .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, ':' | ',' | '-'))
+            .trim();
+        if command.starts_with("status") {
+            return Some(MaintainerCommand::Status);
+        }
+        if command.starts_with("explain") || command.starts_with("why") {
+            return Some(MaintainerCommand::Explain);
+        }
+        if command.starts_with("fix") {
+            return Some(MaintainerCommand::Fix);
+        }
+        if command.starts_with("retry") {
+            return Some(MaintainerCommand::Retry {
+                id: parse_command_id(command.strip_prefix("retry").unwrap_or_default()),
+            });
+        }
+        if command.starts_with("cancel") {
+            return Some(MaintainerCommand::Cancel {
+                id: parse_command_id(command.strip_prefix("cancel").unwrap_or_default()),
+            });
+        }
+    }
+    None
+}
+
+fn parse_command_id(rest: &str) -> Option<i64> {
+    rest.trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '#' | ':' | ','))
+        .split_whitespace()
+        .next()
+        .and_then(|raw| raw.trim_start_matches('#').parse::<i64>().ok())
+}
+
+impl MaintainerCommand {
+    fn as_str(self) -> &'static str {
+        match self {
+            MaintainerCommand::Status => "status",
+            MaintainerCommand::Explain => "explain",
+            MaintainerCommand::Fix => "fix",
+            MaintainerCommand::Retry { .. } => "retry",
+            MaintainerCommand::Cancel { .. } => "cancel",
+        }
+    }
+}
+
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::types::User;
+
+    fn test_user(login: &str) -> User {
+        User {
+            login: login.to_string(),
+            account_type: None,
+        }
+    }
+
+    fn test_issue_comment(association: Option<&str>) -> IssueComment {
+        IssueComment {
+            id: 1,
+            body: "@pr-reviewer status".to_string(),
+            user: test_user("maintainer"),
+            author_association: association.map(ToString::to_string),
+            created_at: "2026-04-29T00:00:00Z".to_string(),
+        }
+    }
 
     #[test]
     fn format_status_includes_key_fields() {
@@ -628,6 +1195,9 @@ mod tests {
             last_heartbeat_at: Some("2026-03-23T06:14:30Z".to_string()),
             heartbeat_age_secs: Some(30),
             active_workers: 2,
+            pending_work: 3,
+            claimed_work: 1,
+            failed_work: 0,
             claimed_reviews: 5,
             watched_repos: vec!["owner/repo".to_string()],
             rate_limit: RateLimitSnapshot {
@@ -644,6 +1214,8 @@ mod tests {
         assert!(out.contains("pid: 1234"));
         assert!(out.contains("uptime: 1h 02m 03s"));
         assert!(out.contains("last heartbeat: 2026-03-23T06:14:30Z (30s)"));
+        assert!(out.contains("pending work: 3"));
+        assert!(out.contains("claimed work: 1"));
         assert!(out.contains("claimed: 5"));
         assert!(out.contains("remaining: 4321 / 5000"));
         assert!(out.contains("owner/repo"));
@@ -655,6 +1227,50 @@ mod tests {
         let _held = try_acquire_worker_permit(&semaphore).expect("first permit");
 
         assert!(try_acquire_worker_permit(&semaphore).is_none());
+    }
+
+    #[test]
+    fn parses_pr_reviewer_status_command() {
+        assert_eq!(
+            parse_pr_reviewer_command("@pr-reviewer status please", "pr-reviewer"),
+            Some(MaintainerCommand::Status)
+        );
+        assert_eq!(
+            parse_pr_reviewer_command("@pr-reviewer explain", "pr-reviewer"),
+            Some(MaintainerCommand::Explain)
+        );
+        assert_eq!(
+            parse_pr_reviewer_command("plain status", "pr-reviewer"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_pr_reviewer_queue_control_commands() {
+        assert_eq!(
+            parse_pr_reviewer_command("@pr-reviewer fix", "pr-reviewer"),
+            Some(MaintainerCommand::Fix)
+        );
+        assert_eq!(
+            parse_pr_reviewer_command("@pr-reviewer retry #123", "pr-reviewer"),
+            Some(MaintainerCommand::Retry { id: Some(123) })
+        );
+        assert_eq!(
+            parse_pr_reviewer_command("@pr-reviewer cancel", "pr-reviewer"),
+            Some(MaintainerCommand::Cancel { id: None })
+        );
+    }
+
+    #[test]
+    fn command_authorization_uses_author_association() {
+        assert!(is_maintainer_comment(&test_issue_comment(Some("OWNER"))));
+        assert!(is_maintainer_comment(&test_issue_comment(Some(
+            "COLLABORATOR"
+        ))));
+        assert!(!is_maintainer_comment(&test_issue_comment(Some(
+            "CONTRIBUTOR"
+        ))));
+        assert!(!is_maintainer_comment(&test_issue_comment(None)));
     }
 }
 

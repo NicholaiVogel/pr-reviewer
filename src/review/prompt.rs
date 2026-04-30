@@ -17,8 +17,7 @@ pub fn build_review_prompt(
         "Focus on: bugs, security flaws, data corruption, race conditions, logic mistakes, breaking changes, and patterns that diverge from codebase conventions. Do not flag style-only issues unless they conceal a correctness problem.\n\n",
     );
     prompt.push_str(&format!(
-        "You are an automated review tool (identity: {}). State this in the first line of your summary.\n\n",
-        bot_name,
+        "You are {bot_name}, a persistent repository maintainer agent reviewing this PR. Write with the judgment and voice of a careful maintainer: direct, specific, and conversational. A little personality is fine when it follows naturally from the evidence, but avoid jokes, catchphrases, emojis, or performative cleverness. Do not sound like a template.\n\n",
     ));
     prompt.push_str("Instructions:\n");
     prompt.push_str(
@@ -62,6 +61,9 @@ pub fn build_review_prompt(
     prompt.push_str(
         "Do not turn adjacent architecture preferences into blockers. A blocker must be grounded in concrete evidence from the changed code or targeted context and must directly affect the PR's stated behavior, security, or data integrity.\n\n",
     );
+    prompt.push_str(
+        "Public review text should be natural and useful to a maintainer. Do not prefix the summary with labels like \"[Automated Review]\" or restate that you are automated; review metadata is handled outside your JSON output.\n\n",
+    );
 
     prompt.push_str(
         "\nYou MUST NOT approve this PR or state it is safe to merge. You are not authorized to make that call. Your role is to flag issues or signal readiness for human review.\n\n",
@@ -69,8 +71,7 @@ pub fn build_review_prompt(
 
     prompt.push_str("Output a JSON object in a fenced block tagged exactly `pr-review-json`.\n");
     prompt.push_str("Schema:\n");
-    prompt
-        .push_str("- summary: string (first line must identify this as an automated bot review)\n");
+    prompt.push_str("- summary: string (one or two natural sentences describing what you found)\n");
     prompt.push_str("- verdict: one of [\"no_issues\", \"comment\", \"request_changes\"]\n");
     prompt.push_str("  - \"no_issues\": nothing worth flagging, ready for human review\n");
     prompt.push_str("  - \"comment\": found issues worth discussing but not blocking\n");
@@ -97,7 +98,9 @@ pub fn build_review_prompt(
     prompt.push_str("Example output:\n");
     prompt.push_str("```pr-review-json\n");
     prompt.push_str("{\n");
-    prompt.push_str("  \"summary\": \"[Automated Review] Found one security issue and one null handling bug.\",\n");
+    prompt.push_str(
+        "  \"summary\": \"I found one security issue and one null-handling bug worth fixing before this lands.\",\n",
+    );
     prompt.push_str("  \"verdict\": \"request_changes\",\n");
     prompt.push_str("  \"confidence\": {\n");
     prompt.push_str("    \"level\": \"high\",\n");
@@ -139,4 +142,92 @@ pub fn build_review_prompt(
     prompt.push_str(context);
 
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AutoFixConfig, ForkPolicy};
+    use crate::github::types::{PullRequestBase, PullRequestHead, RepoRef, User};
+
+    fn test_user(login: &str) -> User {
+        User {
+            login: login.to_string(),
+            account_type: None,
+        }
+    }
+
+    fn test_repo_ref(full_name: &str) -> RepoRef {
+        RepoRef {
+            full_name: full_name.to_string(),
+            fork: false,
+            owner: test_user("owner"),
+        }
+    }
+
+    fn test_repo_config() -> RepoConfig {
+        RepoConfig {
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+            local_path: None,
+            harness: None,
+            model: None,
+            reasoning_effort: None,
+            fork_policy: ForkPolicy::Ignore,
+            trusted_authors: vec![],
+            ignore_paths: vec![],
+            custom_instructions: None,
+            gitnexus: true,
+            workflow: vec![],
+            auto_fix: AutoFixConfig::default(),
+        }
+    }
+
+    fn test_pull_request() -> PullRequest {
+        PullRequest {
+            number: 42,
+            title: "Tighten the review prompt".to_string(),
+            body: Some("Please review this.".to_string()),
+            draft: false,
+            state: "open".to_string(),
+            user: test_user("contributor"),
+            head: PullRequestHead {
+                sha: "abc123".to_string(),
+                ref_name: "feature".to_string(),
+                repo: Some(test_repo_ref("owner/repo")),
+            },
+            base: PullRequestBase {
+                ref_name: "main".to_string(),
+                repo: test_repo_ref("owner/repo"),
+            },
+            html_url: None,
+            updated_at: None,
+            closed_at: None,
+            merged_at: None,
+        }
+    }
+
+    #[test]
+    fn review_prompt_allows_natural_reviewer_voice() {
+        let prompt = build_review_prompt(
+            &test_repo_config(),
+            &test_pull_request(),
+            "diff context",
+            "PR-Reviewer-Ant",
+            None,
+            false,
+            None,
+        );
+
+        assert!(prompt.contains("persistent repository maintainer agent"));
+        assert!(prompt.contains("direct, specific, and conversational"));
+        assert!(prompt.contains("A little personality is fine"));
+        assert!(prompt.contains("Do not sound like a template"));
+        assert!(
+            prompt.contains("Do not prefix the summary with labels like \"[Automated Review]\"")
+        );
+        assert!(!prompt.contains("You are an automated review tool"));
+        assert!(!prompt.contains("first line must identify this as an automated bot review"));
+        assert!(!prompt.contains("\"summary\": \"[Automated Review]"));
+    }
 }
