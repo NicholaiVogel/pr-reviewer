@@ -170,11 +170,14 @@ pr-reviewer stats --since 2026-03-01
 
 - Whether the daemon process is running
 - Uptime, start time, and last heartbeat
-- The current review queue depth and active worker count
+- Pending, claimed, and failed maintainer work counts
+- The active worker count and legacy claimed review count
 - Watched repos from config
 - The last known GitHub rate limit snapshot
 
 Add `--json` when you want the same snapshot in a machine-readable form.
+
+Use `pr-reviewer queue list`, `pr-reviewer queue show <id>`, `pr-reviewer queue retry <id>`, and `pr-reviewer queue cancel <id>` to inspect or operate individual queued maintainer tasks.
 
 Things to watch for in logs:
 

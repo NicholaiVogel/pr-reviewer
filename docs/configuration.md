@@ -190,10 +190,13 @@ gitnexus = true
 
 [repos.auto_fix]
 enabled = false
+scan_default_branch = false
 base_branch = "main"
 branch_prefix = "pr-reviewer/auto-fix"
 draft_pr = true
 max_changed_files = 20
+max_repairs_per_pr = 10
+max_repairs_per_head = 1
 ```
 
 | Field | Description |
@@ -209,17 +212,33 @@ max_changed_files = 20
 | `custom_instructions` | Free-text hints appended to the review prompt |
 | `gitnexus` | Whether to include GitNexus impact analysis in context. Default: `true` (best-effort; gracefully skipped if unavailable) |
 
+### Maintainer work queue
+
+The daemon normalizes GitHub activity into persistent work items before invoking a harness. New PR heads enqueue `review_pr`, maintainer mentions enqueue `respond_to_command`, and live fix markers enqueue `repair_pr`. The queue is orchestration state only: the daemon claims, dedupes, rate-limits, and records each task, while the configured agent decides how to review, explain, or repair.
+
+`pr-reviewer status` shows pending, claimed, and failed work counts. Use `pr-reviewer queue list`, `show`, `retry`, and `cancel` to inspect or operate individual tasks. Completed, failed, and canceled task records remain in SQLite for debugging and idempotency.
+
+Maintainers can also operate the queue from PR issue comments:
+
+- `@pr-reviewer status` or `@pr-reviewer explain` enqueues an agent-authored response.
+- `@pr-reviewer fix` enqueues a `repair_pr` task for the current head when auto-fix is enabled.
+- `@pr-reviewer retry` retries the latest failed task for that PR; `@pr-reviewer retry <id>` targets one queue item.
+- `@pr-reviewer cancel` cancels pending or failed tasks for that PR; `@pr-reviewer cancel <id>` targets one queue item.
+
 ### `[repos.auto_fix]`
 
-Opt-in autonomous fixing for managed clones. When enabled, the daemon scans each new `base_branch` SHA, asks the configured harness to make a small bug/security fix if it finds one, pushes a `branch_prefix/<sha>` branch, and opens a PR. Repos with `local_path` are skipped so the daemon never resets a user-managed checkout.
+Opt-in autonomous fixing for managed clones. When enabled, the daemon enqueues a `repair_pr` work item only after a live `pr-reviewer-action:fix-required` marker targets the exact current PR head SHA. Repos with `local_path` are skipped so the daemon never resets a user-managed checkout. Default-branch scanning remains available only when `scan_default_branch = true`.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `enabled` | `false` | Enable release-branch bug/security scans and PR creation. |
-| `base_branch` | `"main"` | Branch to scan after it advances. |
+| `enabled` | `false` | Enable marker-driven PR-head repairs for managed clones. |
+| `scan_default_branch` | `false` | Also run the legacy release-branch bug/security scanner and open draft fix PRs. |
+| `base_branch` | `"main"` | Branch to scan when `scan_default_branch` is enabled. |
 | `branch_prefix` | `"pr-reviewer/auto-fix"` | Prefix for pushed bot branches. |
 | `draft_pr` | `true` | Open generated PRs as drafts. |
 | `max_changed_files` | `20` | Abort and reset if the harness changes too many files. |
+| `max_repairs_per_pr` | `10` | Stop automatic repair after this many attempts on one PR. |
+| `max_repairs_per_head` | `1` | Stop duplicate repair attempts against the same PR head SHA. |
 
 When enabled, pr-reviewer enriches context with:
 - ranked GitNexus processes related to changed files

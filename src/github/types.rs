@@ -81,6 +81,8 @@ pub struct IssueComment {
     pub id: u64,
     pub body: String,
     pub user: User,
+    #[serde(default)]
+    pub author_association: Option<String>,
     pub created_at: String,
 }
 
@@ -102,6 +104,11 @@ pub struct CreateReviewRequest {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateIssueCommentRequest {
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateIssueCommentRequest {
     pub body: String,
 }
 
