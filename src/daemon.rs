@@ -1039,6 +1039,16 @@ async fn process_work_item(
                 item.pr_number as u64,
             )
             .await?;
+            if pr_data.head.sha != item.head_sha {
+                tracing::debug!(
+                    repo = %item.repo,
+                    pr = item.pr_number,
+                    queued_sha = %item.head_sha,
+                    current_sha = %pr_data.head.sha,
+                    "skipping stale repair work item"
+                );
+                return Ok(WorkItemOutcome::default());
+            }
             let issue_comments = github
                 .get_issue_comments(&repo_cfg.owner, &repo_cfg.name, pr_data.number)
                 .await?;

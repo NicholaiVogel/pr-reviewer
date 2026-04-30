@@ -1160,7 +1160,7 @@ impl Database {
         .await
     }
 
-    pub async fn claim_auto_fix_repair(
+    pub async fn can_auto_fix_repair(
         &self,
         repo: &str,
         pr_number: i64,
@@ -1192,6 +1192,20 @@ impl Database {
                 return Ok(false);
             }
 
+            Ok(true)
+        })
+        .await
+    }
+
+    pub async fn record_auto_fix_repair(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        head_sha: &str,
+    ) -> Result<()> {
+        let repo = repo.to_string();
+        let head_sha = head_sha.to_string();
+        self.run(move |conn| {
             conn.execute(
                 r#"
                 INSERT INTO auto_fix_runs (repo, pr_number, head_sha, repair_count)
@@ -1203,7 +1217,7 @@ impl Database {
                 "#,
                 params![repo, pr_number, head_sha],
             )?;
-            Ok(true)
+            Ok(())
         })
         .await
     }
@@ -2131,28 +2145,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_fix_repair_claim_respects_pr_and_head_limits() {
+    async fn auto_fix_repair_record_respects_pr_and_head_limits() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::new(dir.path().join("state.db"))
             .await
             .expect("db");
 
         assert!(db
-            .claim_auto_fix_repair("o/r", 1, "sha1", 2, 1)
+            .can_auto_fix_repair("o/r", 1, "sha1", 2, 1)
             .await
-            .expect("first claim"));
+            .expect("first check"));
+        assert!(db
+            .can_auto_fix_repair("o/r", 1, "sha1", 2, 1)
+            .await
+            .expect("second check before record"));
+        db.record_auto_fix_repair("o/r", 1, "sha1")
+            .await
+            .expect("record first repair");
         assert!(
-            !db.claim_auto_fix_repair("o/r", 1, "sha1", 2, 1)
+            !db.can_auto_fix_repair("o/r", 1, "sha1", 2, 1)
                 .await
                 .expect("same head blocked"),
             "same head should respect per-head limit"
         );
         assert!(db
-            .claim_auto_fix_repair("o/r", 1, "sha2", 2, 1)
+            .can_auto_fix_repair("o/r", 1, "sha2", 2, 1)
             .await
-            .expect("second head claim"));
+            .expect("second head check"));
+        db.record_auto_fix_repair("o/r", 1, "sha2")
+            .await
+            .expect("record second repair");
         assert!(
-            !db.claim_auto_fix_repair("o/r", 1, "sha3", 2, 1)
+            !db.can_auto_fix_repair("o/r", 1, "sha3", 2, 1)
                 .await
                 .expect("third pr claim blocked"),
             "third repair should respect per-PR limit"

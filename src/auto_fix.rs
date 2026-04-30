@@ -224,8 +224,8 @@ pub async fn repair_marked_pr(
         return Ok(None);
     }
 
-    let claimed = db
-        .claim_auto_fix_repair(
+    let repair_allowed = db
+        .can_auto_fix_repair(
             &repo_cfg.full_name(),
             pr_data.number as i64,
             &pr_data.head.sha,
@@ -233,7 +233,7 @@ pub async fn repair_marked_pr(
             repo_cfg.auto_fix.max_repairs_per_head,
         )
         .await?;
-    if !claimed {
+    if !repair_allowed {
         tracing::debug!(
             repo = %repo_cfg.full_name(),
             pr = pr_data.number,
@@ -332,6 +332,12 @@ pub async fn repair_marked_pr(
     )
     .await?;
     repo_manager::push_head(&repo_path, github.token(), &pr_data.head.ref_name).await?;
+    db.record_auto_fix_repair(
+        &repo_cfg.full_name(),
+        pr_data.number as i64,
+        &pr_data.head.sha,
+    )
+    .await?;
 
     Ok(Some(AutoFixOutcome {
         scanned_sha: pr_data.head.sha.clone(),
