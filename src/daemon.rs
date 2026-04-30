@@ -1102,42 +1102,55 @@ fn parse_pr_reviewer_command(body: &str, bot_name: &str) -> Option<MaintainerCom
     let mention = format!("@{}", bot_name.to_ascii_lowercase());
     let bot_suffix = format!("{mention}[bot]");
     for line in body.lines() {
-        let lower = line.to_ascii_lowercase();
-        let Some(index) = lower.find(&mention) else {
-            continue;
-        };
-        let after_mention = &lower[index..];
-        let command_text = if let Some(rest) = after_mention.strip_prefix(&bot_suffix) {
+        let lower = line.trim_start().to_ascii_lowercase();
+        let command_text = if let Some(rest) = lower.strip_prefix(&bot_suffix) {
             rest
-        } else if let Some(rest) = after_mention.strip_prefix(&mention) {
+        } else if let Some(rest) = lower.strip_prefix(&mention) {
             rest
         } else {
             continue;
         };
+        if command_text
+            .chars()
+            .next()
+            .is_some_and(|ch| !ch.is_whitespace() && !matches!(ch, ':' | ',' | '-'))
+        {
+            continue;
+        }
         let command = command_text
             .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, ':' | ',' | '-'))
             .trim();
-        if command.starts_with("status") {
+        let (verb, rest) = split_command_verb(command);
+        if verb == "status" {
             return Some(MaintainerCommand::Status);
         }
-        if command.starts_with("explain") || command.starts_with("why") {
+        if verb == "explain" || verb == "why" {
             return Some(MaintainerCommand::Explain);
         }
-        if command.starts_with("fix") {
+        if verb == "fix" {
             return Some(MaintainerCommand::Fix);
         }
-        if command.starts_with("retry") {
+        if verb == "retry" {
             return Some(MaintainerCommand::Retry {
-                id: parse_command_id(command.strip_prefix("retry").unwrap_or_default()),
+                id: parse_command_id(rest),
             });
         }
-        if command.starts_with("cancel") {
+        if verb == "cancel" {
             return Some(MaintainerCommand::Cancel {
-                id: parse_command_id(command.strip_prefix("cancel").unwrap_or_default()),
+                id: parse_command_id(rest),
             });
         }
     }
     None
+}
+
+fn split_command_verb(command: &str) -> (&str, &str) {
+    let trimmed = command.trim_start();
+    let split_at = trimmed
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, ':' | ',' | '#'))
+        .unwrap_or(trimmed.len());
+    let (verb, rest) = trimmed.split_at(split_at);
+    (verb, rest)
 }
 
 fn parse_command_id(rest: &str) -> Option<i64> {
@@ -1258,6 +1271,26 @@ mod tests {
         assert_eq!(
             parse_pr_reviewer_command("@pr-reviewer cancel", "pr-reviewer"),
             Some(MaintainerCommand::Cancel { id: None })
+        );
+    }
+
+    #[test]
+    fn pr_reviewer_commands_require_explicit_command_boundaries() {
+        assert_eq!(
+            parse_pr_reviewer_command("@pr-reviewer fixture setup", "pr-reviewer"),
+            None
+        );
+        assert_eq!(
+            parse_pr_reviewer_command("@pr-reviewer fixing this manually", "pr-reviewer"),
+            None
+        );
+        assert_eq!(
+            parse_pr_reviewer_command("example: @pr-reviewer fix", "pr-reviewer"),
+            None
+        );
+        assert_eq!(
+            parse_pr_reviewer_command("@pr-reviewer: retry #123", "pr-reviewer"),
+            Some(MaintainerCommand::Retry { id: Some(123) })
         );
     }
 

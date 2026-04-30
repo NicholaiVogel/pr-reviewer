@@ -3204,12 +3204,15 @@ fn build_in_progress_comment_prompt(
     prompt.push_str("- Address the author as ");
     prompt.push_str(&author_label);
     prompt.push_str(".\n");
+    prompt.push_str(
+        "- Do NOT introduce yourself, say you are automated, or include a pr-reviewer link; metadata is handled separately.\n",
+    );
     if has_prior_bot_review {
         prompt.push_str("- This is a follow-up pass on the same PR: do NOT re-introduce yourself and do NOT include a tool/repo link.\n");
     } else {
-        prompt.push_str("- This is first-touch on this PR: briefly identify as an automated code reviewer and include [pr-reviewer](");
-        prompt.push_str(pr_reviewer_project_url());
-        prompt.push_str(").\n");
+        prompt.push_str(
+            "- This is first-touch on this PR: simply acknowledge that you are taking a look.\n",
+        );
     }
 
     prompt
@@ -3245,9 +3248,8 @@ fn build_in_progress_comment_fallback(
         )
     } else {
         format!(
-            "{} - I'm an automated code reviewer powered by [pr-reviewer]({}). I'm taking a look at {} in {} (commit `{}`) now and I'll follow up shortly with feedback.",
+            "{} - I'm taking a look at {} in {} (commit `{}`) and will follow up shortly.",
             greeting,
-            pr_reviewer_project_url(),
             infer_pr_focus(pr_title),
             title_context,
             short_sha(sha),
@@ -3844,10 +3846,9 @@ mod tests {
         extract_in_progress_comment, find_durable_review_comment, finding_key, infer_pr_focus,
         line_is_authored_by_bot, login_matches_bot, looks_like_harness_error_output,
         looks_like_harness_transport_output, looks_like_reintroduction,
-        normalize_in_progress_comment, normalize_summary_output, pr_reviewer_project_url,
-        reconcile_finding_ledger, resolve_project_url, should_suppress_finding,
-        truncate_github_comment_body, FindingStatus, PendingFinding, ReviewMemory,
-        GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
+        normalize_in_progress_comment, normalize_summary_output, reconcile_finding_ledger,
+        resolve_project_url, should_suppress_finding, truncate_github_comment_body, FindingStatus,
+        PendingFinding, ReviewMemory, GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
     };
 
     fn test_user(login: &str) -> User {
@@ -4084,7 +4085,7 @@ Reviewed the archive flow.
     }
 
     #[test]
-    fn first_touch_comment_mentions_repo_link() {
+    fn first_touch_comment_avoids_reintroduction() {
         let message = build_in_progress_comment_fallback(
             "contributor",
             "fix race condition in queue",
@@ -4092,10 +4093,10 @@ Reviewed the archive flow.
             false,
         );
 
-        assert!(message.contains("automated code reviewer"));
         assert!(message.contains("Hi @contributor"));
-        assert!(message.contains(&format!("[pr-reviewer]({})", pr_reviewer_project_url())));
         assert!(message.contains("commit `527fae59`"));
+        assert!(!message.contains("automated code reviewer"));
+        assert!(!message.contains("[pr-reviewer]("));
     }
 
     #[test]
