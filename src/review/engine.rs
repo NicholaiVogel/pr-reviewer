@@ -1010,7 +1010,7 @@ impl ReviewEngine {
             && inline_comments.is_empty()
             && unmapped_comments.is_empty()
             && !screenshot_note_added
-            && finding_delta_summary.is_none()
+            && !finding_delta_requires_review_post(&finding_delta)
             && !has_structured_findings
         {
             self.db
@@ -2479,6 +2479,10 @@ fn build_finding_delta_summary(delta: &FindingDelta) -> Option<String> {
     ))
 }
 
+fn finding_delta_requires_review_post(delta: &FindingDelta) -> bool {
+    delta.newly_found > 0 || delta.still_blocking > 0
+}
+
 fn apply_scope_drift_policy(comment: &mut ParsedReviewComment) {
     if comment.finding_kind != FindingKind::ScopeDrift
         || comment.severity != CommentSeverity::Blocking
@@ -3843,12 +3847,13 @@ mod tests {
         build_finding_delta_summary, build_in_progress_comment_fallback,
         build_prior_reviews_context, build_retry_review_body, build_review_memory,
         build_review_metadata_block, build_thread_history, durable_review_marker,
-        extract_in_progress_comment, find_durable_review_comment, finding_key, infer_pr_focus,
-        line_is_authored_by_bot, login_matches_bot, looks_like_harness_error_output,
-        looks_like_harness_transport_output, looks_like_reintroduction,
-        normalize_in_progress_comment, normalize_summary_output, reconcile_finding_ledger,
-        resolve_project_url, should_suppress_finding, truncate_github_comment_body, FindingStatus,
-        PendingFinding, ReviewMemory, GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
+        extract_in_progress_comment, find_durable_review_comment,
+        finding_delta_requires_review_post, finding_key, infer_pr_focus, line_is_authored_by_bot,
+        login_matches_bot, looks_like_harness_error_output, looks_like_harness_transport_output,
+        looks_like_reintroduction, normalize_in_progress_comment, normalize_summary_output,
+        reconcile_finding_ledger, resolve_project_url, should_suppress_finding,
+        truncate_github_comment_body, FindingDelta, FindingStatus, PendingFinding, ReviewMemory,
+        GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
     };
 
     fn test_user(login: &str) -> User {
@@ -4528,6 +4533,29 @@ Reviewed the archive flow.
         assert_eq!(updates[0].status, "likely_fixed");
         assert_eq!(updates[0].resolved_by_sha.as_deref(), Some("sha-2"));
         assert_eq!(delta.likely_fixed, 1);
+        assert!(!finding_delta_requires_review_post(&delta));
+    }
+
+    #[test]
+    fn finding_delta_requires_post_only_for_actionable_items() {
+        let resolved_only = FindingDelta {
+            likely_fixed: 1,
+            rebutted_or_scoped: 1,
+            ..FindingDelta::default()
+        };
+        assert!(!finding_delta_requires_review_post(&resolved_only));
+
+        let new_finding = FindingDelta {
+            newly_found: 1,
+            ..FindingDelta::default()
+        };
+        assert!(finding_delta_requires_review_post(&new_finding));
+
+        let still_blocking = FindingDelta {
+            still_blocking: 1,
+            ..FindingDelta::default()
+        };
+        assert!(finding_delta_requires_review_post(&still_blocking));
     }
 
     #[test]
