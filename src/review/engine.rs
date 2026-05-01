@@ -325,7 +325,7 @@ impl ReviewEngine {
                         .await;
                     let durable_body = build_durable_in_progress_comment(pr_data, &in_progress);
                     if let Err(err) = self
-                        .sync_durable_review_comment(repo_cfg, pr_data, &durable_body)
+                        .sync_durable_review_comment(repo_cfg, pr_data, &durable_body, true)
                         .await
                     {
                         tracing::warn!(
@@ -381,6 +381,7 @@ impl ReviewEngine {
         repo_cfg: &RepoConfig,
         pr_data: &PullRequest,
         body: &str,
+        create_if_missing: bool,
     ) -> Result<()> {
         let issue_comments = comments::get_issue_comments(
             &self.github,
@@ -404,7 +405,7 @@ impl ReviewEngine {
                 body,
             )
             .await?;
-        } else {
+        } else if create_if_missing {
             comments::create_issue_comment(
                 &self.github,
                 &repo_cfg.owner,
@@ -1010,7 +1011,7 @@ impl ReviewEngine {
             && inline_comments.is_empty()
             && unmapped_comments.is_empty()
             && !screenshot_note_added
-            && !finding_delta_requires_review_post(&finding_delta)
+            && finding_delta_summary.is_none()
             && !has_structured_findings
         {
             self.db
@@ -1140,19 +1141,7 @@ impl ReviewEngine {
         };
 
         let findings_visible_to_github = post_result.is_ok();
-        if let Err(err) = post_result {
-            let fallback = truncate_github_comment_body(&format!(
-                "Review post failed; fallback summary posted.\n\nError: {err}\n\n{body}"
-            ));
-            comments::create_issue_comment(
-                &self.github,
-                &repo_cfg.owner,
-                &repo_cfg.name,
-                pr_data.number,
-                &fallback,
-            )
-            .await?;
-        }
+        let post_error = post_result.err();
 
         // When 422 retry posted comments in the body instead of inline, record 0 inline comments.
         // Also store the actual posted event (which may differ from the LLM verdict after
@@ -1166,18 +1155,30 @@ impl ReviewEngine {
         let has_blocking_findings = pending_findings
             .iter()
             .any(|finding| finding.severity == CommentSeverity::Blocking);
-        let durable_body = build_durable_review_comment(
-            pr_data,
-            model,
-            verdict,
-            actual_event,
-            posted_inline,
-            findings_visible_to_github,
-            has_blocking_findings,
-            &body,
-        );
+        let durable_body = if let Some(err) = post_error.as_ref() {
+            let fallback = format!("Review post failed.\n\nError: {err}\n\n{body}");
+            build_durable_review_comment(
+                pr_data,
+                model,
+                verdict,
+                actual_event,
+                posted_inline,
+                false,
+                has_blocking_findings,
+                &fallback,
+            )
+        } else {
+            build_durable_review_status_comment(
+                pr_data,
+                model,
+                verdict,
+                actual_event,
+                posted_inline,
+            )
+        };
+        let create_durable_comment = !findings_visible_to_github;
         if let Err(err) = self
-            .sync_durable_review_comment(repo_cfg, pr_data, &durable_body)
+            .sync_durable_review_comment(repo_cfg, pr_data, &durable_body, create_durable_comment)
             .await
         {
             tracing::warn!(
@@ -2479,10 +2480,6 @@ fn build_finding_delta_summary(delta: &FindingDelta) -> Option<String> {
     ))
 }
 
-fn finding_delta_requires_review_post(delta: &FindingDelta) -> bool {
-    delta.newly_found > 0 || delta.still_blocking > 0
-}
-
 fn apply_scope_drift_policy(comment: &mut ParsedReviewComment) {
     if comment.finding_kind != FindingKind::ScopeDrift
         || comment.severity != CommentSeverity::Blocking
@@ -3780,6 +3777,32 @@ fn build_durable_review_comment(
     truncate_github_comment_body(&body)
 }
 
+fn build_durable_review_status_comment(
+    pr_data: &PullRequest,
+    model: &str,
+    verdict: ReviewVerdict,
+    actual_event: &str,
+    posted_inline: i64,
+) -> String {
+    let mut body = String::new();
+    body.push_str(&durable_review_marker(pr_data.number));
+    body.push('\n');
+    body.push_str(&durable_verdict_marker(
+        pr_data.number,
+        &pr_data.head.sha,
+        verdict,
+        actual_event,
+    ));
+    body.push_str(&format!(
+        "\n\nReview posted through GitHub's PR review UI for commit `{}`.",
+        short_sha(&pr_data.head.sha)
+    ));
+    body.push_str(&format!(
+        "\n\n<!-- pr-reviewer-meta model={model} event={actual_event} posted_inline={posted_inline} -->\n"
+    ));
+    truncate_github_comment_body(&body)
+}
+
 fn durable_review_marker(pr_number: u64) -> String {
     format!("{DURABLE_REVIEW_MARKER_PREFIX} pr={pr_number} -->")
 }
@@ -3814,10 +3837,19 @@ fn find_durable_review_comment<'a>(
     authenticated_user: Option<&str>,
 ) -> Option<&'a IssueComment> {
     let marker = durable_review_marker(pr_number);
-    issue_comments.iter().rev().find(|comment| {
-        comment.body.contains(&marker)
-            && login_matches_bot(&comment.user.login, bot_name, authenticated_user)
-    })
+    let mut marked = issue_comments
+        .iter()
+        .rev()
+        .filter(|comment| comment.body.contains(&marker));
+
+    if let Some(comment) = marked
+        .clone()
+        .find(|comment| login_matches_bot(&comment.user.login, bot_name, authenticated_user))
+    {
+        return Some(comment);
+    }
+
+    marked.find(|comment| comment.body.contains("<!-- pr-reviewer-meta"))
 }
 
 fn verdict_label(verdict: ReviewVerdict) -> &'static str {
@@ -3843,16 +3875,16 @@ mod tests {
     use super::{
         apply_scope_drift_policy, blocker_has_sufficient_evidence, build_direct_pushback_reply,
         build_durable_in_progress_comment, build_durable_review_comment,
-        build_final_review_summary_prompt, build_final_review_transcript,
-        build_finding_delta_summary, build_in_progress_comment_fallback,
-        build_prior_reviews_context, build_retry_review_body, build_review_memory,
-        build_review_metadata_block, build_thread_history, durable_review_marker,
-        extract_in_progress_comment, find_durable_review_comment,
-        finding_delta_requires_review_post, finding_key, infer_pr_focus, line_is_authored_by_bot,
-        login_matches_bot, looks_like_harness_error_output, looks_like_harness_transport_output,
+        build_durable_review_status_comment, build_final_review_summary_prompt,
+        build_final_review_transcript, build_finding_delta_summary,
+        build_in_progress_comment_fallback, build_prior_reviews_context, build_retry_review_body,
+        build_review_memory, build_review_metadata_block, build_thread_history,
+        durable_review_marker, extract_in_progress_comment, find_durable_review_comment,
+        finding_key, infer_pr_focus, line_is_authored_by_bot, login_matches_bot,
+        looks_like_harness_error_output, looks_like_harness_transport_output,
         looks_like_reintroduction, normalize_in_progress_comment, normalize_summary_output,
         reconcile_finding_ledger, resolve_project_url, should_suppress_finding,
-        truncate_github_comment_body, FindingDelta, FindingStatus, PendingFinding, ReviewMemory,
+        truncate_github_comment_body, FindingStatus, PendingFinding, ReviewMemory,
         GITHUB_COMMENT_MAX_CHARS, GITHUB_COMMENT_TRUNCATION_NOTE,
     };
 
@@ -4024,6 +4056,31 @@ Ship the archive feature safely.",
     }
 
     #[test]
+    fn durable_status_comment_does_not_mirror_review_body() {
+        let pr = test_pull_request_with_body(Some("Review me."));
+        let body = build_durable_review_status_comment(
+            &pr,
+            "gpt-5.4",
+            ReviewVerdict::Comment,
+            "COMMENT",
+            2,
+        );
+
+        assert!(body.contains("<!-- pr-reviewer-review pr=15 -->"));
+        assert!(
+            body.contains("<!-- pr-reviewer-verdict:comment pr=15 sha=abc123 event=COMMENT -->")
+        );
+        assert!(body.contains("Review posted through GitHub's PR review UI"));
+        assert!(body.contains("commit `abc123`"));
+        assert!(
+            body.contains("<!-- pr-reviewer-meta model=gpt-5.4 event=COMMENT posted_inline=2 -->")
+        );
+        assert!(!body.contains("Review metadata"));
+        assert!(!body.contains("summary"));
+        assert!(!body.contains("Confidence:"));
+    }
+
+    #[test]
     fn review_metadata_block_is_collapsed() {
         let body = build_review_metadata_block("gpt-5.3-codex", "e6f9a1e8");
 
@@ -4048,6 +4105,23 @@ Ship the archive feature safely.",
             .expect("bot marker comment");
 
         assert_eq!(found.id, 3);
+    }
+
+    #[test]
+    fn durable_comment_lookup_recovers_stale_bot_alias_by_meta_marker() {
+        let marker = durable_review_marker(15);
+        let comments = vec![issue_comment(
+            1,
+            "PR-Reviewer-Ant",
+            &format!(
+                "{marker}\n<!-- pr-reviewer-meta model=gpt-5.5 event=COMMENT posted_inline=1 -->"
+            ),
+        )];
+
+        let found = find_durable_review_comment(&comments, 15, "pr-reviewer", None)
+            .expect("durable pr-reviewer marker comment");
+
+        assert_eq!(found.id, 1);
     }
 
     #[test]
@@ -4533,29 +4607,6 @@ Reviewed the archive flow.
         assert_eq!(updates[0].status, "likely_fixed");
         assert_eq!(updates[0].resolved_by_sha.as_deref(), Some("sha-2"));
         assert_eq!(delta.likely_fixed, 1);
-        assert!(!finding_delta_requires_review_post(&delta));
-    }
-
-    #[test]
-    fn finding_delta_requires_post_only_for_actionable_items() {
-        let resolved_only = FindingDelta {
-            likely_fixed: 1,
-            rebutted_or_scoped: 1,
-            ..FindingDelta::default()
-        };
-        assert!(!finding_delta_requires_review_post(&resolved_only));
-
-        let new_finding = FindingDelta {
-            newly_found: 1,
-            ..FindingDelta::default()
-        };
-        assert!(finding_delta_requires_review_post(&new_finding));
-
-        let still_blocking = FindingDelta {
-            still_blocking: 1,
-            ..FindingDelta::default()
-        };
-        assert!(finding_delta_requires_review_post(&still_blocking));
     }
 
     #[test]
